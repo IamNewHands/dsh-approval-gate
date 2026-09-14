@@ -42,7 +42,18 @@ const LEARNING_PATH = join(DATA_DIR, 'learning.json')
 const AUDIT_PATH = join(DATA_DIR, 'audit.log')
 const EVENTS_PATH = join(DATA_DIR, 'events.jsonl')
 const SNAPSHOTS_DIR = join(DATA_DIR, 'snapshots')
-const PROFILE_PATCH_PATH = join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+
+function getProfilePatchPath() {
+  if (process.env.DSH_PROFILE) {
+    const p = join(DSH_HOME, 'profiles', process.env.DSH_PROFILE, 'cordis.patch.yml')
+    if (existsSync(p)) return p
+  }
+  const desktopPath = join(DSH_HOME, 'profiles', 'desktop', 'cordis.patch.yml')
+  if (existsSync(desktopPath)) return desktopPath
+  const webPath = join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+  if (existsSync(webPath)) return webPath
+  return join(DSH_HOME, 'profiles', process.env.DSH_PROFILE || 'desktop', 'cordis.patch.yml')
+}
 
 // 快照限制：单文件 ≤256KB、每事件 ≤5 个文件
 const SNAPSHOT_MAX_BYTES = 256 * 1024
@@ -85,11 +96,11 @@ function snapshotMatchesSession(absPath, sessionId) {
   } catch { return false }
 }
 
-/** 解析文件路径为绝对路径（~ → home，/ → 原样，相对 → 依次尝试会话 cwd / 进程 cwd / home，取存在的） */
+/** 解析文件路径为绝对路径（~ → home，/ → 原样，支持 Windows 盘符，相对 → 依次尝试会话 cwd / 进程 cwd / home，取存在的） */
 function resolveAbsPath(p, baseDir) {
   const s = String(p || '')
   if (s.startsWith('~')) return join(homedir(), s.slice(1))
-  if (s.startsWith('/')) return s
+  if (s.startsWith('/') || /^[a-zA-Z]:[\\\/]/.test(s)) return s
   const candidates = [baseDir, process.cwd(), homedir()].filter((b) => typeof b === 'string' && b)
   const seen = new Set()
   for (const b of candidates) {
@@ -108,14 +119,13 @@ function isDevicePath(absPath) {
   return /^\/dev\//.test(absPath) || /^\/proc\//.test(absPath) || /^\/sys\//.test(absPath)
 }
 
-/** 保存事件涉及文件的快照（审批时 = 改动前内容） */
+/** 保存事件涉及文件的快照（审批前 = 改动前内容） */
 function saveEventSnapshots(eventId, files, baseDir, sessionId) {
   const list = files || []
   if (list.length === 0) return
   const snapshots = []
   const seen = new Set()
-  for (const f of list) {
-    if (snapshots.length >= SNAPSHOT_MAX_FILES) break
+  for (const f of list.slice(0, SNAPSHOT_MAX_FILES)) {
     const abs = resolveAbsPath(f, baseDir)
     if (seen.has(abs)) continue
     seen.add(abs)
@@ -123,18 +133,17 @@ function saveEventSnapshots(eventId, files, baseDir, sessionId) {
     if (isDevicePath(abs)) continue
     const content = readSnapshotFile(abs)
     if (content === null) continue
-    // 空内容快照无 diff 意义（空 vs 空 无行），跳过
+    // 空内容快照无 diff 意义（空 vs 空无行），跳过
     if (content === '') continue
     snapshots.push({ path: abs, content, ts: new Date().toISOString() })
   }
   if (snapshots.length === 0) return
-  const cwdUsed = (typeof baseDir === 'string' && baseDir) ? baseDir : process.cwd()
   try {
-    ensureDataDir()
-    mkdirSync(SNAPSHOTS_DIR, { recursive: true })
-    writeFileSync(join(SNAPSHOTS_DIR, String(eventId) + '.json'), JSON.stringify({ eventId, sessionId: String(sessionId || ''), cwd: cwdUsed, snapshots }, null, 2), 'utf8')
-  } catch (error) {
-    console.error(`[${NAME}] 保存快照失败`, error)
+    if (!existsSync(SNAPSHOTS_DIR)) mkdirSync(SNAPSHOTS_DIR, { recursive: true })
+    const file = join(SNAPSHOTS_DIR, `${eventId}.json`)
+    writeFileSync(file, JSON.stringify({ eventId, sessionId: String(sessionId || ''), snapshots }), 'utf8')
+  } catch (e) {
+    console.error(`[${NAME}] 保存快照失败`, e)
   }
 }
 
@@ -272,14 +281,14 @@ function extractFiles(text) {
   const add = (v) => {
     const seg = v.replace(/[，。；、,.;:：\s]+$/g, '').trim()
     if (seg.length < 3 || seg.length > 120) return
-    // 按文件名（basename）去重：同一文件的绝对/相对/裸名只保留最先出现的完整形式（快照解析用）
-    const base = String(seg).split('/').pop()
+    // 按文件名（basename）去重：同时支持正斜杠与反斜杠
+    const base = String(seg).split(/[\\\/]/).pop()
     if (!base || base.length < 2) return
     if (seen.has(base)) return
     seen.add(base)
     found.push(seg)
   }
-  for (const m of s.matchAll(/(?:~\/|\/|\.\/)?[\w@.-]+\/[\w@.\/-]+/g)) add(m[0])
+  for (const m of s.matchAll(/(?:[a-zA-Z]:[\\\/]|(?:~[\\\/]|[\\\/]|\.[\\\/]))?[\w@.-]+[\\\/][\w@.\/\\-]+/g)) add(m[0])
   for (const m of s.matchAll(/[\w@.-]+\.(?:md|js|json|ya?ml|env|txt|py|ts|css|html|log|mjs|cjs)/gi)) add(m[0])
   return found.slice(0, 8)
 }
@@ -424,12 +433,40 @@ function readBody(req, limit = 1024 * 1024) {
   })
 }
 
+/**
+ * 来源校验（防 DNS rebinding / 跨站表单 CSRF 攻击）
+ * 允许同源请求（无 Origin/Referer 或指向 localhost/127.0.0.1/当前 Host）
+ */
+function isOriginSafe(req) {
+  const host = req.headers['host'] || ''
+  const origin = req.headers['origin']
+  const referer = req.headers['referer']
+
+  const check = (val) => {
+    if (!val) return true
+    try {
+      const u = new URL(val)
+      const allowed = new Set(['localhost', '127.0.0.1', '[::1]'])
+      if (allowed.has(u.hostname)) return true
+      if (host && (u.host === host || u.hostname === host.split(':')[0])) return true
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  if (origin && !check(origin)) return false
+  if (referer && !check(referer)) return false
+  return true
+}
+
 /** 配置快照（供设置页展示；区分预置默认值与当前值） */
-function getRulesSnapshot() {
+function getRulesSnapshot(permissionPresets) {
   reloadConfig()
   return {
     config: {
       version: config.version || 3,
+      judgeModel: config.judgeModel || null,
       denyKeywords: config.denyKeywords || [],
       allowRules: config.allowRules || [],
       denyRules: config.denyRules || [],
@@ -447,37 +484,53 @@ function getRulesSnapshot() {
       allowRules: DEFAULT_ALLOW_RULES,
       hardCategories: DEFAULT_HARD_CATEGORIES
     },
-    setup: getSetupState()
+    setup: getSetupState(permissionPresets)
   }
 }
 
 /** 检查权限预设是否已配置（供设置页初始化卡片） */
-function getSetupState() {
+function getSetupState(permissionPresets) {
+  const patchPath = getProfilePatchPath()
   try {
-    const text = readFileSync(PROFILE_PATCH_PATH, 'utf8')
-    return { configured: text.includes('auto-approve:'), patchPath: PROFILE_PATCH_PATH }
+    if (permissionPresets && permissionPresets.presets && permissionPresets.presets['auto-approve']) {
+      return { configured: true, patchPath }
+    }
+    const text = readFileSync(patchPath, 'utf8')
+    return { configured: text.includes('auto-approve:'), patchPath }
   } catch (e) {
-    return { configured: false, patchPath: PROFILE_PATCH_PATH, error: String((e && e.message) || e) }
+    return { configured: false, patchPath, error: String((e && e.message) || e) }
   }
 }
 
 /** 一键初始化：在 cordis.patch.yml 中写入 auto-approve 权限预设（文本级操作，保留注释格式） */
-function ensureAutoApprovePreset() {
+function ensureAutoApprovePreset(permissionPresets) {
+  const patchPath = getProfilePatchPath()
   try {
-    const text = readFileSync(PROFILE_PATCH_PATH, 'utf8')
-    if (text.includes('auto-approve:')) return { ok: true, status: 'already', needRestart: false }
+    let text = ''
+    try {
+      text = readFileSync(patchPath, 'utf8')
+    } catch {
+      text = '[]\n'
+    }
+    if (text.includes('auto-approve:')) return { ok: true, status: 'already', needRestart: false, patchPath }
 
-    const lines = text.split('\n')
+    let lines = text.split('\n')
     let permIdx = -1
     for (let i = 0; i < lines.length; i++) {
-      if (/^- id:\s*permission\s*$/.test(lines[i])) { permIdx = i; break }
+      if (/^- id:\s*permission\s*$/.test(lines[i].trim())) { permIdx = i; break }
     }
 
     if (permIdx === -1) {
-      // 无 permission 条目：追加完整预设块
-      const next = text.replace(/\s*$/, '') + FULL_PERMISSION_BLOCK + AUTO_APPROVE_PRESET_YAML
-      writeFileSync(PROFILE_PATCH_PATH, next, 'utf8')
-      return { ok: true, status: 'added-entry', needRestart: true }
+      // 无 permission 条目：追加完整预设块（清除单独的 [] 避免生成非法 YAML）
+      let cleanText = text.replace(/\r\n/g, '\n').trim()
+      if (cleanText === '[]') {
+        cleanText = '# Your patch layer for this dsh profile, applied after every bundle layer:\n'
+      } else if (cleanText.endsWith('[]')) {
+        cleanText = cleanText.slice(0, -2).trimEnd()
+      }
+      const next = (cleanText ? cleanText + '\n' : '') + FULL_PERMISSION_BLOCK.trimStart() + AUTO_APPROVE_PRESET_YAML
+      writeFileSync(patchPath, next, 'utf8')
+      return { ok: true, status: 'added-entry', needRestart: true, patchPath }
     }
 
     // 有 permission 条目：在其 presets 块末尾插入 auto-approve
@@ -488,8 +541,18 @@ function ensureAutoApprovePreset() {
       if (i > permIdx && /^- /.test(lines[i]) && !/^ {2,}- /.test(lines[i])) break // 下一个顶层条目
     }
     if (presetsIdx === -1) {
-      // permission 条目存在但没有 presets 键：在 config 下补 presets（简化处理）
-      return { ok: false, status: 'no-presets-key', needRestart: false, error: 'permission 条目缺少 presets 键，请手动添加' }
+      // permission 条目存在但没有 presets 键：在 config 下补 presets
+      let configIdx = -1
+      for (let i = permIdx; i < lines.length; i++) {
+        if (/^ {2}config:\s*$/.test(lines[i])) { configIdx = i; break }
+        if (i > permIdx && /^- /.test(lines[i]) && !/^ {2,}- /.test(lines[i])) break
+      }
+      if (configIdx === -1) {
+        return { ok: false, status: 'no-config-key', needRestart: false, error: 'permission 条目缺少 config 键，请手动配置' }
+      }
+      lines.splice(configIdx + 1, 0, '    presets:\n' + AUTO_APPROVE_PRESET_YAML.replace(/\n$/, ''))
+      writeFileSync(patchPath, lines.join('\n'), 'utf8')
+      return { ok: true, status: 'added-presets-key', needRestart: true, patchPath }
     }
     // 从 presetsIdx 往下找最后一个 presets 子项行（缩进 6 且非注释空行），直到顶层条目/文件尾
     let insertAt = presetsIdx
@@ -500,14 +563,14 @@ function ensureAutoApprovePreset() {
       if (/^\s*$/.test(line)) continue
     }
     lines.splice(insertAt + 1, 0, AUTO_APPROVE_PRESET_YAML.replace(/\n$/, ''))
-    writeFileSync(PROFILE_PATCH_PATH, lines.join('\n'), 'utf8')
-    return { ok: true, status: 'added-preset', needRestart: true }
+    writeFileSync(patchPath, lines.join('\n'), 'utf8')
+    return { ok: true, status: 'added-preset', needRestart: true, patchPath }
   } catch (e) {
     return { ok: false, status: 'error', needRestart: false, error: String((e && e.message) || e) }
   }
 }
 
-/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs */
+/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|judgeModel */
 function applyRuleOp(op, kind, value) {
   reloadConfig()
 
@@ -520,6 +583,24 @@ function applyRuleOp(op, kind, value) {
     saveJson(ALLOWLIST_PATH, config)
     audit(`CONFIG  ${kind} → ${n}`)
     return { ok: true, set: true, value: n }
+  }
+
+  // 判定模型解耦配置（judgeModel）
+  if (kind === 'judgeModel') {
+    if (op === 'set') {
+      if (!value || typeof value !== 'object') return { ok: false, error: 'judgeModel 必须是对象 { provider, model }' }
+      config.judgeModel = { provider: String(value.provider || ''), model: String(value.model || '') }
+      saveJson(ALLOWLIST_PATH, config)
+      audit(`CONFIG  judgeModel → ${JSON.stringify(config.judgeModel)}`)
+      return { ok: true, set: true, value: config.judgeModel }
+    }
+    if (op === 'remove') {
+      delete config.judgeModel
+      saveJson(ALLOWLIST_PATH, config)
+      audit(`CONFIG  judgeModel 已清除`)
+      return { ok: true, removed: true }
+    }
+    return { ok: false, error: 'judgeModel 仅支持 set 或 remove' }
   }
 
   const list = config[kind]
@@ -578,7 +659,6 @@ function applyRuleOp(op, kind, value) {
       }
       if (list.length !== before) audit(`CONFIG  ${kind} - ${JSON.stringify(v)}`)
     }
-    if (list.length === before) return { ok: false, error: '未找到匹配的规则' }
     saveJson(ALLOWLIST_PATH, config)
     return { ok: true, removed: true }
   }
@@ -587,16 +667,17 @@ function applyRuleOp(op, kind, value) {
 }
 
 const CATEGORY_LABELS = {
-  deletion: '删除/覆盖不可再生数据',
-  credential: '凭据/密钥/授权修改',
-  remote: '远程系统/生产环境/数据库',
-  system: '系统级路径/配置',
-  bulk: '批量不可回补操作',
-  neutral: '中立（无硬风险特征）'
+  deletion: '删除操作',
+  credential: '凭据修改',
+  remote: '远程影响',
+  system: '系统变更',
+  bulk: '批量覆盖',
+  neutral: '中立操作'
 }
 
+// flash 判定 prompt（v3，类别输出）
 const SYSTEM_PROMPT = [
-  '你是 AI 编程代理的操作风险评估器。DSH 的审批只发生在「沙箱越界」时，即命令需要比当前更宽的权限才能执行。',
+  '你是命令与工具执行的安全审计器。',
   '',
   '你将收到：工具名、请求升级的目标沙箱模式、以及一句操作理由（justification）。',
   '沙箱模式含义：',
@@ -664,6 +745,12 @@ function normalizeConfig(raw) {
   cfg.riskyThreshold = cfg.riskyThreshold || 3
   cfg.judgeTimeoutMs = cfg.judgeTimeoutMs || 20000
   cfg.learning = cfg.learning || { enabled: true }
+  if (cfg.judgeModel && typeof cfg.judgeModel === 'object') {
+    cfg.judgeModel = {
+      provider: String(cfg.judgeModel.provider || ''),
+      model: String(cfg.judgeModel.model || '')
+    }
+  }
   return cfg
 }
 
@@ -695,6 +782,11 @@ function reloadConfig() {
     if (!config.version) config.version = prev.version || 3
     learning.enabled = config.learning.enabled !== false
   }
+  const lDisk = loadJson(LEARNING_PATH, null)
+  if (lDisk && typeof lDisk === 'object') {
+    learning.stats = lDisk.stats || {}
+    learning.history = lDisk.history || {}
+  }
 }
 
 const learning = loadJson(LEARNING_PATH, { enabled: true, stats: {}, history: {} })
@@ -717,7 +809,17 @@ for (const k of Object.keys(learning.history)) {
 function looksDeny(text) {
   const lower = String(text || '').toLowerCase()
   const keywords = config.denyKeywords || DEFAULT_DENY_KEYWORDS
-  return keywords.some((keyword) => lower.includes(String(keyword).toLowerCase()))
+  return keywords.some((keyword) => {
+    const kw = String(keyword || '').trim().toLowerCase()
+    if (!kw) return false
+    // 单个独立英文/数字标识符（如 format、shutdown、reboot）采用词边界判定，
+    // 避免误伤 Format-Table、Format-List、Get-Date -Format、--format 等正常命令
+    if (/^[a-z0-9_]+$/.test(kw)) {
+      const regex = new RegExp(`(^|[^a-z0-9_-])${kw}([^a-z0-9_-]|$)`, 'i')
+      return regex.test(lower)
+    }
+    return lower.includes(kw)
+  })
 }
 
 // reason 格式：`escalate sandbox to <mode>: <justification>`
@@ -734,7 +836,7 @@ function matchRule(rules, toolName, mode, category, justification) {
   for (const rule of list) {
     if (rule.tool && rule.tool !== toolName) continue
     if (rule.mode && rule.mode !== mode) continue
-    if (rule.category && rule.category !== category) continue
+    if (category !== null && category !== undefined && rule.category && rule.category !== category) continue
     if (rule.contains && !j.includes(String(rule.contains).toLowerCase())) continue
     return rule
   }
@@ -747,44 +849,71 @@ function learnKey(toolName, mode, category) {
 }
 
 // 从 justification 提取「操作指纹」：路径 / 文件名 / 项目名等有区分度的片段。
-// 沉淀/拒绝规则必须携带指纹，避免宽规则（如 edit+danger 放行所有工作区外编辑）
-// 误放行用户未确认过的其他操作。提取不到 → 返回 null（调用方决定不沉淀）。
+// 沉淀/拒绝规则必须携带指纹，避免宽规则误放行用户未确认过的其他操作。
 const GENERIC_EN_WORDS = new Set([
   'update', 'updates', 'updating', 'updated', 'install', 'installs', 'installing',
   'deploy', 'deploys', 'deploying', 'sync', 'syncing', 'copy', 'copies', 'move',
   'remove', 'removes', 'adding', 'change', 'changes', 'changing', 'set', 'clean',
-  'test', 'verify', 'check', 'fix', 'fixes', 'fixing', 'modify', 'modifies'
+  'test', 'verify', 'check', 'fix', 'fixes', 'fixing', 'modify', 'modifies',
+  'start', 'stop', 'restart', 'build', 'create', 'read', 'write', 'open', 'close',
+  'file', 'files', 'directory', 'path', 'script', 'command', 'process', 'task'
 ])
+
+const COMMON_DEV_TOOLS = new Set([
+  'git', 'npm', 'pnpm', 'yarn', 'bun', 'tsc', 'vite', 'vitest', 'node', 'wrangler',
+  'python', 'pytest', 'pip', 'cargo', 'rustc', 'docker', 'kubectl', 'pwsh', 'bash'
+])
+
 function extractOperationFingerprint(text) {
   const s = String(text || '')
   const candidates = []
-  // 1. 显式路径片段：~/xxx、/xxx/yyy、相对路径（含至少一段目录或文件名）
-  for (const m of s.matchAll(/(?:~\/|\/|\.\/)?[\w@.-]+\/[\w@.\/-]+/g)) {
+
+  // 1. 显式路径片段：支持正斜杠 / 与反斜杠 \，支持 Windows 盘符 C:\xxx、~、./
+  for (const m of s.matchAll(/(?:[a-zA-Z]:[\\\/]|(?:~[\\\/]|[\\\/]|\.[\\\/]))?[\w@.-]+[\\\/][\w@.\/\\-]+/g)) {
     const seg = m[0].replace(/[，。；、,.;:：\s]+$/g, '').trim()
-    if (seg.length >= 5 && seg.length <= 80) candidates.push(seg)
+    if (seg.length >= 4 && seg.length <= 100) candidates.push(seg)
   }
-  // 2. 带扩展名的文件名：xxx.md/.js/.json/.yml/.env 等
+
+  // 2. 引号内的操作目标/命令/路径："..." 或 '...' 或 `...` 或 “...”
+  for (const m of s.matchAll(/["'`“‘]([^"'`”’\r\n]{2,80})["'`”’]/g)) {
+    const seg = m[1].trim()
+    if (seg.length >= 2 && seg.length <= 80 && !/^(workspace-write|danger-full-access)$/i.test(seg)) {
+      candidates.push(seg)
+    }
+  }
+
+  // 3. 带扩展名的文件名：xxx.md/.js/.json/.yml/.env 等
   for (const m of s.matchAll(/[\w@.-]+\.(?:md|js|json|ya?ml|env|txt|py|ts|css|html|log|mjs|cjs)/gi)) {
     const seg = m[0]
     if (seg.length >= 4 && seg.length <= 60) candidates.push(seg)
   }
-  // 3. 连字符/点分隔的项目或插件名（2-4 段英文标识符）
+
+  // 4. 常见开发工具/核心命令（优先作为高价值指纹，解决 git/tsc/pnpm 无法被识别的问题）
+  for (const m of s.matchAll(/\b([a-z0-9_-]+)\b/gi)) {
+    const w = m[1].toLowerCase()
+    if (COMMON_DEV_TOOLS.has(w)) {
+      candidates.push(m[1])
+    }
+  }
+
+  // 5. 连字符/点分隔的项目或插件名（2-4 段英文标识符）
   for (const m of s.matchAll(/\b[a-z][\w-]*(?:[-.][a-z][\w-]*){1,3}\b/gi)) {
     const seg = m[0]
     if (seg.length >= 6 && seg.length <= 50 && !/^(workspace-write|danger-full-access)$/i.test(seg)) {
       candidates.push(seg)
     }
   }
-  // 4. 单段英文标识符（≥5 字符，排除通用动词/操作词）：README、config 等文档/配置名
-  for (const m of s.matchAll(/\b[a-z][a-z0-9-]{4,}\b/gi)) {
+
+  // 6. 单段英文标识符（≥3 字符，排除通用动词/操作词）
+  for (const m of s.matchAll(/\b[a-z][a-z0-9-]{2,}\b/gi)) {
     const seg = m[0]
     if (GENERIC_EN_WORDS.has(seg.toLowerCase())) continue
     if (seg.length <= 40) candidates.push(seg)
   }
+
   if (candidates.length === 0) return null
-  // 取最长片段（最长最有区分度），截断防超长
   candidates.sort((a, b) => b.length - a.length)
-  return candidates[0].slice(0, 60)
+  return candidates[0].slice(0, 80)
 }
 
 export default {
@@ -804,6 +933,11 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/events',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) {
+              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+              return
+            }
             if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
             const url = new URL(req.url, 'http://localhost')
             const sessionId = url.searchParams.get('sessionId') || ''
@@ -842,13 +976,18 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/rules',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) {
+              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+              return
+            }
             const send = (code, obj) => {
               res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
               res.end(JSON.stringify(obj))
             }
             try {
               if (req.method === 'GET' || req.method === 'HEAD') {
-                return send(200, getRulesSnapshot())
+                return send(200, getRulesSnapshot(permissionPresets))
               }
               if (req.method === 'POST') {
                 const body = await readBody(req)
@@ -867,16 +1006,21 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/setup',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) {
+              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+              return
+            }
             const send = (code, obj) => {
               res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
               res.end(JSON.stringify(obj))
             }
             try {
               if (req.method === 'GET' || req.method === 'HEAD') {
-                return send(200, getSetupState())
+                return send(200, getSetupState(permissionPresets))
               }
               if (req.method === 'POST') {
-                return send(200, ensureAutoApprovePreset())
+                return send(200, ensureAutoApprovePreset(permissionPresets))
               }
               return send(405, { ok: false, error: 'method not allowed' })
             } catch (e) {
@@ -900,8 +1044,7 @@ export default {
 
     /** 投递消息到会话（撤销指令）；复用 workspace-panels 的 chatSend 机制 */
     const sendToSession = async (sessionId, content) => {
-      // DSH 用户消息 content 必须是块数组；裸字符串会被 GUI 渲染器按字符迭代，
-      // 每个字符渲染成一个「附加内容块」占位符，导致对话界面错乱（v0.5.0 事故根因）。
+      // DSH 用户消息 content 必须是块数组；裸字符串会被 GUI 渲染器按字符迭代
       const textBlock = [{ type: 'text', text: content }]
       const typertGateway = ctx.get('typertGateway')
       if (typertGateway && typeof typertGateway.invoke === 'function') {
@@ -920,12 +1063,11 @@ export default {
             id: 'ag-revert-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36),
             role: 'user',
             content: textBlock,
-            source: { kind: 'user' },
           })
           return { ok: true, via: 'followup' }
         }
       }
-      return { ok: false, error: '没有可用的消息投递通道' }
+      return { ok: false, error: '未找到会话投递通道（typertGateway/agents 均不可用）' }
     }
 
     try {
@@ -939,6 +1081,7 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/diff',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { ok: false, error: 'method not allowed' })
               const url = new URL(req.url, 'http://localhost')
@@ -948,9 +1091,9 @@ export default {
               const snaps = loadEventSnapshots(eventId)
               // client 传的是 justification 中的原始路径（可能绝对/相对/裸文件名），多基准对齐快照的绝对路径
               const base = resolveAbsPath(path)
-              const baseName = String(path).split('/').pop()
+              const baseName = String(path).split(/[\\\/]/).pop()
               const snap = snaps.find((s) => s.path === base || s.path === path)
-                || snaps.find((s) => s.path.endsWith('/' + path) || (baseName && s.path.endsWith('/' + baseName)))
+                || snaps.find((s) => s.path.endsWith('/' + path) || s.path.endsWith('\\' + path) || (baseName && s.path.endsWith('/' + baseName)) || (baseName && s.path.endsWith('\\' + baseName)))
               if (!snap) return send(res, 404, { ok: false, error: '该事件没有此文件的快照' })
               const before = snap.content
               const after = readSnapshotFile(snap.path)
@@ -975,6 +1118,7 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/revert',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method not allowed' })
               const body = await readBody(req)
@@ -998,7 +1142,7 @@ export default {
               if (!event) return send(res, 404, { ok: false, error: '未找到该事件' })
               const files = (event.files || []).map((f) => '`' + f + '`').join('、')
               const snapDir = SNAPSHOTS_DIR
-              // 快照缺失保护：快照被清除后，撤销指令应如实告知 agent，避免其盲目恢复
+              // 快照缺失保护：快照被清除后，撤销指令如实告知 agent
               const snaps = loadEventSnapshots(eventId)
               const snapHint = snaps.length > 0
                 ? '改动前的文件内容快照保存在 ' + snapDir + '（按事件 ID 命名），可参考恢复；请确认改动内容后执行撤销。'
@@ -1022,6 +1166,7 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/snapshots-stats',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
             try {
               const url = new URL(req.url, 'http://localhost')
               const filterSession = url.searchParams.get('sessionId') || ''
@@ -1057,6 +1202,7 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/snapshots-clear',
           handler: async (req, res) => {
+            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method not allowed' })
               const body = await readBody(req)
@@ -1096,6 +1242,10 @@ export default {
     })
 
     const resolveModel = () => {
+      const jm = config.judgeModel
+      if (jm && typeof jm === 'object' && typeof jm.provider === 'string' && jm.provider && typeof jm.model === 'string' && jm.model) {
+        return { provider: jm.provider, model: jm.model }
+      }
       try {
         const sel = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
           ? agentDefaultModel.currentSelection()
@@ -1111,31 +1261,50 @@ export default {
 
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
-     * 由 judgeOnce / verifySimilarity 共用；异常向上抛，由 withRetry 决定重试或降级。
-     * @returns {Promise<string>} 模型原始输出文本
+     * 针对各 provider 差异做容错：
+     * 1. reasoning-delta 与 text-delta 分离，优先取 text-delta，避免思考模型长思考污染 SAFE/RISKY 判定。
+     * 2. finish chunk 的 reason 是可选字段，做防御性读取。
+     * 3. reasoningEffort: 'off' 在自定义/中转/特殊 provider 上可能不被支持（UNSUPPORTED_REASONING_EFFORT），抛错时回退到默认 effort 重试。
      */
+    const isEffortRejection = (error) =>
+      /does not support reasoning effort/i.test(String(error && error.message ? error.message : error))
+
     const callFlash = async (userText, systemPrompt, signal) => {
       const { provider, model } = resolveModel()
-      let text = ''
-      for await (const chunk of llm.stream({
-        provider,
-        model,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        system: systemPrompt,
-        temperature: 0,
-        reasoningEffort: 'off',
-        // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
-        maxTokens: 256,
-        signal
-      })) {
-        if (chunk.type === 'text-delta') text += chunk.text
-        else if (chunk.type === 'reasoning-delta') text += chunk.text
-        else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+
+      const streamOnce = async (reasoningEffort) => {
+        let text = ''
+        let reasoning = ''
+        for await (const chunk of llm.stream({
+          provider,
+          model,
+          messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          system: systemPrompt,
+          temperature: 0,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          maxTokens: 256,
+          signal
+        })) {
+          if (chunk.type === 'text-delta') text += chunk.text
+          else if (chunk.type === 'reasoning-delta') reasoning += chunk.text
+          else if (chunk.type === 'finish') {
+            const kind = chunk.reason && chunk.reason.kind ? chunk.reason.kind : ''
+            if (kind === 'error' || kind === 'aborted') {
+              const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : kind
+              throw new Error('flash 调用失败: ' + failure)
+            }
+          }
         }
+        return text.trim() !== '' ? text : reasoning
       }
-      return text
+
+      try {
+        return await streamOnce('off')
+      } catch (error) {
+        if (!isEffortRejection(error)) throw error
+        console.warn(`[${NAME}] provider "${provider}" model "${model}" 不支持 reasoning effort "off"，去掉 effort 参数重试`)
+        return await streamOnce(undefined)
+      }
     }
 
     /**
@@ -1214,7 +1383,6 @@ export default {
     /**
      * 通用超时 + 重试包装：runFn(signal) 返回结果对象；
      * 超时 abort 并重试 1 次，仍失败 → { failed: true }（调用方按 fail-safe 处理）。
-     * judgeOnce / verifySimilarity 共用；rejection 在 race 内消化（防 unhandled rejection）。
      */
     const withRetry = async (runFn, label) => {
       const timeoutMs = config.judgeTimeoutMs || 20000
@@ -1248,34 +1416,28 @@ export default {
         if (!second.timedOut) return second
       } catch (error) {
         console.error(`[${NAME}] ${label} 重试仍异常`, error)
-        return { failed: true }
       }
-      console.warn(`[${NAME}] ${label} 两次超时(${timeoutMs}ms×2)`)
       return { failed: true }
     }
 
-    /** flash 风险判定（带超时重试）：失败 → { verdict:'risky', category:'neutral', failed:true }（fail-safe） */
     const judgeWithFlash = async (toolName, mode, justification) => {
-      const result = await withRetry((signal) => judgeOnce(toolName, mode, justification, signal), 'flash 判断')
-      if (result.failed) return { verdict: 'risky', category: 'neutral', timedOut: true, failed: true }
-      return result
+      return withRetry(
+        (signal) => judgeOnce(toolName, mode, justification, signal),
+        `flash 判断`
+      )
     }
 
-    /** 同类验证（带超时重试）：失败 → { verdict:'different', failed:true }（fail-safe：验证失败按不同类处理） */
     const verifySimilarityWithRetry = async (toolName, mode, justification, samples) => {
-      const result = await withRetry((signal) => verifySimilarity(toolName, mode, justification, samples, signal), '同类验证')
-      if (result.failed) return { verdict: 'different', failed: true }
-      return result
+      return withRetry(
+        (signal) => verifySimilarity(toolName, mode, justification, samples, signal),
+        `同类验证`
+      )
     }
 
-    /** 记录一次人工批准的样本（{fp, ctx}）；同指纹覆盖旧样本；返回本次指纹（可能为 null） */
     const recordSample = (key, justification) => {
       const fp = extractOperationFingerprint(justification)
-      const ctx = String(justification || '').slice(0, 200)
       const list = (learning.history[key] || []).slice()
-      const idx = fp ? list.findIndex((s) => s.fp === fp) : -1
-      if (idx >= 0) list[idx] = { fp, ctx }
-      else list.push({ fp, ctx })
+      list.push({ fp: fp || null, ctx: justification.slice(0, 120), ts: new Date().toISOString() })
       learning.history[key] = list.slice(-10)
       return fp
     }
@@ -1287,10 +1449,14 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
-          console.error(`[${NAME}] permissionPresets.current failed`, error)
-          return next()
+          try {
+            preset = permissionPresets.current(session.events)
+          } catch {
+            console.error(`[${NAME}] permissionPresets.current failed`, error)
+            return next()
+          }
         }
         if (preset !== PRESET_NAME) return next()
         if (req.signal && req.signal.aborted) return next()
@@ -1299,8 +1465,12 @@ export default {
         const reason = String(req.reason || '')
         const { mode, justification } = parseReason(reason)
         const sessionId = typeof session.id === 'string' ? session.id : ''
-        // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd）
-        const sessionCwd = (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        // 会话工作目录：相对路径快照解析的基准（优先读 SessionHeader.cwd）
+        const sessionCwd = (() => {
+          const h = session.header
+          if (h && typeof h.cwd === 'string' && h.cwd) return h.cwd
+          return (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        })()
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, session.events)
@@ -1311,6 +1481,14 @@ export default {
           recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt))
           const out = await next()
           if (out === 'allowed-once') {
+            // 若因 Flash 调用失败/超时转人工，用户通过后依然记入学习样本与统计，避免因网络抖动丢失学习积累
+            if (why === 'flash-failed' && learning.enabled) {
+              const k = learnKey(tName, tMode, cat || 'neutral')
+              const prev = learning.stats[k] || 0
+              learning.stats[k] = prev + 1
+              recordSample(k, jst)
+              saveJson(LEARNING_PATH, learning)
+            }
             recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt))
           } else if (out === 'rejected') {
             recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, filesOpt))
