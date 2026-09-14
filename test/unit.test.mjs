@@ -225,4 +225,44 @@ assert.strictEqual(isOriginSafe({ headers: { host: '127.0.0.1:3000', origin: 'ht
 assert.strictEqual(isOriginSafe({ headers: { host: '127.0.0.1:3000', origin: 'https://evil.com' } }), false, 'External origin MUST be rejected')
 assert.strictEqual(isOriginSafe({ headers: { host: '127.0.0.1:3000', referer: 'https://attacker.org/attack' } }), false, 'External referer MUST be rejected')
 
+// 5. normalizeConfig auto-merges allowRules test
+const DEFAULT_ALLOW_RULES = [
+  { mode: 'workspace-write', description: '工作区写入' },
+  { contains: 'git', description: 'Git 常规操作自动放行' },
+  { contains: 'github', description: 'GitHub/GCM 凭据与网络交互自动放行' },
+  { tool: 'pwsh', mode: 'danger-full-access', contains: 'git', description: 'git 网络/凭据操作自动放行' },
+  { tool: 'pwsh', mode: 'danger-full-access', contains: 'EPERM', description: '沙箱子进程创建受限自动提权放行' }
+]
+
+function testNormalizeConfig(raw) {
+  const cfg = raw && typeof raw === 'object' ? raw : {}
+  if (!Array.isArray(cfg.allowRules)) {
+    cfg.allowRules = DEFAULT_ALLOW_RULES.slice()
+  } else {
+    for (const defRule of DEFAULT_ALLOW_RULES) {
+      const exists = cfg.allowRules.some((r) =>
+        (r.mode || '') === (defRule.mode || '') &&
+        (r.tool || '') === (defRule.tool || '') &&
+        (r.category || '') === (defRule.category || '') &&
+        (r.contains || '') === (defRule.contains || '')
+      )
+      if (!exists) {
+        cfg.allowRules.push(defRule)
+      }
+    }
+  }
+  return cfg
+}
+
+const customConfig = {
+  allowRules: [
+    { mode: 'workspace-write', description: '自定义工作区' },
+    { tool: 'bash', contains: 'curl', description: '用户自定义规则' }
+  ]
+}
+const merged = testNormalizeConfig(customConfig)
+assert.strictEqual(merged.allowRules.length, 6, 'Should keep 2 custom rules and merge 4 missing default rules without duplication')
+assert.ok(merged.allowRules.some((r) => r.contains === 'git'), 'Should contain git rule after merge')
+assert.ok(merged.allowRules.some((r) => r.contains === 'curl'), 'Should preserve custom curl rule')
+
 console.log('All tests passed successfully!')

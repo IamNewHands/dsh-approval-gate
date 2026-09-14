@@ -32,7 +32,8 @@
  */
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const NAME = 'dsh-approval-gate'
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -42,6 +43,9 @@ const LEARNING_PATH = join(DATA_DIR, 'learning.json')
 const AUDIT_PATH = join(DATA_DIR, 'audit.log')
 const EVENTS_PATH = join(DATA_DIR, 'events.jsonl')
 const SNAPSHOTS_DIR = join(DATA_DIR, 'snapshots')
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const BUNDLED_ALLOWLIST_PATH = join(__dirname, '..', 'allowlist.json')
 
 function getProfilePatchPath() {
   if (process.env.DSH_PROFILE) {
@@ -424,11 +428,13 @@ const DEFAULT_DENY_KEYWORDS = [
   'git reset --hard', 'git clean -fd', 'docker rm', 'docker system prune'
 ]
 
-// 默认白名单规则：工作区写入（可回补）、Git 常规操作自动放行
+// 默认白名单规则：工作区写入（可回补）、Git 常规操作、常用提权放行
 const DEFAULT_ALLOW_RULES = [
   { mode: 'workspace-write', description: '工作区写入（可回补，对应 acceptEdits/workspace-write）' },
   { contains: 'git', description: 'Git 常规操作（clone/fetch/pull/push/commit/checkout 等）自动放行' },
-  { contains: 'github', description: 'GitHub/GCM 凭据与网络交互自动放行' }
+  { contains: 'github', description: 'GitHub/GCM 凭据与网络交互自动放行' },
+  { tool: 'pwsh', mode: 'danger-full-access', contains: 'git', description: 'git 网络/凭据操作(danger-full-access)自动放行' },
+  { tool: 'pwsh', mode: 'danger-full-access', contains: 'EPERM', description: '沙箱子进程创建受限(EPERM/cmd.exe)自动提权放行' }
 ]
 
 // 硬风险类别：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习、永远人工）
@@ -753,11 +759,25 @@ function audit(line) {
   } catch { /* 审计失败不影响主流程 */ }
 }
 
-// 首次加载时初始化配置文件；旧版（v1）自动补齐 v3 字段
+// 首次加载时初始化配置文件；旧版（v1）自动补齐 v3 字段；自动合并默认白名单规则（方便多机同步）
 function normalizeConfig(raw) {
   const cfg = raw && typeof raw === 'object' ? raw : {}
   cfg.denyKeywords = cfg.denyKeywords || DEFAULT_DENY_KEYWORDS
-  cfg.allowRules = cfg.allowRules || DEFAULT_ALLOW_RULES
+  if (!Array.isArray(cfg.allowRules)) {
+    cfg.allowRules = DEFAULT_ALLOW_RULES.slice()
+  } else {
+    for (const defRule of DEFAULT_ALLOW_RULES) {
+      const exists = cfg.allowRules.some((r) =>
+        (r.mode || '') === (defRule.mode || '') &&
+        (r.tool || '') === (defRule.tool || '') &&
+        (r.category || '') === (defRule.category || '') &&
+        (r.contains || '') === (defRule.contains || '')
+      )
+      if (!exists) {
+        cfg.allowRules.push(defRule)
+      }
+    }
+  }
   cfg.denyRules = cfg.denyRules || []
   cfg.hardCategories = cfg.hardCategories || DEFAULT_HARD_CATEGORIES
   cfg.riskyThreshold = cfg.riskyThreshold || 3
@@ -774,7 +794,8 @@ function normalizeConfig(raw) {
 
 let config = loadJson(ALLOWLIST_PATH, null)
 if (!config || typeof config !== 'object') {
-  config = {
+  const bundled = loadJson(BUNDLED_ALLOWLIST_PATH, null)
+  config = bundled && typeof bundled === 'object' ? bundled : {
     version: 3,
     denyKeywords: DEFAULT_DENY_KEYWORDS,
     allowRules: DEFAULT_ALLOW_RULES,
@@ -784,6 +805,7 @@ if (!config || typeof config !== 'object') {
     judgeTimeoutMs: 20000,
     learning: { enabled: true }
   }
+  config = normalizeConfig(config)
   saveJson(ALLOWLIST_PATH, config)
 } else {
   config = normalizeConfig(config)
