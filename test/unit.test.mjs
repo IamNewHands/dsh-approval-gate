@@ -21,6 +21,8 @@ function matchRule(rules, toolName, mode, category, justification) {
 
 const allowRules = [
   { mode: 'workspace-write', description: '工作区写入' },
+  { contains: 'git', description: 'Git 常规操作自动放行' },
+  { contains: 'github', description: 'GitHub/GCM 凭据与网络交互自动放行' },
   { tool: 'pwsh', mode: 'danger-full-access', category: 'neutral', contains: 'vitest', description: '自动沉淀：中立' }
 ]
 
@@ -32,6 +34,50 @@ assert.strictEqual(matchedInStep2.contains, 'vitest')
 // Workspace-write rule match
 const matchedWs = matchRule(allowRules, 'edit', 'workspace-write', null, 'edit file.js')
 assert.ok(matchedWs, 'Step 2 must match workspace-write rule')
+
+// Git operations tests
+const matchedGit1 = matchRule(allowRules, 'pwsh', 'danger-full-access', null, 'git push origin main')
+assert.ok(matchedGit1, 'Git push under danger-full-access MUST match git allow rule')
+
+const matchedGit2 = matchRule(allowRules, 'bash', 'danger-full-access', null, 'git clone https://github.com/repo')
+assert.ok(matchedGit2, 'Git clone under bash MUST match git allow rule')
+
+const matchedGit3 = matchRule(allowRules, 'pwsh', 'workspace-write', null, 'git status')
+assert.ok(matchedGit3, 'Git status under workspace-write MUST match git allow rule')
+
+const matchedGithub = matchRule(allowRules, 'pwsh', 'danger-full-access', null, 'Windows 凭据管理器读取 GitHub token')
+assert.ok(matchedGithub, 'GitHub credential access MUST match github allow rule')
+
+// Tool command resolution test
+function resolveToolCallArgs(callId, events) {
+  if (!callId || !Array.isArray(events) || events.length === 0) return null
+  for (const ev of events) {
+    if (ev && ev.type === 'tool/call' && ev.data && ev.data.callId === callId) {
+      const raw = ev.data.arguments
+      try {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+        return parsed && typeof parsed === 'object' ? parsed : null
+      } catch {
+        return null
+      }
+    }
+  }
+  return null
+}
+
+function resolveToolCallCommand(callId, events) {
+  const args = resolveToolCallArgs(callId, events)
+  if (!args || typeof args !== 'object') return ''
+  return String(args.command || args.cmd || args.script || args.CommandLine || '').trim()
+}
+
+const mockEvents = [
+  { type: 'tool/call', data: { callId: 'c1', arguments: JSON.stringify({ command: 'git -c http.sslBackend=openssl push origin main' }) } }
+]
+const extractedCmd = resolveToolCallCommand('c1', mockEvents)
+assert.strictEqual(extractedCmd, 'git -c http.sslBackend=openssl push origin main')
+const matchWithCmd = matchRule(allowRules, 'pwsh', 'danger-full-access', null, `推送代码到远程仓库 ${extractedCmd}`)
+assert.ok(matchWithCmd, 'Match context including resolved tool command MUST match git rule')
 
 // 2. looksDeny test
 const DEFAULT_DENY_KEYWORDS = [
@@ -70,6 +116,12 @@ assert.strictEqual(looksDeny('rm -rf /data'), true, 'rm -rf must be blocked')
 assert.strictEqual(looksDeny('shutdown /s /t 0'), true, 'shutdown must be blocked')
 assert.strictEqual(looksDeny('reboot now'), true, 'reboot must be blocked')
 assert.strictEqual(looksDeny('git reset --hard HEAD~1'), true, 'git reset --hard must be blocked')
+assert.strictEqual(looksDeny('git clean -fd'), true, 'git clean -fd must be blocked')
+assert.strictEqual(looksDeny('git push --force origin main'), true, 'push --force must be blocked')
+assert.strictEqual(looksDeny('git force-push origin main'), true, 'force-push must be blocked')
+assert.strictEqual(looksDeny('pwsh git push origin main'), false, 'normal git push should not be blocked')
+assert.strictEqual(looksDeny('pwsh git clone https://github.com/repo'), false, 'git clone should not be blocked')
+assert.strictEqual(looksDeny('pwsh git commit -m "update code"'), false, 'git commit should not be blocked')
 assert.strictEqual(looksDeny('truncate table users'), true, 'truncate table must be blocked')
 assert.strictEqual(looksDeny('清空数据库'), true, '清空数据库 must be blocked')
 

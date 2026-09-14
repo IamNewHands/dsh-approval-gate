@@ -302,16 +302,32 @@ function extractFiles(text) {
  * @param {Array} events 会话事件列表（session.events）
  * @returns {string[]|null} 结构化路径数组（未命中返回 null）
  */
-function resolveToolCallFiles(callId, events) {
+/** 从 session.events 中提取关联 tool/call 的参数对象 */
+function resolveToolCallArgs(callId, events) {
   if (!callId || !Array.isArray(events) || events.length === 0) return null
-  let args = null
   for (const ev of events) {
     if (ev && ev.type === 'tool/call' && ev.data && ev.data.callId === callId) {
       const raw = ev.data.arguments
-      try { args = typeof raw === 'string' ? JSON.parse(raw) : raw } catch { args = null }
-      break
+      try {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+        return parsed && typeof parsed === 'object' ? parsed : null
+      } catch {
+        return null
+      }
     }
   }
+  return null
+}
+
+/** 从 session.events 中提取关联 tool/call 的执行命令文本（供白名单与危险词综合判定） */
+function resolveToolCallCommand(callId, events) {
+  const args = resolveToolCallArgs(callId, events)
+  if (!args || typeof args !== 'object') return ''
+  return String(args.command || args.cmd || args.script || args.CommandLine || '').trim()
+}
+
+function resolveToolCallFiles(callId, events) {
+  const args = resolveToolCallArgs(callId, events)
   if (!args || typeof args !== 'object') return null
   const found = []
   const seen = new Set()
@@ -408,9 +424,11 @@ const DEFAULT_DENY_KEYWORDS = [
   'git reset --hard', 'git clean -fd', 'docker rm', 'docker system prune'
 ]
 
-// 默认白名单规则：工作区写入（可回补）自动放行
+// 默认白名单规则：工作区写入（可回补）、Git 常规操作自动放行
 const DEFAULT_ALLOW_RULES = [
-  { mode: 'workspace-write', description: '工作区写入（可回补，对应 acceptEdits/workspace-write）' }
+  { mode: 'workspace-write', description: '工作区写入（可回补，对应 acceptEdits/workspace-write）' },
+  { contains: 'git', description: 'Git 常规操作（clone/fetch/pull/push/commit/checkout 等）自动放行' },
+  { contains: 'github', description: 'GitHub/GCM 凭据与网络交互自动放行' }
 ]
 
 // 硬风险类别：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习、永远人工）
@@ -1475,6 +1493,8 @@ export default {
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, session.events)
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
+        const toolCmd = resolveToolCallCommand(req.callId, session.events)
+        const matchContext = toolCmd ? `${justification} ${toolCmd}` : justification
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
         const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why) => {
@@ -1497,13 +1517,13 @@ export default {
         }
 
         // 1. DENY 层：不可逆危险词 → 转人工（fail-safe，最高优先）
-        if (looksDeny(toolName + ' ' + reason)) {
+        if (looksDeny(toolName + ' ' + reason + (toolCmd ? ' ' + toolCmd : ''))) {
           audit(`DENY    ${toolName} mode=${mode || 'none'} | ${reason.slice(0, 160)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'deny')
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        const matchedRule = matchRule(config.allowRules, toolName, mode, null, justification)
+        const matchedRule = matchRule(config.allowRules, toolName, mode, null, matchContext)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', filesOpt)
@@ -1511,7 +1531,7 @@ export default {
         }
 
         // 3. flash 判定
-        const { verdict, category, timedOut, failed } = await judgeWithFlash(toolName, mode, justification)
+        const { verdict, category, timedOut, failed } = await judgeWithFlash(toolName, mode, matchContext)
 
         if (verdict === 'safe') {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-safe${timedOut ? '，重试后' : ''})`)
@@ -1541,14 +1561,14 @@ export default {
         }
 
         // 4d. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
-        if (matchRule(config.denyRules, toolName, mode, cat, justification)) {
+        if (matchRule(config.denyRules, toolName, mode, cat, matchContext)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
         // 4e. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
         const key = learnKey(toolName, mode, cat)
-        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, justification)
+        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, matchContext)
         if (learnedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
