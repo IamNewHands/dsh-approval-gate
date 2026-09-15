@@ -492,11 +492,15 @@ function isOriginSafe(req) {
  * 返回 undefined 表示放行；否则返回应写入的 HTTP 状态码（401/403）。
  */
 function requestAuthRejection(ctx, req) {
-  const conn = ctx && ctx.connection
-  if (conn && typeof conn.requestRejection === 'function') {
-    const rejection = conn.requestRejection(req)
-    if (rejection !== undefined) return rejection
-    return undefined
+  try {
+    const conn = ctx && ctx.connection
+    if (conn && typeof conn.requestRejection === 'function') {
+      const rejection = conn.requestRejection(req)
+      if (rejection !== undefined) return rejection
+      return undefined
+    }
+  } catch (error) {
+    console.error(`[${NAME}] requestRejection 异常，退化为来源校验`, error)
   }
   return isOriginSafe(req) ? undefined : 403
 }
