@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "denyKeywords": [
     "rm -rf",
     "rm -fr",
@@ -10,10 +10,10 @@
     "dd of=",
     "mkfs",
     "mkfs.ext",
+    "format",
     "drop table",
     "drop database",
     "delete from",
-    "truncate table",
     "truncate ",
     "terraform destroy",
     "revoke",
@@ -27,64 +27,60 @@
     "git clean -fd",
     "docker rm",
     "docker system prune",
-    "shutdown",
-    "reboot",
     "remove-item -recurse -force",
     "remove-item -force -recurse",
     "remove-item -r -fo",
     "remove-item -fo -r",
-    "rmdir /s /q",
-    "rmdir /q /s",
-    "rd /s /q",
-    "rd /q /s",
+    "ri -recurse -force",
+    "ri -r -fo",
     "del /f /s /q",
     "del /s /q /f",
     "del /s /q",
     "del /q /s",
     "del /f /q",
+    "rmdir /s /q",
+    "rmdir /q /s",
+    "rd /s /q",
+    "rd /q /s",
     "erase /f /s /q",
     "erase /s /q",
-    "format c:",
-    "format d:",
-    "format-volume",
     "clear-disk",
+    "format-volume",
+    "remove-partition",
     "initialize-disk",
     "diskpart",
-    "remove-partition",
     "cipher /w:",
     "vssadmin delete shadows",
     "vssadmin resize shadowstorage",
     "wmic shadowcopy delete",
     "wbadmin delete catalog",
     "wbadmin delete systemstatebackup",
+    "shutdown",
+    "reboot",
+    "stop-computer",
+    "restart-computer",
+    "set-executionpolicy",
+    "set-mppreference",
+    "add-mppreference",
+    "disablerealtimemonitoring",
+    "disable-bitlocker",
+    "netsh advfirewall",
+    "netsh firewall set",
+    "set-netfirewallprofile",
     "reg delete",
     "reg add",
     "reg restore",
     "reg import",
     "reg load",
     "remove-itemproperty",
-    "remove-item hklm:",
-    "remove-item hkcu:",
+    "remove-item hklm",
+    "remove-item hkcu",
     "remove-item registry::",
     "set-itemproperty -path hklm:",
     "set-itemproperty -path hkcu:",
-    "stop-computer",
-    "restart-computer",
-    "bcdedit",
-    "bootrec",
     "takeown",
     "icacls",
     "set-acl",
-    "set-mppreference",
-    "add-mppreference",
-    "disablerealtimemonitoring",
-    "netsh advfirewall set",
-    "netsh firewall set",
-    "set-netfirewallprofile",
-    "wevtutil cl",
-    "clear-eventlog",
-    "auditpol /clear",
-    "auditpol /set",
     "sc delete",
     "sc stop",
     "sc config",
@@ -104,7 +100,12 @@
     "new-localuser",
     "add-localgroupmember",
     "enable-localuser",
-    "set-executionpolicy"
+    "bcdedit",
+    "bootrec",
+    "wevtutil cl",
+    "clear-eventlog",
+    "auditpol /clear",
+    "auditpol /set"
   ],
   "allowRules": [
     {
@@ -112,12 +113,90 @@
       "description": "工作区写入（可回补，对应 acceptEdits/workspace-write）"
     },
     {
+      "tool": "pwsh",
+      "contains": "vitest",
+      "description": "放行 Vitest 单元/集成测试与 Worker 子进程执行"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "worker process",
+      "description": "放行测试框架 Worker 多进程派生与沙箱提权"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "child process",
+      "description": "放行开发工具链 Child Process 子进程派生与执行"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "subprocess",
+      "description": "放行 Windows Subprocess 子进程沙箱提权与重试"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "wrangler",
+      "description": "放行 Cloudflare Wrangler 构建、dry-run、类型生成与 Worker 流程"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "build",
+      "description": "放行前端与 Worker 项目构建 (build) 流程"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "github",
+      "description": "放行 GitHub/GCM 凭据调用、变基同步与常规推送"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "凭据",
+      "description": "放行 Git 凭据管理器调用（解决 Windows 沙箱 Win32 error 5）"
+    },
+    {
+      "tool": "pwsh",
       "contains": "git",
-      "description": "Git 常规操作（clone/fetch/pull/push/commit/checkout 等）自动放行"
+      "description": "放行常规 Git 版本管理与分支同步操作"
+    },
+    {
+      "contains": "git",
+      "description": "Git 常规操作（clone/fetch/pull/push/commit/checkout 等）自动放行（不限工具）"
     },
     {
       "contains": "github",
-      "description": "GitHub/GCM 凭据与网络交互自动放行"
+      "description": "GitHub/GCM 凭据与网络交互自动放行（不限工具）"
+    },
+    {
+      "contains": "push",
+      "description": "放行常规 Git 推送操作 (push)"
+    },
+    {
+      "contains": "推送",
+      "description": "放行常规 Git 代码推送与分支同步操作"
+    },
+    {
+      "tool": "pwsh",
+      "contains": ".dsh",
+      "description": "放行 DSH Profile 目录插件与依赖配置写入"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "pnpm",
+      "description": "放行 pnpm 包管理、构建与依赖安装"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "tsc",
+      "description": "放行 TypeScript 类型检查与编译输出"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "typescript",
+      "description": "放行 TypeScript 完整类型检查与构建流程"
+    },
+    {
+      "tool": "pwsh",
+      "contains": "eslint",
+      "description": "放行 ESLint 代码规范与静态检查"
     },
     {
       "tool": "pwsh",
