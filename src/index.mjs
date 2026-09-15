@@ -484,6 +484,23 @@ function isOriginSafe(req) {
   return true
 }
 
+/**
+ * API 鉴权围栏（修复上游 issue #12：/api/auto-approve/* 此前无凭据校验）。
+ * 优先使用 DSH 核心连接服务 `connection.requestRejection(req)`——与宿主自身 API
+ * （/api/health、/api/sessions 等 401 围栏）同一套凭据（会话 cookie / access token）。
+ * 核心服务不可用（旧版部署未加载 connection）时退化为来源校验。
+ * 返回 undefined 表示放行；否则返回应写入的 HTTP 状态码（401/403）。
+ */
+function requestAuthRejection(ctx, req) {
+  const conn = ctx && ctx.connection
+  if (conn && typeof conn.requestRejection === 'function') {
+    const rejection = conn.requestRejection(req)
+    if (rejection !== undefined) return rejection
+    return undefined
+  }
+  return isOriginSafe(req) ? undefined : 403
+}
+
 /** 配置快照（供设置页展示；区分预置默认值与当前值） */
 function getRulesSnapshot(permissionPresets) {
   reloadConfig()
@@ -973,9 +990,10 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/events',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) {
-              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
-              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
               return
             }
             if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
@@ -1016,9 +1034,10 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/rules',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) {
-              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
-              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
               return
             }
             const send = (code, obj) => {
@@ -1046,9 +1065,10 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/setup',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) {
-              res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
-              res.end(JSON.stringify({ ok: false, error: 'Forbidden: untrusted origin' }))
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
               return
             }
             const send = (code, obj) => {
@@ -1121,7 +1141,8 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/diff',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) return send(res, authRej, { ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { ok: false, error: 'method not allowed' })
               const url = new URL(req.url, 'http://localhost')
@@ -1158,7 +1179,8 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/revert',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) return send(res, authRej, { ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method not allowed' })
               const body = await readBody(req)
@@ -1206,7 +1228,8 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/snapshots-stats',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) return send(res, authRej, { ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' })
             try {
               const url = new URL(req.url, 'http://localhost')
               const filterSession = url.searchParams.get('sessionId') || ''
@@ -1242,7 +1265,8 @@ export default {
           kind: 'exact',
           path: '/api/auto-approve/snapshots-clear',
           handler: async (req, res) => {
-            if (!isOriginSafe(req)) return send(res, 403, { ok: false, error: 'Forbidden: untrusted origin' })
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) return send(res, authRej, { ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' })
             try {
               if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method not allowed' })
               const body = await readBody(req)
