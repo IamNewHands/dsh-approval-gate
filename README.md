@@ -40,8 +40,10 @@ Flash 模型预判每次沙箱越界：常规操作自动放行，硬风险操�
 ## 🚀 快速开始
 
 ```sh
-dsh plugin --profile web add dsh-approval-gate
+dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 ```
+
+> npm 上的 `dsh-approval-gate` 是上游 0.5.0，不含本仓库修复，请勿按包名安装。
 
 1. **配置权限预设**：在 `~/.dsh/profiles/web/cordis.patch.yml` 添加 `auto-approve` 预设（[详见指南](docs/GUIDE.md#%E5%AE%89%E8%A3%85%E5%90%8E%E5%BF%85%E9%A1%BB%E6%89%8B%E5%8A%A8%E9%85%8D%E7%BD%AE%E6%9D%83%E9%99%90%E9%A2%84%E8%AE%BE%E5%85%B3%E9%94%AE%E6%AD%A5%E9%AA%A4)）
 2. **重启** `dsh web`

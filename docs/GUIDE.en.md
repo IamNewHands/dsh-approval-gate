@@ -2,7 +2,7 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.5.0: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.5.5: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
@@ -30,12 +30,11 @@ DENY (irreversible keywords) → allowlist (deterministic rules) → denyRules (
 ## Install
 
 ```sh
-# Option 1: npm (recommended)
-dsh plugin --profile web add dsh-approval-gate
-
-# Option 2: GitHub
-dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
+# Install from this repository (recommended)
+dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 ```
+
+> Note: the `dsh-approval-gate` package on npm is still upstream 0.5.0 and does not contain this repository's fixes. Do not install it by package name.
 
 ## ⚠️ Manual permission preset (required after install)
 

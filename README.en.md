@@ -40,8 +40,10 @@ The "Auto-approval" section in Settings provides full configuration: **preset in
 ## 🚀 Quick Start
 
 ```sh
-dsh plugin --profile web add dsh-approval-gate
+dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 ```
+
+> The `dsh-approval-gate` package on npm is upstream 0.5.0 and lacks this repository's fixes — do not install it by package name.
 
 1. **Add the permission preset**: append the `auto-approve` preset to `~/.dsh/profiles/web/cordis.patch.yml` ([see guide](docs/GUIDE.en.md#%E2%9A%A0%EF%B8%8F-manual-permission-preset-required-after-install))
 2. **Restart** `dsh web`
