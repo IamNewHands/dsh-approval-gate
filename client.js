@@ -24,6 +24,11 @@ window.__ModuleLoader__.load({
 .ag-notice-card{box-sizing:border-box;display:flex;align-items:center;gap:10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);border-radius:12px;padding:6px 10px 6px 12px;box-shadow:var(--dsw-shadow-lv1)}
 .ag-notice-card-pending{border-color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-state-warn-tertiary)}
 .ag-notice-card-manual{border-color:var(--dsw-alias-state-warn-primary)}
+.ag-notice-card-reject{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-interactive-bg-hover-danger)}
+.ag-notice-actions{flex:none;display:flex;align-items:center;gap:6px}
+.ag-notice-btn{box-sizing:border-box;height:24px;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;border:1px solid var(--dsw-alias-border-l2);background:transparent;border-radius:12px;align-items:center;padding:0 10px;font-size:12px;line-height:22px;display:inline-flex;white-space:nowrap}
+.ag-notice-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.ag-notice-hint{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
 .ag-notice-glyph{color:var(--dsw-alias-state-success-primary);flex:none;display:inline-flex;align-items:center;justify-content:center}
 .ag-notice-glyph-warn{color:var(--dsw-alias-state-warn-label);flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:16px;width:16px;height:16px}
 .ag-notice-glyph-err{color:var(--dsw-alias-state-error-primary);flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:16px;width:16px;height:16px}
@@ -53,6 +58,8 @@ window.__ModuleLoader__.load({
 .ag-row-glyph-err{color:var(--dsw-alias-state-error-primary);flex:none;display:inline-flex;font-size:12px;line-height:16px;width:14px;height:14px;align-items:center;justify-content:center}
 .ag-row-line{flex:1 1 auto;flex:none;width:1px;background:var(--dsw-alias-border-l1);min-height:10px}
 .ag-row:last-child .ag-row-line{display:none}
+.ag-row-actions{display:flex;align-items:center;gap:6px;margin-top:2px}
+.ag-row-pending{border-left:2px solid var(--dsw-alias-state-error-primary)}
 .ag-row-body{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:4px}
 .ag-row-top{display:flex;align-items:center;gap:8px;min-width:0}
 .ag-row-tool{flex:none;color:var(--dsw-alias-label-primary);font:500 12px/18px var(--ds-font-family-code)}
@@ -143,7 +150,14 @@ window.__ModuleLoader__.load({
       'flash-same': 'Flash 同类验证'
     }
     const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same'])
-    const HARD_CATEGORIES = new Set(['deletion', 'credential', 'remote', 'system', 'bulk'])
+    /**
+     * 生效的硬风险类别。默认值与 host 的 DEFAULT_HARD_CATEGORIES 一致，但 host 会通过
+     * 事件 API 下发**实际配置**（hardCategories 是可在设置页改、且参与多机同步的键）。
+     * 硬编码默认值会在用户自定义后撒谎：多显示追认按钮 → 点了 400；少显示 → 用户
+     * 以为不可追认。因此以服务端下发的列表为准。
+     */
+    const DEFAULT_HARD_CATEGORIES = ['deletion', 'credential', 'remote', 'system', 'bulk']
+    let HARD_CATEGORIES = new Set(DEFAULT_HARD_CATEGORIES)
 
     // 拒绝记录文案：按 host 记录的 path（判定路径）精确分类
     function rejectLabel(ev) {
@@ -194,24 +208,154 @@ window.__ModuleLoader__.load({
       return { sessionId }
     }
 
+    /** 用 host 下发的生效硬类别刷新本地缓存（缺失/非法时保留当前值，不退回默认） */
+    function applyHardCategories(list) {
+      if (!Array.isArray(list) || list.length === 0) return
+      HARD_CATEGORIES = new Set(list.map(function (c) { return String(c) }))
+    }
+
     function fetchEvents(sessionId, since) {
       const q = '/api/auto-approve/events?sessionId=' + encodeURIComponent(sessionId || '') + (since ? '&since=' + since : '')
       return fetch(q, { headers: { 'cache-control': 'no-cache' } }).then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status)
         return r.json()
       }).then(function (data) {
+        applyHardCategories(data && data.hardCategories)
         return (data && Array.isArray(data.events)) ? data.events : []
       })
     }
 
     // ================= ✅ 自动放行提示条（conversation.input.dock，order=30） =================
+    /**
+     * 已读位置（跨刷新保留）：静默拒绝的提示条会**一直挂在对话框上方**，直到用户
+     * 切到「审批」tab 看过为止。已读集合与「当前仍待处理的最大事件 id」都放在
+     * localStorage，刷新页面不会把待处理记录弄丢，也不会重复提醒已看过的记录。
+     */
+    const SEEN_REJECTS_KEY = 'dsh-approval-gate.seenRejects'
+    const PENDING_REJECT_KEY = 'dsh-approval-gate.pendingReject'
+
+    function readJson(key, fallback) {
+      try {
+        const raw = window.localStorage.getItem(key)
+        return raw ? JSON.parse(raw) : fallback
+      } catch (e) { return fallback }
+    }
+    function writeJson(key, value) {
+      try { window.localStorage.setItem(key, JSON.stringify(value)) } catch (e) {}
+    }
+
+    /** 事件是否属于「需要用户知晓」的拒绝：静默拒绝 + 人工拒绝 */
+    function isRejectEvent(ev) {
+      const kind = ev && ev.kind
+      return kind === 'hard-reject' || kind === 'judge-deny' || kind === 'manual-rejected'
+    }
+
+    /** 该事件能否被追认（与 host 端围栏一致：判定层静默拒绝 + 非硬风险类别） */
+    function isReconsiderable(ev) {
+      return Boolean(ev) && ev.kind === 'judge-deny' && !ev.reconsidered
+        && !HARD_CATEGORIES.has(String(ev.category || 'neutral'))
+    }
+
+    /**
+     * 未读拒绝数（用于「审批」tab 角标）。事件从新到旧传入；遇到第一条已读记录即停止，
+     * 因为「已读」是按切到审批 tab 的时刻整体推进的。
+     */
+    function countUnseenRejects(events) {
+      const seen = new Set(readJson(SEEN_REJECTS_KEY, []))
+      let n = 0
+      for (const ev of events) {
+        if (!isRejectEvent(ev)) continue
+        if (seen.has(ev.id)) break
+        n++
+      }
+      return n
+    }
+
+    /** 把当前所有拒绝事件标记为已读（用户切到审批 tab 时调用） */
+    function markRejectsSeen(events) {
+      const seen = readJson(SEEN_REJECTS_KEY, [])
+      const set = new Set(seen)
+      let changed = false
+      for (const ev of events) {
+        if (isRejectEvent(ev) && !set.has(ev.id)) { set.add(ev.id); changed = true }
+      }
+      if (changed) writeJson(SEEN_REJECTS_KEY, Array.from(set).slice(-500))
+      return changed
+    }
+
+    /** 会话内广播「拒绝已读」，让 tab 角标与提示条同步（同页多个组件不共享 React 状态） */
+    const SEEN_EVENT = 'dsh-approval-gate:rejects-seen'
+    function broadcastSeen() {
+      try { window.dispatchEvent(new CustomEvent(SEEN_EVENT)) } catch (e) {}
+    }
+
+    /** 轮询某个会话的全部审批事件（按 id 升序） */
+    function fetchAllEvents(sessionId) {
+      return fetchEvents(sessionId, 0)
+    }
+
+    /**
+     * 切到「审批」tab。
+     *
+     * conversation.input.dock 的 slot props 里没有 openView（那是 conversation.session
+     * 才有的注入面），所以这里按 DOM 找宿主渲染的 tab 按钮并点击——tab 的可见文本就是
+     * 本插件注册的 label「审批」。找不到就返回 false，调用方退化为「标记已读 + 收起提示条」。
+     */
+    function clickApprovalTab() {
+      try {
+        const nodes = document.querySelectorAll('[role="tab"], button, [role="button"]')
+        for (const node of nodes) {
+          const text = String((node.textContent || '')).trim()
+          // label 可能是「审批」或带角标的「审批 2」；排除本插件自己的按钮文案
+          if (text === '审批' || /^审批\s*\d*$/.test(text)) {
+            node.click()
+            return true
+          }
+        }
+      } catch (e) {}
+      return false
+    }
+
     function NoticeStrip(props) {
       const frame = resolveFrame(props.slotsProps || {})
       const sessionId = frame.sessionId
       const [notice, setNotice] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
       const sinceRef = React.useRef(0)
       const lastShownIdRef = React.useRef(0) // 已弹过的事件最大 id（跨会话全局递增，防重复弹历史）
       const hideTimerRef = React.useRef(null)
+
+      const openApprovalTab = function () {
+        if (clickApprovalTab()) return
+        // 兜底：切不动视图时至少把待处理记录标为已读，避免角标永久挂着
+        fetchAllEvents(sessionId).then(function (evs) {
+          markRejectsSeen(evs)
+          broadcastSeen()
+          setNotice(null)
+        }).catch(function () {})
+      }
+
+      const doReconsider = function (ev) {
+        setBusy(true)
+        fetch('/api/auto-approve/reconsider', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: sessionId, eventId: ev.id }),
+        }).then(function (r) { return r.json() }).then(function (res) {
+          if (res && res.ok) {
+            // 已追认：标为已读并收起提示条
+            const seen = readJson(SEEN_REJECTS_KEY, [])
+            const set = new Set(seen); set.add(ev.id)
+            writeJson(SEEN_REJECTS_KEY, Array.from(set).slice(-500))
+            broadcastSeen()
+            setNotice(null)
+          } else {
+            window.alert((res && res.error) || '追认失败')
+          }
+        }).catch(function (e) {
+          window.alert('追认失败：' + String((e && e.message) || e))
+        }).finally(function () { setBusy(false) })
+      }
 
       React.useEffect(function () {
         let alive = true
@@ -219,6 +363,18 @@ window.__ModuleLoader__.load({
         sinceRef.current = 0
         setNotice(null)
         if (!sessionId) return
+
+        // 待处理拒绝的恢复：刷新页面后仍要看到「直接拒绝」的提示条（用户没看过就不该消失）。
+        // 只恢复最近一条，避免历史拒绝刷屏。
+        const restorePending = function (evs) {
+          const seen = new Set(readJson(SEEN_REJECTS_KEY, []))
+          const pending = evs.filter(function (ev) { return isRejectEvent(ev) && !seen.has(ev.id) })
+          if (pending.length > 0) {
+            const last = pending[pending.length - 1]
+            setNotice(last)
+            lastShownIdRef.current = Math.max(lastShownIdRef.current, last.id)
+          }
+        }
 
         // 轮询主体：拉取游标之后的新事件；去重兜底（id 不大于已弹过的最大 id 直接跳过）
         const startPolling = function () {
@@ -233,9 +389,10 @@ window.__ModuleLoader__.load({
               sinceRef.current = last.id
               const kind = last.kind || 'auto'
               setNotice(last)
-              // pending（等待人工审批）不自动收起；其余按类型定时收起
               if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
-              if (kind !== 'manual-pending') {
+              // 静默拒绝 / 人工拒绝：不自动收起，一直挂到用户看过「审批」tab 或点了处理按钮；
+              // 等待人工审批（pending）同样不收起；其余（自动放行等）按类型定时收起。
+              if (kind !== 'manual-pending' && !isRejectEvent(last)) {
                 const hold = kind === 'manual-approved' ? 5000 : 4000
                 hideTimerRef.current = setTimeout(function () { setNotice(null) }, hold)
               }
@@ -243,21 +400,34 @@ window.__ModuleLoader__.load({
           }, 2000)
         }
 
-        // 打开会话：先静默拉一次全量，仅把游标推进到最新，不弹任何历史提示；完成后再开始轮询
-        fetchEvents(sessionId, 0).then(function (evs) {
+        // 打开会话：先静默拉一次全量，恢复未读拒绝 + 推进游标，不弹自动放行的历史记录
+        fetchAllEvents(sessionId).then(function (evs) {
           if (!alive) return
           if (evs.length > 0) sinceRef.current = evs[evs.length - 1].id
+          restorePending(evs)
           startPolling()
         }).catch(function () {
-          // 静默拉取失败：游标保持 0，靠 lastShownIdRef 去重兜底，仍启动轮询
           if (!alive) return
           startPolling()
         })
+
+        // 用户在「审批」tab 里看过之后，收起提示条
+        const onSeen = function () {
+          setNotice(function (cur) {
+            if (cur && isRejectEvent(cur)) {
+              const seen = new Set(readJson(SEEN_REJECTS_KEY, []))
+              if (seen.has(cur.id)) return null
+            }
+            return cur
+          })
+        }
+        window.addEventListener(SEEN_EVENT, onSeen)
 
         return function () {
           alive = false
           if (timer) clearInterval(timer)
           if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+          window.removeEventListener(SEEN_EVENT, onSeen)
         }
       }, [sessionId])
 
@@ -266,6 +436,7 @@ window.__ModuleLoader__.load({
       const isPending = kind === 'manual-pending'
       const isSilentReject = kind === 'hard-reject' || kind === 'judge-deny'
       const isManual = kind === 'manual-approved' || kind === 'manual-rejected'
+      const isReject = isRejectEvent(notice)
       // 文案
       let title = ''
       let tagText = ''
@@ -294,7 +465,11 @@ window.__ModuleLoader__.load({
         tagText = '自动放行 · ' + label
         glyph = React.createElement(GlyphCheck, null)
       }
-      const cardCls = 'ag-notice-card' + (isPending ? ' ag-notice-card-pending' : isManual ? ' ag-notice-card-manual' : '')
+      const cardCls = 'ag-notice-card'
+        + (isPending ? ' ag-notice-card-pending' : isManual ? ' ag-notice-card-manual' : '')
+        + (isReject ? ' ag-notice-card-reject' : '')
+      // 拒绝类提示条：不自动消失，提供「查看审批记录」与（可追认时）「重新审批通过」
+      const canReconsider = isReconsiderable(notice)
       return React.createElement('div', { className: 'ag-notice' },
         React.createElement('div', { className: cardCls },
           React.createElement('span', { className: 'ag-notice-glyph' }, glyph),
@@ -306,8 +481,27 @@ window.__ModuleLoader__.load({
             React.createElement('div', { className: 'ag-notice-meta' },
               React.createElement('span', { className: isPending ? 'ag-tag-warn' : (kind === 'manual-rejected' || isSilentReject) ? 'ag-tag-err' : kind === 'manual-approved' ? 'ag-tag-warn' : 'ag-tag' + (VERDICT_NEUTRAL.has(notice.verdict) ? ' ag-tag-neutral' : '') }, tagText),
               React.createElement('span', { className: 'ag-time' }, fmtTime(notice.ts)),
+              isReject
+                ? React.createElement('span', { className: 'ag-notice-hint' }, '未读 · 切到「审批」tab 后自动收起')
+                : null,
             ),
           ),
+          isReject
+            ? React.createElement('div', { className: 'ag-notice-actions' },
+                canReconsider
+                  ? React.createElement('button', {
+                      type: 'button', className: 'ag-notice-btn', disabled: busy,
+                      title: '追认这次拒绝：写入自动放行规则，并让 AI 重试该操作',
+                      onClick: function () { doReconsider(notice) },
+                    }, busy ? '处理中…' : '重新审批通过')
+                  : null,
+                React.createElement('button', {
+                  type: 'button', className: 'ag-notice-btn',
+                  title: '打开「审批」tab 查看全部记录',
+                  onClick: openApprovalTab,
+                }, '查看审批记录'),
+              )
+            : null,
           React.createElement('button', {
             type: 'button',
             className: 'ag-notice-close',
@@ -457,6 +651,50 @@ window.__ModuleLoader__.load({
       const [snapIds, setSnapIds] = React.useState(null) // Set<eventId> | null（当前存在快照的事件）
       const [snapFiles, setSnapFiles] = React.useState(null) // {eventId: [absPath,...]} | null（文件级 diff 可点击判断）
       const [diffOpen, setDiffOpen] = React.useState(null) // {eventId, path} | null
+      const [busyId, setBusyId] = React.useState(null) // 正在追认的事件 id
+      const [feedback, setFeedback] = React.useState(null)
+      const aliveRef = React.useRef(true)
+
+      /** 拉取本会话全部审批事件（时间倒序）；组件卸载后丢弃结果 */
+      const loadEvents = function () {
+        if (!sessionId) { setEvents([]); return Promise.resolve() }
+        return fetchEvents(sessionId, 0).then(function (evs) {
+          if (!aliveRef.current) return
+          evs.sort(function (a, b) { return b.id - a.id }) // 时间倒序：最新在最上面
+          setEvents(evs)
+          setError(null)
+          // 打开「审批」tab = 用户看过这些拒绝：标记已读，提示条与待处理角标据此收起
+          if (markRejectsSeen(evs)) broadcastSeen()
+        }).catch(function (e) {
+          if (!aliveRef.current) return
+          setError(String((e && e.message) || e))
+        })
+      }
+
+      /** 追认一次静默拒绝：写规则 + 让 AI 重试；成功后重新加载列表 */
+      const doReconsider = function (ev) {
+        if (busyId !== null) return
+        setBusyId(ev.id)
+        setFeedback(null)
+        fetch('/api/auto-approve/reconsider', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: sessionId, eventId: ev.id }),
+        }).then(function (r) { return r.json() }).then(function (res) {
+          if (res && res.ok) {
+            setFeedback({ ok: true, msg: '已追认：写入自动放行规则' + (res.duplicate ? '（规则已存在）' : '') + '，并已通知 AI 重试该操作' })
+            // 标记已读并通知提示条收起
+            const seen = new Set(readJson(SEEN_REJECTS_KEY, [])); seen.add(ev.id)
+            writeJson(SEEN_REJECTS_KEY, Array.from(seen).slice(-500))
+            broadcastSeen()
+            loadEvents()
+          } else {
+            setFeedback({ ok: false, msg: (res && res.error) || '追认失败' })
+          }
+        }).catch(function (e) {
+          setFeedback({ ok: false, msg: '追认失败：' + String((e && e.message) || e) })
+        }).finally(function () { setBusyId(null) })
+      }
 
       const loadSnapStats = function (sid) {
         const q = sid ? ('?sessionId=' + encodeURIComponent(sid)) : ''
@@ -501,33 +739,43 @@ window.__ModuleLoader__.load({
       }
 
       React.useEffect(function () {
+        aliveRef.current = true
         setEvents(null)
         setError(null)
         loadSnapStats(sessionId)
         if (!sessionId) { setEvents([]); return }
-        let alive = true
-        const load = function () {
-          fetchEvents(sessionId, 0).then(function (evs) {
-            if (!alive) return
-            evs.sort(function (a, b) { return b.id - a.id }) // 时间倒序：最新在最上面
-            setEvents(evs)
-            setError(null)
-          }).catch(function (e) {
-            if (!alive) return
-            setError(String((e && e.message) || e))
-          })
-          loadSnapStats(sessionId)
+        loadEvents()
+        const timer = setInterval(function () { loadEvents(); loadSnapStats(sessionId) }, 5000)
+        // 提示条点了「重新审批通过」后广播已读，这里同步刷新
+        const onSeen = function () { loadEvents() }
+        window.addEventListener(SEEN_EVENT, onSeen)
+        return function () {
+          aliveRef.current = false
+          clearInterval(timer)
+          window.removeEventListener(SEEN_EVENT, onSeen)
         }
-        load()
-        const timer = setInterval(load, 5000)
-        return function () { alive = false; clearInterval(timer) }
       }, [sessionId])
+
+      // 待处理拒绝数：已拒绝但尚未追认的记录（硬拒档也算，它只能靠人工重做，但至少看得见）
+      const pendingRejects = (events || []).filter(function (ev) {
+        return isRejectEvent(ev) && !ev.reconsidered
+      })
 
       return React.createElement('div', { className: 'ag-view' },
         React.createElement('div', { className: 'ag-view-head' },
-          React.createElement('div', { className: 'ag-view-title' }, '自动放行审批'),
+          React.createElement('div', { className: 'ag-view-title' },
+            '自动放行审批',
+            pendingRejects.length > 0
+              ? React.createElement('span', { className: 'ag-tag-err', style: { marginLeft: 8 } }, '待处理 ' + pendingRejects.length)
+              : null,
+          ),
           React.createElement('div', { className: 'ag-view-sub' }, '本会话中自动放行与人工审批的记录（最新在上）'),
+          React.createElement('div', { className: 'ag-view-sub' },
+            '被拒绝的记录可点「重新审批通过」追认：写入自动放行规则并让 AI 重试该操作（硬拒档与硬风险类别除外）。'),
         ),
+        feedback
+          ? React.createElement('div', { className: feedback.ok ? 'ag-set-ok' : 'ag-set-err', style: { padding: '6px 14px 0' } }, feedback.msg)
+          : null,
         React.createElement('div', { className: 'ag-snap-bar' },
           React.createElement('span', null,
             'diff 快照 ',
@@ -574,6 +822,7 @@ window.__ModuleLoader__.load({
                   let tagCls = 'ag-tag'
                   let glyph = React.createElement(GlyphCheck, null)
                   let glyphCls = 'ag-row-glyph'
+                  const canReconsider = isReconsiderable(ev)
                   if (kind === 'manual-approved') {
                     const lc = ev.learningCount !== undefined ? ev.learningCount : null
                     const th = ev.threshold || 3
@@ -586,6 +835,8 @@ window.__ModuleLoader__.load({
                     // hard-reject / judge-deny 是判定层静默拒绝（未弹窗）
                     const silent = kind === 'hard-reject' || kind === 'judge-deny'
                     tagText = silent ? silentRejectLabel(ev) : rejectLabel(ev)
+                    // 已被用户追认：明确标注，避免误以为仍然被拒
+                    if (ev.reconsidered) tagText = '已追认 · ' + tagText
                     tagCls = 'ag-tag-err'
                     glyphCls = 'ag-row-glyph-err'
                     glyph = React.createElement('span', null, '✕')
@@ -593,7 +844,7 @@ window.__ModuleLoader__.load({
                     tagText = '自动放行 · ' + (VERDICT_LABELS[ev.verdict] || ev.verdict || 'auto')
                     tagCls = 'ag-tag' + (VERDICT_NEUTRAL.has(ev.verdict) ? ' ag-tag-neutral' : '')
                   }
-                  return React.createElement('div', { className: 'ag-row', key: ev.id },
+                  return React.createElement('div', { className: 'ag-row' + (isRejectEvent(ev) && !ev.reconsidered ? ' ag-row-pending' : ''), key: ev.id },
                     React.createElement('div', { className: 'ag-row-rail' },
                       React.createElement('span', { className: glyphCls }, glyph),
                       React.createElement('span', { className: 'ag-row-line' }),
@@ -620,6 +871,19 @@ window.__ModuleLoader__.load({
                               const fname = String(f).split('/').pop()
                               return React.createElement('span', chipProps, fname)
                             }),
+                          )
+                        : null,
+                      // 追认入口：仅判定层静默拒绝、且非硬风险类别（与 host 端围栏一致）
+                      canReconsider
+                        ? React.createElement('div', { className: 'ag-row-actions' },
+                            React.createElement('button', {
+                              type: 'button',
+                              className: 'ag-set-btn ag-set-btn-primary',
+                              disabled: busyId !== null,
+                              title: '追认这次拒绝：写入自动放行规则，并让 AI 重试该操作',
+                              onClick: function () { doReconsider(ev) },
+                            }, busyId === ev.id ? '处理中…' : '重新审批通过'),
+                            React.createElement('span', { className: 'ag-set-item-meta' }, '追认后同类操作将自动放行'),
                           )
                         : null,
                     ),

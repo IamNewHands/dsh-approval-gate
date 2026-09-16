@@ -4,6 +4,33 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.7.0] — 2026-09-16
+
+Fixes an ordering defect in the judgment pipeline and adds user visibility plus a remedy path for silent rejections.
+
+### Fixed
+
+- **Hard-risk categories now take precedence over the judge model's `deny`**: the `deny` branch used to sit before the hard-category check, so when the model returned `deny` for a hard category (`deletion`/`credential`/`remote`/`system`/`bulk`) the request was **rejected silently** and the configured `hardCategories` was effectively inert — a legitimate out-of-workspace write (an application config under `%APPDATA%`, say) never even got the chance of a manual approval. Hard categories are now a **symmetric safety gate**:
+  - `allow` + hard category → escalate to human (previous behavior)
+  - `deny` + hard category → escalate to human (this fix)
+  - `deny` + `neutral` → still rejected silently (no dialog, so the agent replans)
+- The deterministic hard-deny layer (credential exfiltration, filesystem-root and system-path destruction) is **unchanged**: it still runs first, and neither an allowlist rule nor a re-approval can override it
+
+### Added
+
+- **"Re-approve" (reconsideration)**: a silent rejection in the approval history can be reconsidered, which writes an auto-approve rule carrying the operation fingerprint and delivers a retry instruction so the AI re-runs the operation. Two fences:
+  - Only **judge-layer silent rejections** (`judge-deny`) are reconsiderable; the deterministic hard-deny tier (`hard-reject`) runs first and no allowlist rule can override it, so offering a button would be a false promise → 400
+  - A **hard-risk category** means "must be confirmed by a human every time", so reconsideration-based auto-approval is refused → 400
+  - New endpoint `POST /api/auto-approve/reconsider`; the reconsideration is recorded as `kind: "reconsidered"` with `reconsiderOf` pointing back at the original event
+- **Rejection notices persist**: notices for silent and manual rejections no longer disappear after 4 seconds — they stay above the composer until you switch to the "Approval" tab or press an action button. Auto-approved notices still collapse after a few seconds as before. The read position is persisted per session in browser `localStorage`, so a page reload neither loses pending rejections nor re-nags about ones already seen
+- **Pending badge on the "Approval" tab**: the view title shows how many rejections are still unreconsidered, and the notice offers both "View approval log" (switch to the tab) and "Re-approve"
+
+### Tests
+
+- `test/pipeline.test.mjs`: case 7 now covers `deny + neutral` staying silent; new case 7b locks in `deny + hard category → human`, with a `neutral` variant of the same tool and justification as a control so the relaxation cannot silently become a blanket opening
+- Added `test/reconsider.test.mjs`: 7 contracts of the reconsideration endpoint (hard rejects not reconsiderable, hard categories not reconsiderable, a neutral rejection writing a fingerprint rule + delivering a retry + recording `reconsiderOf`, event-API annotation and filtering, idempotent re-reconsideration, 404 for unknown events)
+- Added `test/client-render-smoke.test.mjs`: renders the client bundle for real with a minimal React hooks shim plus DOM/fetch stubs, covering persistent rejection notices and their buttons, no re-approval button on hard rejects, only reconsiderable rows offering the button, marking rejects as seen when the tab opens, and no re-surfacing after a reload
+
 ## [0.6.0] — 2026-09-16
 
 Ports 5 capabilities from [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCoder/dsh-auto-mode) (MIT License), adapted to this repository's confirm-to-learn pipeline.

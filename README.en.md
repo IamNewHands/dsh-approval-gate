@@ -24,13 +24,15 @@ A deterministic hard-deny layer and a Flash model pre-judge every sandbox escala
 - 🔒 **Classifier-input redaction**: private key blocks, cloud/GitHub/Slack tokens, `Bearer` headers and `key=value` secrets become `[redacted-secret]`; text is truncated to 1000 characters; arguments are sanitized by field name (secret-named fields → `[redacted-secret-field]`, bulk-content fields → `[redacted-<key>:<length>-chars]`). Secrets never leave the machine
 - ♻️ **Judge-failure counter**: judge failures are counted per session — the first 2 are silently rejected so the agent can replan, the 3rd (`judgeFailureLimit`) offers one manual human approval so a long outage cannot trap the task; a successful response resets the counter
 - 🧭 **Dynamic system-prompt guidance**: while the `auto-approve` preset is active, an `<auto_approve_policy>` block is injected into the session's dynamic runtime context, telling the agent that routine workspace work runs directly, that deletion is the highest-risk routine operation and its authority must never be generalized to a variable/glob/parent/sibling/second target, that a reversible move or backup is preferred, and that hard-denied calls are rejected without a dialog so it should replan rather than resubmit
-- 🛡️ **Hard risks are always human**: deletion, credentials, remote/production, system paths, and bulk irreversible operations go directly to human — no counting, no learning
+- 🛡️ **Hard risks are always human**: deletion, credentials, remote/production, system paths, and bulk irreversible operations go directly to human — no counting, no learning, and no reconsideration. This is a **symmetric safety gate**: whether the judge answers `allow` or `deny`, a hard category goes to a human (fixed in v0.7.0 — the `deny` branch used to silently reject first, making the configured hard categories inert)
 - 🎯 **Confirmation-based learning**: after N human confirmations of the same operation, the N+1th occurrence auto-approves; persisted rules carry an **operation fingerprint**, so only operations you confirmed are auto-approved
 - 🧠 **Semantic similarity verification**: operations with different wording but the same intent are judged by Flash against your confirmed samples — no keyword dependency
 - 📄 **File diff & revert** (v0.5.0+): click a file in an approval record to view a **unified diff** — changed lines with ±5 context lines, multiple changes grouped into hunks separated by gray "N unmodified lines" bars, green additions / red deletions / gray context, dual line numbers; one-click **Revert** sends a command for the AI to restore the file from snapshot
 - 🗂️ **Session-scoped snapshots** (v0.5.0+): snapshots belong to the event's session; the approval view shows only the current session's snapshot stats; clearing supports "this session only" vs "clear all" to avoid wiping other sessions' unviewed diffs
 - 🔧 **Hot-reloadable config**: `allowlist.json` edits take effect immediately, no restart
 - ✅ **Human review UI**: a green notice appears above the composer on auto-approval; the "Approval" view (right of Trajectory) shows the current session's full auto-approval timeline
+- 🔔 **Rejection notices persist** (v0.7.0+): notices for silent and manual rejections no longer vanish after a few seconds — they stay above the composer (with "View approval log" / "Re-approve" actions) until you switch to the "Approval" tab. The read position is persisted locally, so a reload neither loses pending rejections nor re-nags about ones already seen
+- ↩️ **Reconsider a rejection** (v0.7.0+): a silent rejection in the approval log can be re-approved in one click — writing an auto-approve rule carrying the operation fingerprint and delivering a retry instruction so the AI re-runs it. Fences: the deterministic hard-deny tier and hard-risk categories are not reconsiderable (offering a button there would be a false promise)
 
 ## 📸 Interface Overview
 
@@ -39,6 +41,8 @@ A deterministic hard-deny layer and a Flash model pre-judge every sandbox escala
 ![Approval View](docs/screenshots/approval-view.png)
 
 The "Approval" tab (right of Trace) lists the current session's auto-allowed and manually-approved actions in reverse-chronological order: each record shows the tool (`bash` / `edit`), a verdict tag ("Auto-allowed · Flash safe", "Approved" etc.), timestamp and description. The top bar shows this session's **diff snapshot usage** (`2.9 KB · 3 items`) with two cleanup options: **"This session only"** (removes only the current session's snapshots, never touching other sessions' unviewed diffs) and **"Clear all"** (double-confirmed, clears every session).
+
+**Silently rejected** records (red "Rejected outright") carry an extra **"Re-approve"** button: pressing it writes an auto-approve rule carrying the operation fingerprint and delivers a retry instruction so the AI re-runs the operation. A **pending N** badge next to the title shows how many rejections are still unreconsidered. The **deterministic hard-deny tier** (credential exfiltration / system-path destruction) and **hard-risk categories** (deletion / credential / remote / system / bulk) do not show the button — no allowlist rule can override the former, and the latter must be confirmed by a human every time, so offering a button would be a false promise.
 
 ### ② File Diff
 
@@ -56,7 +60,7 @@ The judgment pipeline runs in this order:
 
 ```
 hard-deny (credential / system-path) → hard-fact human escalation → dangerous keywords
-→ allowlist → deny-rules → structured JSON judge (allow / ask / deny; hard categories → human;
+→ allowlist → deny-rules → structured JSON judge (hard categories → human, ahead of allow / deny;
 neutral → confirmation-based learning; failure limit) → verdict learning
 ```
 

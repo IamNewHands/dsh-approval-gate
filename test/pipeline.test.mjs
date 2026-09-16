@@ -4,7 +4,7 @@
  * 与 unit / absorbed 测试不同：这里用一个**模拟宿主**真正执行 src/index.mjs 里
  * 注册的 `approval/request` 处理器，验证移植后的判定管道在真实调用路径上的行为：
  *   硬拒（reject，不弹窗）→ 硬事实（human）→ 危险词 → 白名单 → 脱敏 → 结构化判定
- *   → deny / allow / ask → 连续失败计数 → 确认制学习
+ *   → 硬类别（优先于 allow / deny）→ deny / allow / ask → 连续失败计数 → 确认制学习
  *
  * 断言的是「处理器返回的裁决」与「是否调用了 next()（是否弹窗）」，
  * 以及「真正发给判定模型的消息内容」，而不是测试内重复的判定逻辑。
@@ -234,9 +234,10 @@ function boot(opts) {
   console.log('  ✓ 判定 allow → 直接放行')
 }
 
-// ================= 7. 判定 deny → 静默拒绝，不弹窗 =================
+// ================= 7. 判定 deny + neutral → 静默拒绝，不弹窗 =================
+// 静默拒绝语义只作用于 neutral（无硬风险特征）的操作；硬类别见用例 7b。
 {
-  const { state } = boot({ judgeReply: () => '{"decision":"deny","reason":"no authority","category":"remote"}' })
+  const { state } = boot({ judgeReply: () => '{"decision":"deny","reason":"no authority","category":"neutral"}' })
   const req = makeReq({
     sessionId: 's-judge-deny',
     toolName: 'pwsh',
@@ -244,9 +245,39 @@ function boot(opts) {
     args: { command: 'deploy-prod --force' },
   })
   const { outcome, nextCalls } = await decide(null, req)
-  assert.strictEqual(outcome, 'rejected', 'judge deny must silently reject')
-  assert.strictEqual(nextCalls, 0, 'judge deny must not prompt the human')
-  console.log('  ✓ 判定 deny → rejected（静默，无弹窗）')
+  assert.strictEqual(outcome, 'rejected', 'judge deny on a neutral op must silently reject')
+  assert.strictEqual(nextCalls, 0, 'judge deny on a neutral op must not prompt the human')
+  console.log('  ✓ 判定 deny + neutral → rejected（静默，无弹窗）')
+}
+
+// ================= 7b. 判定 deny + 硬风险类别 → 转人工（2026-09-16 修复） =================
+// 缺陷回归：此前 deny 分支排在硬类别之前，模型对硬类别判 deny 会被静默拒绝，
+// 用户配置的 hardCategories 形同虚设——工作区外的合法写入连人工放行机会都没有。
+{
+  boot({ judgeReply: () => '{"decision":"deny","reason":"outside the workspace","category":"system"}' })
+  const req = makeReq({
+    sessionId: 's-deny-hardcat',
+    toolName: 'edit',
+    justification: 'Merge.yaml 位于 %APPDATA%，在工作区之外，必须写入才能修复启动报错',
+    args: { file_path: 'C:\\Users\\example\\AppData\\Roaming\\app\\Merge.yaml' },
+  })
+  const { outcome, nextCalls } = await decide(null, req, 'allowed-once')
+  assert.strictEqual(nextCalls, 1,
+    'deny + hard category must escalate to a human instead of silently rejecting')
+  assert.strictEqual(outcome, 'allowed-once', 'the human can approve the hard-category operation')
+
+  // 对照：同一工具、同一理由，但类别为 neutral 时仍走静默拒绝（不因上面放宽而全面放开）
+  boot({ judgeReply: () => '{"decision":"deny","reason":"outside the workspace","category":"neutral"}' })
+  const neutralReq = makeReq({
+    sessionId: 's-deny-hardcat-neutral',
+    toolName: 'edit',
+    justification: 'Merge.yaml 位于 %APPDATA%，在工作区之外',
+    args: { file_path: 'C:\\Users\\example\\AppData\\Roaming\\app\\Merge.yaml' },
+  })
+  const neutral = await decide(null, neutralReq)
+  assert.strictEqual(neutral.outcome, 'rejected', 'neutral deny is still silently rejected')
+  assert.strictEqual(neutral.nextCalls, 0, 'neutral deny still does not prompt')
+  console.log('  ✓ 判定 deny + 硬风险类别 → 转人工；neutral 仍静默拒绝')
 }
 
 // ================= 8. 判定 allow 但硬风险类别 → 不得放行（安全闸） =================

@@ -2,14 +2,14 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.6.0: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.7.0: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
 ```
 hard-deny (credential / system-path) → hard-fact human escalation → dangerous keywords
 → allowlist (deterministic rules) → denyRules (rejected upgrades)
-→ structured JSON judge (allow / ask / deny; hard categories → human; neutral confirmation; failure limit)
+→ structured JSON judge (hard categories → human, ahead of allow / deny; neutral confirmation; failure limit)
 → verdict learning
 ```
 
@@ -21,9 +21,10 @@ hard-deny (credential / system-path) → hard-fact human escalation → dangerou
 - **② Allowlist layer**: a matching rule → auto-approve (deterministic, no LLM). Default rule `{mode:"workspace-write"}` — workspace writes (recoverable) auto-approve; `tool/mode/category/contains` combinations are supported (including learned rules)
 - **③ denyRules layer**: `tool+mode+category` pairs the user has **explicitly rejected** → permanently human (never auto-approve what the user refused)
 - **④ Judge** (escalations only): a strict JSON verdict — `decision` ∈ `allow` / `ask` / `deny`, `category` ∈ `deletion` / `credential` / `remote` / `system` / `bulk` / `neutral`
+  - **Hard-risk categories are decided first** (`deletion` / `credential` / `remote` / `system` / `bulk`) → **directly human** (must confirm; no counting, no learning). This is a **symmetric safety gate**: whether the model answers `allow` or `deny`, a hard category always goes to a human — the model's verdict cannot bypass it
+  - `deny` with category `neutral` → silently rejected, no dialog, so the agent can replan; the record stays on screen and can be **reconsidered** from the approval view (see below)
   - `allow` → auto-approve
-  - `deny` → silently rejected, no dialog, so the agent can replan
-  - Hard-risk categories (`deletion` / `credential` / `remote` / `system` / `bulk`) → **directly human** (must confirm; no counting, no learning)
+  - `ask` → human
   - `neutral` (no hard-risk traits) → **confirmation mode**: the first N occurrences go to human, then the threshold state begins
   - Judge failure → counted per session (see [Judge-failure counter](#judge-failure-counter))
 - **⑤ Learned persistence** (neutral, N=3: confirm 3 times, threshold state from the 4th)
@@ -211,18 +212,38 @@ All changes go through `POST /api/auto-approve/rules` into `allowlist.json` — 
 Review entry points appear on auto-approval or human-approval (strict DSH design language, `--dsw-alias-*` tokens):
 
 1. **Notice strip** (a dedicated row above the composer, `conversation.input.dock` order=30, does not scroll with the conversation):
-   - Auto-approval → green ✅: tool + summary + verdict label (allowlist / flash-safe / learned / confirmed / flash-same), auto-dismisses after 8s
+   - Auto-approval → green ✅: tool + summary + verdict label (allowlist / flash-safe / learned / confirmed / flash-same), auto-dismisses after a few seconds
    - **Escalated to human → amber** (`--dsw-alias-state-warn-*`): "Waiting for human approval: <operation>", **stays until you decide**
-   - Human approved → amber "Learning n/N, auto-approves after N" (5s); rejected → red "Rejected · upgraded to always-human"
-   - No history notice when opening a session (cursor silently synchronized)
-2. **"Approval" history view**: the tab right of "Trajectory" (`conversation.view`, order=20). Current session records (**newest first**): auto-approved (green ✅), human-approved (amber + learning count n/N), human-rejected (red)
-3. **File diff & revert** (v0.5.0+): when an auto-approval involves files, the host saves a **pre-change snapshot** at approval time (before the write). In the history view the corresponding event's **file chips become clickable** (blue outline) and open a diff panel:
+   - **Silent / manual rejection → red** (v0.7.0+): "Rejected outright: <operation>" or "Rejected: <operation>", and it **never auto-dismisses** — it stays above the composer until you switch to the "Approval" tab or press an action button. The strip offers:
+     - **"View approval log"**: switches to the "Approval" tab (which also counts as reading it, so the strip collapses)
+     - **"Re-approve"**: shown only when the rejection is **reconsiderable** (see below); pressing it writes an auto-approve rule and lets the AI retry the operation
+   - Human approved → amber "Learning n/N, auto-approves after N" (dismisses after a few seconds)
+   - Opening a session restores only **unread rejections**; auto-approved history is not replayed
+   - The read position is persisted per session in browser `localStorage` (`dsh-approval-gate.seenRejects`): a reload neither loses pending rejections nor re-nags about ones already seen
+2. **"Approval" history view**: the tab right of "Trajectory" (`conversation.view`, order=20). The title carries a **pending N** badge (rejections not yet reconsidered). Current session records (**newest first**): auto-approved (green ✅), human-approved (amber + learning count n/N), human-rejected (red), silent rejections (red + a "Re-approve" button)
+3. **Reconsideration ("Re-approve", v0.7.0+)**: a rejected record can be reconsidered, which **writes an auto-approve rule carrying the operation fingerprint and delivers a retry instruction to the session** (so the AI re-runs the operation instead of you retyping it). Two fences:
+   - **Only judge-layer silent rejections are reconsiderable**: `judge-deny` (a judge `deny` verdict, or a silent rejection after consecutive failures). The **deterministic hard-deny tier** (`hard-reject`: credential exfiltration, filesystem-root and system-path destruction) runs first and no allowlist rule can override it, so offering a button would be a false promise — it is not offered
+   - **Hard-risk categories are not reconsiderable**: `deletion` / `credential` / `remote` / `system` / `bulk` mean "must be confirmed by a human every time", so reconsideration-based auto-approval is refused; loosen `hardCategories` or add an explicit allowlist rule instead
+   - Reconsidering twice is idempotent (the rule is not written again); a reconsidered record is labelled "Reconsidered" and drops out of the pending count
+4. **File diff & revert** (v0.5.0+): when an auto-approval involves files, the host saves a **pre-change snapshot** at approval time (before the write). In the history view the corresponding event's **file chips become clickable** (blue outline) and open a diff panel:
    - **Changed lines only**: green `+` rows are additions, red `-` rows are deletions (classic diff semantics); the header shows +N / -M stats and unchanged-line count; a missing file is flagged
    - **Revert this change**: posts a revert instruction to the conversation (operation, files, event time, snapshot directory) so the AI restores the files to their pre-approval state
    - **Snapshot management**: the view header shows "diff snapshots <size> · <count>" with two cleanup actions — **"This session only"** (removes only the current session's snapshots, never touching other sessions' unviewed diffs) and **"Clear all"** (double-confirmed, clears every session). Both delete comparison data only — approval records stay — and after clearing, historical files can no longer be diffed
    - Limits: only text files (≤256KB each, ≤5 per event) get snapshots; binary/oversized files are not clickable
 
-Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.jsonl` per judgment (`kind`: auto / manual-pending / manual-approved / manual-rejected, plus sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold); the browser polls `GET /api/auto-approve/events?sessionId=&since=` (2s incremental / 5s full refresh in the view).
+Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.jsonl` per judgment (`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered, plus sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold); the browser polls `GET /api/auto-approve/events?sessionId=&since=` (2s incremental / 5s full refresh in the view).
+
+> `hard-reject` and `judge-deny` are **judge-layer silent rejections** (no dialog was shown): the hard-deny tier and a judge `deny` / consecutive failure respectively. The review view shows both in red as "Rejected outright" with the concrete reason.
+>
+> `reconsidered` is a **reconsideration record** (v0.7.0+): its `reconsiderOf` points back at the original event. The events API filters the reconsideration records out and adds `reconsidered: true` to the original event, which the frontend uses to label it "Reconsidered" and drop it from the pending count.
+
+## Reconsideration API (v0.7.0+)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/auto-approve/reconsider` | POST | `{sessionId, eventId, retry?}` → reconsiders one judge-layer silent rejection. Writes a fingerprint-scoped `allowRules` entry (its `description` is prefixed "User reconsidered:") and, when `retry !== false`, delivers a retry instruction. Returns `{ok, rule, duplicate, delivery}`; 400 with the reason (the `error` says whether it is the hard-deny tier or a hard-risk category) when not reconsiderable |
+
+Fences (enforced server-side; the UI merely hides the button): `kind` must be `judge-deny`, and `category` must not hit `hardCategories`.
 
 ## File Diff & Revert API (v0.5.0+)
 
@@ -241,7 +262,7 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 
 1. **Hard-deny layer outranks everything**: credential exfiltration and destruction aimed at a filesystem root, an OS/credential-critical path or a Windows device namespace are rejected outright with no dialog; `DSH_HOME` and the home root escalate to a human. The judge model cannot overturn these facts
 2. **DENY layer**: irreversible keywords go to human with zero model calls and zero false negatives
-3. **Hard-risk categories are always human**: `deletion`/`credential`/`remote`/`system`/`bulk` are never counted, learned, or covered by persisted rules
+3. **Hard-risk categories are always human (symmetric gate, corrected in v0.7.0)**: `deletion`/`credential`/`remote`/`system`/`bulk` are never counted, learned, covered by persisted rules, or **reconsiderable**; whether the judge answers `allow` or `deny`, a hard category goes to a human. The `deny` branch used to precede the hard-category check, so a model `deny` on a hard category was rejected silently and made the configured categories inert — that is fixed
 4. **Secrets never leave the machine**: judge inputs are redacted (tokens, key blocks, `Bearer` headers, `key=value` secrets) and truncated before the request is sent; secret-named and bulk-content argument fields are replaced by placeholders
 5. **Learned rules carry category + operation fingerprint**: persisted rules are `{tool, mode, category, contains}` (contains = a fingerprint you confirmed); only the same fingerprint auto-approves. When the fingerprint misses, flash does **semantic similarity verification** against your confirmed samples — DIFFERENT or verification failure always goes to human; rejected operations upgrade to denyRules (with fingerprint; without one, the whole kind is blocked), never auto-approved
 6. **Fail-safe**: judge failure, timeout (20s × 2 attempts), or malformed/unparseable output → neutral degradation or human; hard risks are never auto-approved. Consecutive failures are counted per session (first 2 silently rejected, the 3rd offers one manual approval) so an outage cannot trap the task
@@ -269,12 +290,14 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 
 ## Tests
 
-`npm test` syntax-checks every source file and runs the four suites. The two suites covering the absorbed capabilities are:
+`npm test` syntax-checks every source file and runs the six suites:
 
 | File | Covers |
 |------|--------|
 | `test/absorbed.test.mjs` | Regression tests for the five ported capabilities against the **real exports** in `src/`: the structured JSON verdict protocol, judge-input redaction, the per-session judge-failure counter, the deterministic hard-deny tiers, and the dynamic system-prompt context (injected only while the preset is active). Uses a temporary `DSH_HOME` so the real `~/.dsh/auto-approve` is never touched |
-| `test/pipeline.test.mjs` | End-to-end pipeline test driven through a **mock host** that actually executes the registered `approval/request` handler: hard-deny reject (no dialog) → hard-fact human → dangerous keywords → allowlist → redaction → structured judge → `deny` / `allow` / `ask` → failure counting → confirmation-based learning. Asserts the returned verdict, whether `next()` was called (i.e. whether a dialog appeared), and the exact message sent to the judge model |
+| `test/pipeline.test.mjs` | End-to-end pipeline test driven through a **mock host** that actually executes the registered `approval/request` handler: hard-deny reject (no dialog) → hard-fact human → dangerous keywords → allowlist → redaction → structured judge → hard categories (ahead of allow / deny) → `deny` / `allow` / `ask` → failure counting → confirmation-based learning. Asserts the returned verdict, whether `next()` was called (i.e. whether a dialog appeared), and the exact message sent to the judge model. Includes the `deny + neutral` silent-reject case and its `deny + hard category` human-escalation counterpart |
+| `test/reconsider.test.mjs` | Contracts of the reconsideration endpoint (`POST /api/auto-approve/reconsider`): the hard-deny tier and hard-risk categories both return 400 without writing a rule, a neutral silent rejection is reconsiderable (fingerprint rule + delivered retry + `reconsiderOf` recorded), the events API annotates `reconsidered` and filters the reconsideration records out, reconsidering twice is idempotent, and an unknown event is a 404 |
+| `test/client-render-smoke.test.mjs` | **Real rendering** smoke tests of the client bundle (minimal React hooks shim + DOM/fetch stubs): rejection notices persist and carry "Re-approve" / "View approval log", hard rejects get no re-approve button, only reconsiderable rows in the approval view offer the button, opening the tab marks rejections seen, and a seen rejection does not re-surface after a reload |
 
 `test/unit.test.mjs` and `test/seed-sync.test.mjs` cover the pre-existing rule matching, config migration and cross-machine rule sharing.
 

@@ -168,6 +168,26 @@ function loadEventSnapshots(eventId) {
   } catch { return [] }
 }
 
+/** 按事件 ID 读取一条审批事件（events.jsonl 追加式，逐行扫描）；未找到返回 null */
+function findApprovalEvent(eventId) {
+  const want = Number.parseInt(String(eventId), 10)
+  if (!Number.isInteger(want)) return null
+  try {
+    const text = readFileSync(EVENTS_PATH, 'utf8')
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const ev = JSON.parse(line)
+        if (ev.id === want) return ev
+      } catch { /* 跳过坏行 */ }
+    }
+  } catch { /* 文件不存在 */ }
+  return null
+}
+
+/** 判定层静默拒绝的事件（可被用户追认）——确定性硬拒档不在此列，白名单也盖不过它 */
+const RECONSIDERABLE_KINDS = new Set(['judge-deny'])
+
 /** 逐行 diff：只返回变更行（add/del） */
 function diffLines(before, after, contextLines) {
   const CTX = (typeof contextLines === 'number' && contextLines >= 0) ? contextLines : 5
@@ -408,6 +428,8 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   if (o.category) ev.category = o.category
   // path：判定路径标识（hard-category / unknown-category / deny-rule / deny / flash-failed / neutral-reject / neutral-confirm）
   if (o.path) ev.path = o.path
+  // reconsiderOf：追认记录指回被追认的原事件 id（供审查视图标注「已追认」）
+  if (Number.isInteger(o.reconsiderOf)) ev.reconsiderOf = o.reconsiderOf
   try {
     ensureDataDir()
     appendFileSync(EVENTS_PATH, JSON.stringify(ev) + '\n', 'utf8')
@@ -1202,18 +1224,35 @@ export default {
             const events = []
             try {
               const text = readFileSync(EVENTS_PATH, 'utf8')
+              // 被追认过的静默拒绝事件 id 集合：追认记录用 reconsiderOf 指回原事件。
+              // 前端据此把该条标注为「已追认」并撤销「待处理」角标——角标代表未读，
+              // 已读位置由浏览器侧持久化，不在服务端状态里。
+              const reconsidered = new Set()
+              const rows = []
               for (const line of text.split('\n')) {
                 if (!line.trim()) continue
-                try {
-                  const ev = JSON.parse(line)
-                  if (!Number.isInteger(ev.id) || ev.id <= since) continue
-                  if (sessionId && ev.sessionId !== sessionId) continue
-                  events.push(ev)
-                } catch { /* 跳过坏行 */ }
+                try { rows.push(JSON.parse(line)) } catch { /* 跳过坏行 */ }
+              }
+              for (const row of rows) {
+                if (row && row.kind === 'reconsidered' && Number.isInteger(row.reconsiderOf)) {
+                  reconsidered.add(row.reconsiderOf)
+                }
+              }
+              for (const ev of rows) {
+                if (!Number.isInteger(ev.id) || ev.id <= since) continue
+                if (sessionId && ev.sessionId !== sessionId) continue
+                if (ev.kind === 'reconsidered') continue
+                const copy = Object.assign({}, ev)
+                // reconsidered：本事件是否已被用户追认（前端据此撤销待处理角标）
+                if (reconsidered.has(ev.id)) copy.reconsidered = true
+                events.push(copy)
               }
             } catch { /* events 文件不存在：返回空 */ }
+            // hardCategories：把**生效的**硬类别下发给前端，让「重新审批通过」按钮的显隐
+            // 与服务端围栏完全一致。硬编码默认值会在用户自定义 hardCategories 后撒谎：
+            // 多显示按钮 → 点了 400；少显示 → 用户以为不可追认。
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
-            res.end(JSON.stringify({ events }))
+            res.end(JSON.stringify({ events, hardCategories: config.hardCategories || DEFAULT_HARD_CATEGORIES }))
           },
         })
         console.log(`[${NAME}] 事件 API 已注册：/api/auto-approve/events`)
@@ -1298,6 +1337,7 @@ export default {
     // ---- diff / 撤销 / 快照管理 API ----
     let offDiffRoute = null
     let offRevertRoute = null
+    let offReconsiderRoute = null
     let offSnapStatsRoute = null
     let offSnapClearRoute = null
 
@@ -1423,6 +1463,80 @@ export default {
           },
         })
 
+        offReconsiderRoute = ctx.webServer.register({
+          kind: 'exact',
+          path: '/api/auto-approve/reconsider',
+          handler: async (req, res) => {
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) return send(res, authRej, { ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' })
+            try {
+              if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'method not allowed' })
+              const body = await readBody(req)
+              const sessionId = String(body.sessionId || '')
+              const eventId = Number.parseInt(String(body.eventId || ''), 10)
+              if (!Number.isInteger(eventId)) return send(res, 400, { ok: false, error: 'eventId 必填' })
+              const event = findApprovalEvent(eventId)
+              if (!event) return send(res, 404, { ok: false, error: '未找到该事件' })
+
+              // 围栏 1：只接受「判定层静默拒绝」。确定性硬拒档（凭据外泄 / 根与系统路径销毁）
+              // 位于管道最前，白名单规则无法覆盖它——给按钮就是假承诺；人工拒绝与自动放行无需追认。
+              if (!RECONSIDERABLE_KINDS.has(String(event.kind || ''))) {
+                return send(res, 400, {
+                  ok: false,
+                  error: '该记录不可追认（仅判定层静默拒绝可追认；硬拒档不弹窗且不接受覆盖，人工拒绝与自动放行无需追认）',
+                })
+              }
+              // 围栏 2：硬风险类别属于「必须人工确认」，不接受追认式自动放行
+              const cat = String(event.category || 'neutral')
+              const hardList = config.hardCategories || DEFAULT_HARD_CATEGORIES
+              if (hardList.includes(cat)) {
+                return send(res, 400, {
+                  ok: false,
+                  error: `硬风险类别「${cat}」必须每次人工确认，不接受追认自动放行；请在设置页调整硬类别或改用白名单规则`,
+                })
+              }
+
+              // 写入沉淀规则：带操作指纹，只放行同一指纹的操作（宽规则会误放行用户没确认过的其他操作）
+              reloadConfig()
+              const fingerprint = extractOperationFingerprint(String(event.justification || event.reason || ''))
+              const rule = { tool: String(event.tool || 'unknown'), category: cat }
+              if (event.mode) rule.mode = String(event.mode)
+              if (fingerprint) rule.contains = fingerprint
+              const dup = config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)
+              if (!dup) {
+                rule.description = '用户追认：' + (fingerprint ? '同类操作自动放行' : '同类操作自动放行（无指纹，按工具+模式+类别）')
+                config.allowRules.push(rule)
+                saveJson(ALLOWLIST_PATH, config)
+                audit(`RECONSIDER event=${eventId} +allowRule ${JSON.stringify(rule)}`)
+              } else {
+                audit(`RECONSIDER event=${eventId} 规则已存在 ${JSON.stringify(rule)}`)
+              }
+
+              // 可选：投递重试指令（与「撤销此改动」同一套通道）
+              let delivery = { ok: false, via: 'none' }
+              if (body.retry !== false && sessionId) {
+                const files = (event.files || []).map((f) => '`' + f + '`').join('、')
+                const content = '你之前的操作被自动审批门控拒绝了，用户已在审批记录中追认通过，现在可以重试：\n' +
+                  '- 操作：' + (event.justification || event.reason || '(无说明)') + '\n' +
+                  '- 涉及文件：' + (files || '(未记录)') + '\n' +
+                  '- 原判定：' + (event.verdict || 'judge-deny') + (cat !== 'neutral' ? '（category=' + cat + '）' : '') + '\n' +
+                  '- 已写入自动放行规则：' + JSON.stringify(rule) + '\n' +
+                  '请重新执行同一操作；该操作现在会自动放行。'
+                delivery = await sendToSession(sessionId, content)
+                audit(`RECONSIDER event=${eventId} retry via=${delivery.via || 'none'}`)
+              }
+
+              // 记录一条追认事件：审查视图据此把该条静默拒绝标注为「已追认」并撤销待处理角标
+              recordApprovalEvent(sessionId || event.sessionId, event.tool, event.mode, event.reason, event.justification, 'reconsidered',
+                { kind: 'reconsidered', path: 'reconsider', category: cat, files: event.files || [], reconsiderOf: event.id })
+
+              send(res, 200, { ok: true, rule, duplicate: dup, delivery })
+            } catch (e) {
+              send(res, 400, { ok: false, error: String((e && e.message) || e) })
+            }
+          },
+        })
+
         offSnapStatsRoute = ctx.webServer.register({
           kind: 'exact',
           path: '/api/auto-approve/snapshots-stats',
@@ -1500,6 +1614,7 @@ export default {
       if (offSetupRoute) { try { offSetupRoute() } catch (e) {} }
       if (offDiffRoute) { try { offDiffRoute() } catch (e) {} }
       if (offRevertRoute) { try { offRevertRoute() } catch (e) {} }
+      if (offReconsiderRoute) { try { offReconsiderRoute() } catch (e) {} }
       if (offSnapStatsRoute) { try { offSnapStatsRoute() } catch (e) {} }
       if (offSnapClearRoute) { try { offSnapClearRoute() } catch (e) {} }
     })
@@ -1826,7 +1941,24 @@ export default {
         // 判定成功 → 清零失败计数
         judgeFailures.delete(sessionId)
 
-        // 4b. deny：判定器明确判定有害/越权 → 静默拒绝，不弹窗
+        // 4b. 硬风险类别（deletion/credential/remote/system/bulk）→ 直接转人工，
+        //     **优先于模型的 allow / deny 两个方向**（必须人工确认，不计数不学习）。
+        //
+        // 对称安全闸：配置的 hardCategories 是最终裁决权，模型的裁决不得绕过它。
+        //   - allow + 硬类别 → 转人工（原有安全闸）
+        //   - deny  + 硬类别 → 转人工（2026-09-16 修复）
+        //
+        // 修复的缺陷：此前 deny 分支排在硬类别之前，模型对硬类别判 deny 时会被**静默拒绝**，
+        // 用户配置的硬类别（如 system）形同虚设——工作区外的合法写入（%APPDATA% 下的应用
+        // 配置等，本就该由用户裁决）连人工放行的机会都没有。deny 的静默拒绝语义现在只
+        // 作用于 neutral（无硬风险特征）的操作。
+        const hard = config.hardCategories || DEFAULT_HARD_CATEGORIES
+        if (hard.includes(cat)) {
+          audit(`HARD    ${toolName} mode=${mode || 'none'} category=${cat} decision=${decision} → 人工 | ${reason.slice(0, 120)}`)
+          return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'hard-category')
+        }
+
+        // 4c. deny（非硬风险类别，即 neutral）→ 静默拒绝，不弹窗，让 agent 改换更安全的方案
         if (decision === 'deny') {
           audit(`JUDGEDENY ${toolName} mode=${mode || 'none'} category=${cat} | ${judged.reason || ''}`)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'judge-deny',
@@ -1834,32 +1966,26 @@ export default {
           return 'rejected'
         }
 
-        if (decision === 'allow' && !(config.hardCategories || DEFAULT_HARD_CATEGORIES).includes(cat)) {
+        // 4d. allow（非硬风险类别）→ 自动放行
+        if (decision === 'allow') {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (judge-allow${cat !== 'neutral' ? ' category=' + cat : ''})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-safe', filesOpt)
           return 'allowed-once'
         }
 
-        // 4a. 硬风险类别（deletion/credential/remote/system/bulk）→ 直接转人工（必须人工确认，不计数不学习）
-        const hard = config.hardCategories || DEFAULT_HARD_CATEGORIES
-        if (hard.includes(cat)) {
-          audit(`HARD    ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
-          return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'hard-category')
-        }
-
-        // 4c. 协议外类别（模型输出未知类别）→ 判定不可靠，fail-safe 转人工
+        // 4e. 协议外类别（模型输出未知类别，或该类别已被用户从 hardCategories 移除）→ 判定不可靠，fail-safe 转人工
         if (cat !== 'neutral') {
           audit(`UNKNOWN ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'unknown-category')
         }
 
-        // 4d. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
+        // 4f. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
         if (matchRule(config.denyRules, toolName, mode, cat, matchContext)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
-        // 4e. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
+        // 4g. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
         const key = learnKey(toolName, mode, cat)
         const learnedRule = matchRule(config.allowRules, toolName, mode, cat, matchContext)
         if (learnedRule) {
