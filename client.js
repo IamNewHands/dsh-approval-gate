@@ -157,6 +157,15 @@ window.__ModuleLoader__.load({
       return '人工拒绝'
     }
 
+    // 静默拒绝文案：判定层未弹窗，直接拒绝让 agent 改方案
+    function silentRejectLabel(ev) {
+      const p = ev && ev.path
+      if (p === 'hard-deny') return '已直接拒绝 · 凭据外泄或系统路径销毁'
+      if (p === 'judge-unavailable') return '已直接拒绝 · 判定器不可用（连续失败）'
+      if (p === 'classifier-deny') return '已直接拒绝 · 判定为有害或越权'
+      return '已直接拒绝'
+    }
+
     function fmtTime(iso) {
       try {
         const d = new Date(iso)
@@ -255,6 +264,7 @@ window.__ModuleLoader__.load({
       if (!notice) return null
       const kind = notice.kind || 'auto'
       const isPending = kind === 'manual-pending'
+      const isSilentReject = kind === 'hard-reject' || kind === 'judge-deny'
       const isManual = kind === 'manual-approved' || kind === 'manual-rejected'
       // 文案
       let title = ''
@@ -264,6 +274,10 @@ window.__ModuleLoader__.load({
         title = '等待人工审批：' + (notice.justification || notice.reason || '')
         tagText = '人工审批中'
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '◔')
+      } else if (isSilentReject) {
+        title = '已直接拒绝：' + (notice.justification || notice.reason || '')
+        tagText = silentRejectLabel(notice)
+        glyph = React.createElement('span', { className: 'ag-notice-glyph-err' }, '✕')
       } else if (kind === 'manual-approved') {
         const lc = notice.learningCount !== undefined ? notice.learningCount : null
         const th = notice.threshold || 3
@@ -290,7 +304,7 @@ window.__ModuleLoader__.load({
               React.createElement('span', { className: 'ag-notice-text' }, title),
             ),
             React.createElement('div', { className: 'ag-notice-meta' },
-              React.createElement('span', { className: isPending ? 'ag-tag-warn' : kind === 'manual-rejected' ? 'ag-tag-err' : kind === 'manual-approved' ? 'ag-tag-warn' : 'ag-tag' + (VERDICT_NEUTRAL.has(notice.verdict) ? ' ag-tag-neutral' : '') }, tagText),
+              React.createElement('span', { className: isPending ? 'ag-tag-warn' : (kind === 'manual-rejected' || isSilentReject) ? 'ag-tag-err' : kind === 'manual-approved' ? 'ag-tag-warn' : 'ag-tag' + (VERDICT_NEUTRAL.has(notice.verdict) ? ' ag-tag-neutral' : '') }, tagText),
               React.createElement('span', { className: 'ag-time' }, fmtTime(notice.ts)),
             ),
           ),
@@ -567,9 +581,11 @@ window.__ModuleLoader__.load({
                     tagCls = 'ag-tag-warn'
                     glyphCls = 'ag-row-glyph-warn'
                     glyph = React.createElement('span', null, '✓')
-                  } else if (kind === 'manual-rejected') {
+                  } else if (kind === 'manual-rejected' || kind === 'hard-reject' || kind === 'judge-deny') {
                     // 按拒绝路径精确分类文案（reason 由 host 记录）
-                    tagText = rejectLabel(ev)
+                    // hard-reject / judge-deny 是判定层静默拒绝（未弹窗）
+                    const silent = kind === 'hard-reject' || kind === 'judge-deny'
+                    tagText = silent ? silentRejectLabel(ev) : rejectLabel(ev)
                     tagCls = 'ag-tag-err'
                     glyphCls = 'ag-row-glyph-err'
                     glyph = React.createElement('span', null, '✕')

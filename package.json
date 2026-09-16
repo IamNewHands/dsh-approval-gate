@@ -18,7 +18,7 @@
     "allowlist.json"
   ],
   "scripts": {
-    "test": "node --check src/index.mjs && node --check client.js && node test/unit.test.mjs && node test/seed-sync.test.mjs"
+    "test": "node --check src/index.mjs && node --check client.js && node --check src/paths.mjs && node --check src/sanitize.mjs && node --check src/classifier.mjs && node test/unit.test.mjs && node test/seed-sync.test.mjs && node test/absorbed.test.mjs && node test/pipeline.test.mjs"
   },
   "keywords": [
     "deepseek-harness",
