@@ -77,6 +77,7 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 ## 📖 文档
 
 - [完整指南（管道 / 配置 / 安全设计 / 审查 UI）](docs/GUIDE.md) · [English Guide](docs/GUIDE.en.md)
+- [更新日志](CHANGELOG.md) · [Changelog](CHANGELOG.en.md)
 
 ## 📄 License
 

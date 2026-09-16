@@ -1,0 +1,114 @@
+# 更新日志
+
+本文件记录 dsh-approval-gate 的重要变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+> 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
+
+## [0.6.0] — 2026-09-16
+
+从 [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCoder/dsh-auto-mode)（MIT License）移植 5 项能力，按本仓库的确认制学习管道适配。
+
+### 新增
+
+- **确定性硬拒层**（`src/paths.mjs` + `hardDenyFacts()`）：判定基于工具参数的**真实路径与凭据事实**，而非 `justification` 关键词，且判定模型无权推翻。分两档：
+  - **直接拒绝**（返回 `rejected`，不弹窗，让 agent 改方案）：对外调用携带凭据材料；破坏性目标落在文件系统根、系统或凭据关键路径、Windows 设备/NT 命名空间、Windows 保留设备名
+  - **转人工**（保留手动放行能力）：目标为 `$DSH_HOME` 或用户 home 根本身
+- **判定输入脱敏**（`src/sanitize.mjs`）：密钥与大块正文在送判定模型前抹除/截断——私钥块、`AKIA`/`ASIA`、GitHub/Slack 令牌、`Bearer` 头、`key=value` 密钥 → `[redacted-secret]`；密钥类字段名 → `[redacted-secret-field]`；大块正文字段 → `[redacted-<字段>:<长度>-chars]`；文本截断 1000 字符，深度 3 / 数组 25 / 对象 50。工作区路径含敏感形态时转人工，不外发
+- **结构化 JSON 裁决协议**（`src/classifier.mjs`）：严格 `{decision, reason, category}` 替代原文本 `SAFE` / `RISKY:<类别>`；`decision` ∈ `allow`/`ask`/`deny`，`category` ∈ `deletion`/`credential`/`remote`/`system`/`bulk`/`neutral`，`reason` 非空且 ≤1000 字符；任何格式偏差抛错并按 fail-safe 处理
+- **判定器连续失败计数**：按会话计数，前 2 次静默拒绝让 agent 改方案，第 3 次转一次人工，避免判定器长期不可用时卡死任务；判定成功一次即清零。阈值由 `judgeFailureLimit` 配置（默认 3）
+- **动态系统提示指导**：预设激活期间向会话动态上下文注入 `<auto_approve_policy>`（顺序紧随宿主沙箱策略），从源头减少需要判定的越界请求
+- **授权来源限定**：判定模型只承认**直接人类消息**为授权（最多 4 条、逐条脱敏、总预算 4000 字符）；仓库内容、工具输出、assistant 文本、skill / 插件 / 子代理文本一律不构成授权
+
+### 变更
+
+- **判定模型输出协议变更**：`SAFE` / `RISKY:<类别>` 不再被接受。若你为本插件单独配置了判定提示或下游工具，需要同步更新
+- **安全闸**：判定模型给出 `decision: "allow"` 但 `category` 命中 `hardCategories` 时，**强制转人工**，不允许绕过硬类别闸门
+- **失败兜底语义变更**：原先「判定失败即转人工」改为「连续失败计数」——前 2 次为静默拒绝，第 3 次才转人工
+- 新增事件 `kind`：`hard-reject`（硬拒档）与 `judge-deny`（判定 `deny` / 连续失败静默拒绝）；人工审查视图对二者显示红色「已直接拒绝」并标注原因
+- 挂载日志改为反映新管道顺序
+
+### 新增配置
+
+- `judgeFailureLimit`：判定器连续失败多少次后转一次人工（默认 3，**机器本地**配置，不参与多机同步）
+
+### 测试
+
+- 新增 `test/absorbed.test.mjs`：5 项移植能力的回归测试，断言针对 `src/` 下的**真实导出实现**（不在测试内重复逻辑），覆盖脱敏边界、JSON 协议非法输入 fail-safe、硬拒分档、提示层契约、失败计数、授权来源
+- 新增 `test/pipeline.test.mjs`：**模拟宿主**真实执行注册的 `approval/request` 处理器，覆盖硬拒不弹窗、硬事实转人工、白名单零模型调用、`allow`/`deny`/`ask` 分流、`allow` + 硬类别安全闸、连续失败计数与清零、**密钥不出站**、预设门控
+- `npm test` 已纳入 3 个新模块的语法检查与上述两个测试文件
+
+### 文档
+
+- README（中/英）与 docs/GUIDE（中/英）补充新管道顺序、JSON 裁决协议、脱敏行为与边界、失败计数、硬拒两档、提示层指导与 `judgeFailureLimit`
+- 补充**上游署名**：上述 5 项能力移植自 NanmiCoder/dsh-auto-mode（MIT License），原始设计与实现版权归该项目所有
+
+## [0.5.5] — 2026-09-16
+
+### 新增
+
+- **多机规则共享**：插件包内（仓库根目录）的 `allowlist.json` 作为汇总版规则，加载时增量并入本地配置（只增不减、按特征去重、幂等、版本以仓库为准）
+- 仓库根目录打包 `allowlist.json` 作为共享规则种子
+
+### 修复
+
+- 判定模型配置字段 `model` → `judgeModel` 迁移：保留本机原有取值，移除旧键；已显式配置 `judgeModel` 时以它为准（此前旧配置里的 `model` 不再被读取，导致判定模型静默失效）
+- `/api/auto-approve/*` 路由补上 DSH 核心凭据围栏（上游 issue #12）：`connection.requestRejection` 优先，缺失时退化为来源校验；`requestAuthRejection` 内层加异常保护
+- 清理机器本地标识符与失效文档
+
+### 变更
+
+- 仓库元数据指向本 fork，安装改为从本仓库安装
+
+## [0.5.0] — 2026-09-15
+
+### 新增
+
+- **文件改动对比与撤销**：审批涉及的文件可点击查看 unified diff——变动行带上下 5 行上下文、多处修改按 hunk 分区并以「N unmodified lines」分隔条折叠、双行号；一键「撤销此改动」投递指令让 AI 按快照恢复文件
+- **会话级快照管理**：快照按事件归属会话，审批视图按当前会话统计；清理支持「仅清本会话」与「清空全部」两档
+- diff / 撤销 / 快照管理 API
+
+### 修复
+
+- **diff 快照数据源断档**：`callId` 回溯工具参数取真实路径（B 层）+ `justification` 兜底（C 层），`manual-pending` 也保存快照
+- **bash 只读命令产生假快照**：写特征精确化 + 设备/空内容过滤 + UI 文件级可点击
+- 自动学习缺陷修复、判定模型解耦、上游 issue 批量修复
+
+## [0.4.1] — 2026-09-14
+
+### 新增
+
+- 设置页「自动审批」分区：可视化规则管理（管道总览 / 危险词黑名单 / 白名单 / 永久人工 / 阈值与超时 / 正在学习）
+- 一键初始化权限预设（文本级写入 `cordis.patch.yml`，保留注释格式）
+- 规则管理 API：`GET/POST /api/auto-approve/rules`、`POST /api/auto-approve/setup`
+
+### 修复
+
+- 提示条历史弹窗问题
+
+## [0.4.0] — 2026-09-14
+
+### 新增
+
+- **人工审查 UI**：自动放行时输入框上方绿色提示条；「审批」历史视图（轨迹右侧）
+- 审批历史视图时间倒序（最新在上）
+
+### 修复
+
+- `client.js` 补齐标准导出模式（`default` / `apply` / `inject`），与 DSH bundle 规范一致
+
+## [0.3.0] — 2026-09-13
+
+### 新增
+
+- **flash 第三方同类验证**：语义级判断新操作是否与用户确认样本同类（`SAME` / `DIFFERENT`）
+- **中立类别人工确认制**：同一「工具+模式+类别」被人工确认 N 次后，第 N+1 次起自动放行
+- 沉淀/拒绝规则携带**操作指纹**（`contains`），修复宽规则误放行漏洞
+- `allowlist.json` 配置热更新（每次审批前重新读盘，改配置无需重启）
+
+### 修复
+
+- 白盒走查修复 3 个 P0 + 3 个 P1（可达性 / 有效性）
+
+## 更早版本
+
+0.3.0 之前为本 fork 的初始开发阶段与上游 [moon09300731/dsh-approval-gate](https://github.com/moon09300731/dsh-approval-gate) 的基础实现，未逐条记录。

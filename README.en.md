@@ -75,6 +75,7 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 ## 📖 Docs
 
 - [Full Guide (pipeline / configuration / security / review UI)](docs/GUIDE.en.md) · [中文指南](docs/GUIDE.md)
+- [Changelog](CHANGELOG.en.md) · [更新日志](CHANGELOG.md)
 
 ## 📄 License
 
