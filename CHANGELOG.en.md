@@ -59,7 +59,7 @@ Ports 5 capabilities from [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCod
 
 - Repository metadata now points to this fork, and installation is done from this repository
 
-## [0.5.0] — 2026-09-15
+## [0.5.0] — 2026-08-18
 
 ### Added
 
@@ -73,7 +73,7 @@ Ports 5 capabilities from [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCod
 - **Read-only bash commands produced false snapshots**: write detection tightened, device/empty-content filtering, and file-level clickability in the UI
 - Fixes for auto-learning defects, judge-model decoupling, and a batch of upstream issues
 
-## [0.4.1] — 2026-09-14
+## [0.4.1] — 2026-08-17
 
 ### Added
 
@@ -85,7 +85,7 @@ Ports 5 capabilities from [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCod
 
 - Prompt-banner history popup issue
 
-## [0.4.0] — 2026-09-14
+## [0.4.0] — 2026-08-16
 
 ### Added
 
@@ -96,7 +96,7 @@ Ports 5 capabilities from [NanmiCoder/dsh-auto-mode](https://github.com/NanmiCod
 
 - `client.js` now provides the standard export pattern (`default` / `apply` / `inject`), matching the DSH bundle specification
 
-## [0.3.0] — 2026-09-13
+## [0.3.0] — 2026-08-16
 
 ### Added
 
