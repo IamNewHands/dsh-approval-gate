@@ -16,10 +16,10 @@ DENY（不可逆危险词）→ 白名单（确定性规则）→ denyRules（�
 - **④ flash 判定**（仅越界请求）：输出 `SAFE` 或 `RISKY:<category>`
   - `SAFE` → 自动放行
   - 硬风险类别（`deletion` 删除 / `credential` 凭据 / `remote` 远程生产 / `system` 系统路径 / `bulk` 批量不可回补）→ **直接转人工**（必须人工确认，不计数、不学习）
-  - `neutral`（中立，无硬风险特征）→ **人工确认制**：前 N-1 次转人工确认，之后进入阈值状态
-- **⑤ 学习沉淀**（neutral 类别，N=3 时：前 2 次人工确认，之后进入阈值状态）
+  - `neutral`（中立，无硬风险特征）→ **人工确认制**：前 N 次转人工确认，之后进入阈值状态
+- **⑤ 学习沉淀**（neutral 类别，N=3 时：前 3 次人工确认，第 4 次起进入阈值状态）
   - 阈值前：一律人工确认，**批准** → 计数 +1 并记录**操作样本**（指纹 + 操作背景/目的）；**拒绝** → 升级 denyRules
-  - 阈值后（计数 ≥ N-1）三种分流：
+  - 阈值状态（计数 ≥ N）三种分流：
     1. **指纹确定性命中**（本次操作在确认样本中）→ 自动放行 + 沉淀 `{tool, mode, category, contains}` 规则
     2. **指纹未命中但有确认样本** → 把本次操作的背景/目的 + 用户确认过的样本交给 flash **第三方同类验证**：判 `SAME`（与已确认样本同类）→ 自动放行（有指纹则沉淀）；判 `DIFFERENT`/验证失败 → 人工确认
     3. **无确认样本** → 人工确认
@@ -91,7 +91,7 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
-  "judgeModel": { "provider": "ai-gateway", "model": "workbuddy/deepseek-v4-flash" },
+  "judgeModel": { "provider": "my-provider", "model": "my-flash-model" },
   "learning": { "enabled": true }
 }
 ```
@@ -110,7 +110,7 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 以下配置属于**机器本地**，不参与同步（各机按实际环境自行设置）：
 
 - `riskyThreshold`、`judgeTimeoutMs`、`learning`
-- `judgeModel`：判定模型。各机的自定义提供商名称可能不同（如 `ai-gateway`），
+- `judgeModel`：判定模型。各机的自定义提供商名称可能不同（如 `my-provider`），
   必须按本机实际配置填写，不要照搬另一台机器的值
 
 > 旧版本（上游 0.5.0）使用的 `model` 字段已更名为 `judgeModel`。加载时会自动迁移：
@@ -121,14 +121,14 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 - `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` 均满足才放行（缺省表示任意）。学习沉淀的规则也会写入这里
 - `denyRules`：用户裁决拒绝后自动写入，命中即转人工（不学习）
 - `hardCategories`：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习）
-- `riskyThreshold`：中立类别的人工确认阈值（默认 3）——同一「工具+模式+类别」被人工确认 N-1 次后，第 N 次起自动放行并沉淀规则
+- `riskyThreshold`：中立类别的人工确认阈值（默认 3）——同一「工具+模式+类别」被人工确认 N 次后，第 N+1 次起自动放行并沉淀规则
 - `judgeTimeoutMs`：单次 flash 判断超时（默认 20000ms，超时自动重试 1 次，仍超时转人工）
 
 ## 使用
 
 在会话的权限下拉（`/permission` 弹窗或设置页）选中**「自动审批（Flash）」**，该会话即启用自动审批；其他会话不受影响（按会话预设门控）。
 
-## 设置页（v0.4.2+）
+## 设置页（v0.4.1+）
 
 DSH 设置面板新增「自动审批」分区（settings.section，样式与 DSH 原生设置一致），按管道顺序提供可视化规则管理，每张卡片标注管道阶段：
 
@@ -142,7 +142,7 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 
 所有修改通过 `POST /api/auto-approve/rules` 写入 `allowlist.json`，**热更新即时生效**（无需重启）；`POST /api/auto-approve/setup` 负责一键初始化。
 
-## 人工审查 UI（v0.4.2+）
+## 人工审查 UI（v0.4.0+）
 
 每次命令被自动放行或转人工审批时，提供审查入口（严格按 DSH 设计语言，`--dsw-alias-*` tokens）：
 
@@ -155,7 +155,7 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 3. **文件改动对比与撤销**（v0.5.0+）：自动放行且涉及文件时，host 在审批（写入前）保存文件**改动前快照**；历史视图中对应事件的**文件标签变为可点击**（蓝色描边），点击弹出 diff 面板：
    - **只看变更行**：绿底 `+` 为新增行、红底 `-` 为删除行（经典 diff 语义），头部显示 +N / -M 行统计与「未变行」数；文件当前已不存在会提示
    - **撤销此改动**：向当前会话投递一条撤销指令（含操作说明、涉及文件、事件时间、快照目录位置），AI 据此把文件恢复为审批前状态
-   - **diff 快照管理**：视图顶部显示「diff 快照 占用 · 条数」；「清除 diff 记录」按钮可一键删除全部快照（仅删除对比数据，不影响审批记录本身；删除后历史文件不可再查看对比）
+   - **diff 快照管理**：视图顶部显示「diff 快照 占用 · 条数」，并提供两个清理入口——**「仅清本会话」**（只删除当前会话的快照，不影响其他会话未查看的 diff）与**「清空全部」**（二次确认后清空所有会话；均仅删除对比数据，不影响审批记录本身，删除后历史文件不可再查看对比）
    - 限制：仅文本文件（单文件 ≤256KB、每事件 ≤5 个文件）会保存快照，二进制/超限文件不可点击
 
 数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
@@ -166,10 +166,10 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 |------|------|------|
 | `/api/auto-approve/diff?eventId=&path=` | GET | 返回指定事件/文件的变更行（`changedLines`，add/del）与统计（`stats`），只读该事件快照中列出的路径 |
 | `/api/auto-approve/revert` | POST | `{sessionId, eventId}` → 组装撤销指令投递到对应会话（typertGateway 优先，agent.followup 兜底） |
-| `/api/auto-approve/snapshots-stats` | GET | 快照占用统计 `{count, bytes, ids}`（ids = 仍有快照的事件列表，用于判定哪些文件可点击） |
-| `/api/auto-approve/snapshots-clear` | POST | 删除全部快照文件（仅限 `snapshots/` 目录内 `.json`） |
+| `/api/auto-approve/snapshots-stats?sessionId=` | GET | 快照占用统计 `{count, bytes, ids, files}`（ids = 仍有快照的事件列表，用于判定哪些文件可点击；带 sessionId 时只统计该会话） |
+| `/api/auto-approve/snapshots-clear` | POST | 删除快照文件（仅限 `snapshots/` 目录内 `.json`）；带 `{sessionId}` 时只清该会话，否则清空全部 |
 
-## 学习语义（v0.4.2+）
+## 学习语义（v0.3.0+）
 
 中立操作确认制：同一「工具|模式|类别」每被人工批准一次计数 +1；**确认满 N 次（默认 3）后，第 N+1 次起自动放行**并沉淀带指纹规则。阈值状态内：指纹命中直接放行；未命中由 Flash 对照确认样本做语义同类验证（SAME 放行 / DIFFERENT 人工）；拒绝升级 denyRules 永久人工；「正在学习」可在设置页终止。
 
@@ -201,3 +201,6 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 ## License
 
 MIT
+
+本项目是 [moon09300731/dsh-approval-gate](https://github.com/moon09300731/dsh-approval-gate) 的 fork，
+原作者版权声明保留在 [LICENSE](../LICENSE) 中。

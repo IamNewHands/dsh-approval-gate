@@ -204,7 +204,7 @@ assert.strictEqual(fp1, 'tsc', 'Should extract tsc from Chinese justification')
 const fp2 = extractOperationFingerprint('Vitest must spawn its worker process to run tests')
 assert.ok(fp2 && fp2.toLowerCase().includes('vitest'), 'Should extract vitest')
 
-const fp3 = extractOperationFingerprint('需要写入 "C:\\Users\\mashi\\.dsh\\auto-approve\\allowlist.json"')
+const fp3 = extractOperationFingerprint('需要写入 "C:\\Users\\example\\.dsh\\auto-approve\\allowlist.json"')
 assert.ok(fp3 && fp3.includes('allowlist.json'), 'Should extract Windows path or filename')
 
 // 4. isOriginSafe test

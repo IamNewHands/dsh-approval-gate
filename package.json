@@ -29,6 +29,10 @@
     "自动审批"
   ],
   "license": "MIT",
+  "author": "IamNewHands",
+  "contributors": [
+    "moon09300731 (original work, https://github.com/moon09300731/dsh-approval-gate)"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

@@ -16,10 +16,10 @@ DENY (irreversible keywords) → allowlist (deterministic rules) → denyRules (
 - **④ flash judgment** (escalations only): outputs `SAFE` or `RISKY:<category>`
   - `SAFE` → auto-approve
   - Hard-risk categories (`deletion` / `credential` / `remote` / `system` / `bulk`) → **directly human** (must confirm; no counting, no learning)
-  - `neutral` (no hard-risk traits) → **confirmation mode**: first N-1 occurrences go to human, then the threshold state begins
-- **⑤ Learned persistence** (neutral, N=3: confirm twice, then threshold state)
+  - `neutral` (no hard-risk traits) → **confirmation mode**: the first N occurrences go to human, then the threshold state begins
+- **⑤ Learned persistence** (neutral, N=3: confirm 3 times, threshold state from the 4th)
   - Before threshold: every occurrence goes to human; **approve** → count +1 and record an **operation sample** (fingerprint + context); **reject** → upgrade to denyRules
-  - At threshold (count ≥ N-1), three branches:
+  - In the threshold state (count ≥ N), three branches:
     1. **Fingerprint hit** (this operation is in the confirmed samples) → auto-approve + persist a `{tool, mode, category, contains}` rule
     2. **No fingerprint hit but samples exist** → hand the current operation's context plus the confirmed samples to flash for **third-party similarity verification**: `SAME` (same kind as a confirmed sample) → auto-approve (persist when a fingerprint exists); `DIFFERENT` / verification failure → human
     3. **No samples** → human
@@ -91,7 +91,7 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
-  "judgeModel": { "provider": "ai-gateway", "model": "workbuddy/deepseek-v4-flash" },
+  "judgeModel": { "provider": "my-provider", "model": "my-flash-model" },
   "learning": { "enabled": true }
 }
 ```
@@ -113,7 +113,7 @@ The following are **machine-local** and are never synchronised (set them per mac
 
 - `riskyThreshold`, `judgeTimeoutMs`, `learning`
 - `judgeModel`: the judge model. Custom provider names differ between machines
-  (e.g. `ai-gateway`), so use this machine's actual value rather than copying another's
+  (e.g. `my-provider`), so use this machine's actual value rather than copying another's
 
 > The legacy `model` field (upstream 0.5.0) was renamed to `judgeModel`. On load it is
 > migrated automatically: the machine-local value is carried over into `judgeModel` and
@@ -123,14 +123,14 @@ The following are **machine-local** and are never synchronised (set them per mac
 - `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` (omitted fields match anything). Learned rules are also written here
 - `denyRules`: written automatically after a human rejection; a hit goes to human (no learning)
 - `hardCategories`: flash `RISKY` in these categories → directly human (no counting, no learning)
-- `riskyThreshold`: neutral confirmation threshold (default 3) — after N-1 human confirmations of the same tool+mode+category, the Nth occurrence auto-approves and persists a rule
+- `riskyThreshold`: neutral confirmation threshold (default 3) — after N human confirmations of the same tool+mode+category, the N+1th occurrence auto-approves and persists a rule
 - `judgeTimeoutMs`: single flash judgment timeout (default 20000ms; auto-retries once, then goes to human)
 
 ## Usage
 
 Select **"Auto Approval (Flash)"** in the session's permission dropdown (`/permission` dialog or settings). Other sessions are unaffected (gated per session preset).
 
-## Settings Page (v0.4.2+)
+## Settings Page (v0.4.1+)
 
 A new "Auto Approval" section in the DSH settings panel (`settings.section`, styled like native DSH settings) provides visual rule management, cards ordered by pipeline stage:
 
@@ -144,7 +144,7 @@ A new "Auto Approval" section in the DSH settings panel (`settings.section`, sty
 
 All changes go through `POST /api/auto-approve/rules` into `allowlist.json` — **hot-reloaded immediately** (no restart); `POST /api/auto-approve/setup` handles one-click setup.
 
-## Human Review UI (v0.4.2+)
+## Human Review UI (v0.4.0+)
 
 Review entry points appear on auto-approval or human-approval (strict DSH design language, `--dsw-alias-*` tokens):
 
@@ -157,7 +157,7 @@ Review entry points appear on auto-approval or human-approval (strict DSH design
 3. **File diff & revert** (v0.5.0+): when an auto-approval involves files, the host saves a **pre-change snapshot** at approval time (before the write). In the history view the corresponding event's **file chips become clickable** (blue outline) and open a diff panel:
    - **Changed lines only**: green `+` rows are additions, red `-` rows are deletions (classic diff semantics); the header shows +N / -M stats and unchanged-line count; a missing file is flagged
    - **Revert this change**: posts a revert instruction to the conversation (operation, files, event time, snapshot directory) so the AI restores the files to their pre-approval state
-   - **Snapshot management**: the view header shows "diff snapshots <size> · <count>"; a "Clear diff history" button deletes all snapshots (data only — approval records stay; after clearing, historical files can no longer be diffed)
+   - **Snapshot management**: the view header shows "diff snapshots <size> · <count>" with two cleanup actions — **"This session only"** (removes only the current session's snapshots, never touching other sessions' unviewed diffs) and **"Clear all"** (double-confirmed, clears every session). Both delete comparison data only — approval records stay — and after clearing, historical files can no longer be diffed
    - Limits: only text files (≤256KB each, ≤5 per event) get snapshots; binary/oversized files are not clickable
 
 Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.jsonl` per judgment (`kind`: auto / manual-pending / manual-approved / manual-rejected, plus sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold); the browser polls `GET /api/auto-approve/events?sessionId=&since=` (2s incremental / 5s full refresh in the view).
@@ -168,10 +168,10 @@ Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.js
 |----------|--------|---------|
 | `/api/auto-approve/diff?eventId=&path=` | GET | Changed lines (`changedLines`, add/del) and stats for an event/file; reads only paths listed in that event's snapshot |
 | `/api/auto-approve/revert` | POST | `{sessionId, eventId}` → assembles a revert instruction and delivers it to the session (typertGateway first, `agent.followup` fallback) |
-| `/api/auto-approve/snapshots-stats` | GET | Snapshot usage `{count, bytes, ids}` (ids = events that still have snapshots; drives chip clickability) |
-| `/api/auto-approve/snapshots-clear` | POST | Deletes all snapshot files (only `.json` inside `snapshots/`) |
+| `/api/auto-approve/snapshots-stats?sessionId=` | GET | Snapshot usage `{count, bytes, ids, files}` (ids = events that still have snapshots; drives chip clickability; scoped to one session when sessionId is given) |
+| `/api/auto-approve/snapshots-clear` | POST | Deletes snapshot files (only `.json` inside `snapshots/`); with `{sessionId}` it clears just that session, otherwise all sessions |
 
-## Learning Semantics (v0.4.2+)
+## Learning Semantics (v0.3.0+)
 
 Neutral confirmation learning: each human approval of the same tool|mode|category increments the count; after **N confirmations (default 3), the N+1th occurrence auto-approves** and persists a fingerprinted rule. In the threshold state: fingerprint hit auto-approves; otherwise Flash semantically verifies against confirmed samples (SAME approves / DIFFERENT goes to human); rejections upgrade to denyRules (always human); in-progress learning can be stopped from the settings page.
 
@@ -203,3 +203,6 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 ## License
 
 MIT
+
+This project is a fork of [moon09300731/dsh-approval-gate](https://github.com/moon09300731/dsh-approval-gate);
+the original author's copyright notice is retained in [LICENSE](../LICENSE).

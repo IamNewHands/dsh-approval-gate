@@ -6,11 +6,16 @@
 
 A Flash model pre-judges every sandbox escalation: routine operations auto-approve, hard-risk operations (deletion / credentials / remote / system / bulk) always require human confirmation; learned rules only ever cover operations you confirmed, with an in-app human review UI.
 
+> **Origin**: this project is a fork of [moon09300731/dsh-approval-gate](https://github.com/moon09300731/dsh-approval-gate),
+> with several defects fixed and multi-machine rule sharing added. The original author's copyright
+> and the MIT license are in [LICENSE](LICENSE). This repository
+> ([IamNewHands/dsh-approval-gate](https://github.com/IamNewHands/dsh-approval-gate)) is the maintained version.
+
 ## ✨ Features
 
 - ⚡ **Flash risk pre-judgment**: every sandbox escalation is judged by a Flash model (`SAFE` / `RISKY:<category>`); recoverable operations auto-approve
 - 🛡️ **Hard risks are always human**: deletion, credentials, remote/production, system paths, and bulk irreversible operations go directly to human — no counting, no learning
-- 🎯 **Confirmation-based learning**: after N-1 human confirmations of the same operation, it auto-approves; persisted rules carry an **operation fingerprint**, so only operations you confirmed are auto-approved
+- 🎯 **Confirmation-based learning**: after N human confirmations of the same operation, the N+1th occurrence auto-approves; persisted rules carry an **operation fingerprint**, so only operations you confirmed are auto-approved
 - 🧠 **Semantic similarity verification**: operations with different wording but the same intent are judged by Flash against your confirmed samples — no keyword dependency
 - 📄 **File diff & revert** (v0.5.0+): click a file in an approval record to view a **unified diff** — changed lines with ±5 context lines, multiple changes grouped into hunks separated by gray "N unmodified lines" bars, green additions / red deletions / gray context, dual line numbers; one-click **Revert** sends a command for the AI to restore the file from snapshot
 - 🗂️ **Session-scoped snapshots** (v0.5.0+): snapshots belong to the event's session; the approval view shows only the current session's snapshot stats; clearing supports "this session only" vs "clear all" to avoid wiping other sessions' unviewed diffs

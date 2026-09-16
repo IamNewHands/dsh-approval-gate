@@ -49,7 +49,7 @@ try {
     hardCategories: ['deletion', 'credential', 'remote', 'system', 'bulk'],
     riskyThreshold: 7,
     judgeTimeoutMs: 12345,
-    model: { provider: 'ai-gateway', model: 'workbuddy/deepseek-v4-flash' },
+    model: { provider: 'my-gateway', model: 'custom/flash-model' },
     learning: { enabled: false },
   }
   const { mod, written, tempHome } = await bootWith(localConfig)
@@ -86,7 +86,7 @@ try {
 
   // ---- 5. 旧 model 字段迁移到 judgeModel，保留本机取值 ----
   assert.strictEqual(written.model, undefined, 'legacy `model` key must be removed after migration')
-  assert.deepStrictEqual(written.judgeModel, { provider: 'ai-gateway', model: 'workbuddy/deepseek-v4-flash' },
+  assert.deepStrictEqual(written.judgeModel, { provider: 'my-gateway', model: 'custom/flash-model' },
     'legacy model must migrate to judgeModel preserving the machine-local value')
   console.log('  ✓ model → judgeModel 迁移完成，本机取值保留')
 

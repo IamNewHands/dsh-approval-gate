@@ -1,12 +1,12 @@
 /**
- * dsh-approval-gate — 自动审批（多级判定）持久插件 v3
+ * dsh-approval-gate — 自动审批（多级判定）持久插件
  *
  * 挂在审批瀑布（approval/request）最前：当会话权限预设为 auto-approve 时，
  * 按「DENY → 白名单 → denyRules → flash（SAFE/硬类别/中立计数）→ 裁决学习」管道判定越界请求。
  *
  * 设计目标：最小人工介入。人工只出现在两类场景：
  *   1. 必须人工确认：DENY 危险词、硬风险类别（deletion/credential/remote/system/bulk）
- *   2. 中立操作（neutral）：前 N-1 次人工确认；阈值状态按「指纹命中 → flash 第三方同类验证 → 人工」分流：
+ *   2. 中立操作（neutral）：前 N 次人工确认；阈值状态按「指纹命中 → flash 第三方同类验证 → 人工」分流：
  *      指纹命中（确认样本）→ 自动放行并沉淀规则（{tool,mode,category,contains}）
  *      指纹未命中但有样本 → flash 语义判断是否与确认样本同类（SAME 放行 / DIFFERENT 人工）
  *      无样本 / 判不同 / 验证失败 → 人工确认
@@ -18,9 +18,9 @@
  * 其中 mode 仅两级：workspace-write（写工作区，可回补）/
  * danger-full-access（任意文件/系统，危险）。
  *
- * flash 判定协议（v3）：输出 `SAFE` 或 `RISKY:<category>`
+ * flash 判定协议：输出 `SAFE` 或 `RISKY:<category>`
  *   category ∈ { deletion, credential, remote, system, bulk, neutral }
- *   硬类别（前五个）→ 直接转人工；neutral（中立）→ 计数放行，第 N 次转人工裁决。
+ *   硬类别（前五个）→ 直接转人工；neutral（中立）→ 前 N 次人工确认，之后进入阈值状态。
  *
  * 超时/失败处理：AbortController + signal 传给 llm.stream（可取消），
  *   超时或失败重试 1 次，仍失败 → 转人工（fail-safe）。
@@ -1830,6 +1830,6 @@ export default {
       }
     }, { prepend: true })
 
-    console.log(`[${NAME}] v3 已挂载：DENY→白名单→denyRules→flash(SAFE/硬类别/中立计数${config.riskyThreshold})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
+    console.log(`[${NAME}] 已挂载：DENY→白名单→denyRules→flash(SAFE/硬类别/中立计数${config.riskyThreshold})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
   },
 }
