@@ -47,6 +47,10 @@ const SNAPSHOTS_DIR = join(DATA_DIR, 'snapshots')
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const BUNDLED_ALLOWLIST_PATH = join(__dirname, '..', 'allowlist.json')
 
+// 配置 schema 版本（与判定协议版本无关）。以 bundled 汇总文件为准，
+// 仅当种子缺失时退回此常量。
+const CONFIG_VERSION = 4
+
 function getProfilePatchPath() {
   if (process.env.DSH_PROFILE) {
     const p = join(DSH_HOME, 'profiles', process.env.DSH_PROFILE, 'cordis.patch.yml')
@@ -510,7 +514,7 @@ function getRulesSnapshot(permissionPresets) {
   reloadConfig()
   return {
     config: {
-      version: config.version || 3,
+      version: config.version || CONFIG_VERSION,
       judgeModel: config.judgeModel || null,
       denyKeywords: config.denyKeywords || [],
       allowRules: config.allowRules || [],
@@ -780,7 +784,66 @@ function audit(line) {
   } catch { /* 审计失败不影响主流程 */ }
 }
 
-// 首次加载时初始化配置文件；旧版（v1）自动补齐 v3 字段；自动合并默认白名单规则（方便多机同步）
+/**
+ * 多机共享规则：bundled 种子文件（仓库根目录 allowlist.json）是「汇总版」规则，
+ * 加载时把其中的规则数组**增量并入**本地配置，两台机器因此共用同一份规则。
+ *
+ * 只合并规则数组；阈值/超时/学习状态/判定模型属**机器本地**配置，不参与同步
+ * （判定模型的 provider/model 名各机可能不同，必须按本机实际值判断）。
+ * 合并是幂等的：按特征去重，已存在的规则不重复追加。
+ */
+const SHARED_RULE_KEYS = ['denyKeywords', 'allowRules', 'denyRules', 'hardCategories']
+
+/** 规则特征键：字符串规则用自身，对象规则用 tool/mode/category/contains 四元组 */
+function ruleKey(kind, rule) {
+  if (kind === 'denyKeywords' || kind === 'hardCategories') return String(rule)
+  const r = rule && typeof rule === 'object' ? rule : {}
+  return [r.tool || '', r.mode || '', r.category || '', r.contains || ''].join('\u0000')
+}
+
+/** 把种子里本地缺失的规则补进来（只增不减，保留本机自定义规则） */
+function mergeSharedRules(cfg, seed) {
+  if (!seed || typeof seed !== 'object') return cfg
+  for (const kind of SHARED_RULE_KEYS) {
+    const incoming = seed[kind]
+    if (!Array.isArray(incoming)) continue
+    const current = Array.isArray(cfg[kind]) ? cfg[kind] : []
+    const seen = new Set(current.map((r) => ruleKey(kind, r)))
+    for (const rule of incoming) {
+      const k = ruleKey(kind, rule)
+      if (seen.has(k)) continue
+      seen.add(k)
+      current.push(rule)
+    }
+    cfg[kind] = current
+  }
+  return cfg
+}
+
+/**
+ * 旧字段迁移：上游 0.5.0 读 `config.model`，本 fork 已更名为 `judgeModel`。
+ * 旧配置里的 `model` 因此不再被读取（判定模型静默失效），此处就地迁移，
+ * **保留本机原有取值**，不写入任何硬编码默认值。
+ */
+function migrateJudgeModel(cfg) {
+  const legacy = cfg.model
+  if (!legacy || typeof legacy !== 'object') return false
+  const hasProvider = typeof legacy.provider === 'string' && legacy.provider
+  const hasModel = typeof legacy.model === 'string' && legacy.model
+  const jm = cfg.judgeModel
+  const jmEmpty = !jm || typeof jm !== 'object' || !jm.provider || !jm.model
+  delete cfg.model
+  if (hasProvider && hasModel && jmEmpty) {
+    cfg.judgeModel = { provider: legacy.provider, model: legacy.model }
+    return true
+  }
+  return false
+}
+
+// 汇总种子（仓库根目录 allowlist.json）：规则与版本号的权威来源
+const bundledSeed = loadJson(BUNDLED_ALLOWLIST_PATH, null)
+
+// 首次加载时初始化配置文件；旧版（v1/v3）字段自动补齐；并入 bundled 汇总规则（多机同步）
 function normalizeConfig(raw) {
   const cfg = raw && typeof raw === 'object' ? raw : {}
   cfg.denyKeywords = cfg.denyKeywords || DEFAULT_DENY_KEYWORDS
@@ -804,12 +867,20 @@ function normalizeConfig(raw) {
   cfg.riskyThreshold = cfg.riskyThreshold || 3
   cfg.judgeTimeoutMs = cfg.judgeTimeoutMs || 20000
   cfg.learning = cfg.learning || { enabled: true }
+  // 判定模型：先迁移旧字段（本机取值），再规范化
+  migrateJudgeModel(cfg)
   if (cfg.judgeModel && typeof cfg.judgeModel === 'object') {
     cfg.judgeModel = {
       provider: String(cfg.judgeModel.provider || ''),
       model: String(cfg.judgeModel.model || '')
     }
   }
+  // 多机共享：并入 bundled 种子里的规则（只增不减，幂等）
+  // 注意：此处**不**合并。normalizeConfig 也被 reloadConfig()（每次审批前热更新）
+  // 调用，若在其中合并，用户在 UI 删除的种子规则会被反复复活。合并只在启动时做一次。
+  // 版本以汇总种子为准（仓库文件是权威），本机不自行降级
+  if (bundledSeed && bundledSeed.version) cfg.version = bundledSeed.version
+  else cfg.version = cfg.version || CONFIG_VERSION
   return cfg
 }
 
@@ -817,7 +888,7 @@ let config = loadJson(ALLOWLIST_PATH, null)
 if (!config || typeof config !== 'object') {
   const bundled = loadJson(BUNDLED_ALLOWLIST_PATH, null)
   config = bundled && typeof bundled === 'object' ? bundled : {
-    version: 3,
+    version: CONFIG_VERSION,
     denyKeywords: DEFAULT_DENY_KEYWORDS,
     allowRules: DEFAULT_ALLOW_RULES,
     denyRules: [],
@@ -829,8 +900,13 @@ if (!config || typeof config !== 'object') {
   config = normalizeConfig(config)
   saveJson(ALLOWLIST_PATH, config)
 } else {
+  const before = JSON.stringify(config)
   config = normalizeConfig(config)
-  if (config.version !== 3) { config.version = 3; saveJson(ALLOWLIST_PATH, config) }
+  // 启动时一次性并入汇总种子规则（多机同步）；热更新路径不做合并，
+  // 以免用户在 UI 删除的种子规则被反复复活。
+  mergeSharedRules(config, bundledSeed)
+  // 有实际变化才落盘：种子新增规则、旧字段迁移、版本对齐
+  if (JSON.stringify(config) !== before) saveJson(ALLOWLIST_PATH, config)
 }
 
 // 热更新：每次审批前重新读盘 allowlist.json（小文件、审批频率低，无性能问题），
@@ -840,7 +916,7 @@ function reloadConfig() {
   if (disk && typeof disk === 'object') {
     const prev = config
     config = normalizeConfig(disk)
-    if (!config.version) config.version = prev.version || 3
+    if (!config.version) config.version = prev.version || CONFIG_VERSION
     learning.enabled = config.learning.enabled !== false
   }
   const lDisk = loadJson(LEARNING_PATH, null)
@@ -976,6 +1052,9 @@ function extractOperationFingerprint(text) {
   candidates.sort((a, b) => b.length - a.length)
   return candidates[0].slice(0, 80)
 }
+
+// 具名导出：供单元测试直接验证真实实现（而非测试内重复一份逻辑）
+export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, SHARED_RULE_KEYS }
 
 export default {
   name: NAME,

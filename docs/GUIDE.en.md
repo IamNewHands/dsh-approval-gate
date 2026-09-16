@@ -77,11 +77,11 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
 | `events.jsonl` | Auto-approval events (for the review UI, per-session isolation) |
 | `snapshots/` | Pre-change snapshots of auto-approved files (named by event ID; used for diff and revert) |
 
-`allowlist.json` structure (v3):
+`allowlist.json` structure (v4):
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "denyKeywords": ["rm -rf", "drop table", "force push", "format"],
   "allowRules": [
     { "mode": "workspace-write", "description": "Workspace writes auto-approve" },
@@ -91,9 +91,33 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
+  "judgeModel": { "provider": "ai-gateway", "model": "workbuddy/deepseek-v4-flash" },
   "learning": { "enabled": true }
 }
 ```
+
+### Sharing rules across machines
+
+The `allowlist.json` shipped inside the plugin package (repository root) is the
+**aggregated ruleset**. On every load its rule arrays (`denyKeywords` /
+`allowRules` / `denyRules` / `hardCategories`) are **merged incrementally** into
+the local `$DSH_HOME/auto-approve/allowlist.json`, so several machines share one
+ruleset:
+
+- **Additive only**: machine-local rules are preserved, never overwritten or removed
+- **Deduplicated by identity**: the same rule (`tool`/`mode`/`category`/`contains`) is never appended twice
+- **Idempotent**: repeated loads produce no duplicate entries
+- **Version follows the repo**: `version` tracks the aggregated file; a machine never downgrades it
+
+The following are **machine-local** and are never synchronised (set them per machine):
+
+- `riskyThreshold`, `judgeTimeoutMs`, `learning`
+- `judgeModel`: the judge model. Custom provider names differ between machines
+  (e.g. `ai-gateway`), so use this machine's actual value rather than copying another's
+
+> The legacy `model` field (upstream 0.5.0) was renamed to `judgeModel`. On load it is
+> migrated automatically: the machine-local value is carried over into `judgeModel` and
+> the old `model` key is removed. An explicitly configured `judgeModel` always wins.
 
 - `denyKeywords`: a hit sends the request to human (irreversible operations)
 - `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` (omitted fields match anything). Learned rules are also written here

@@ -1,5 +1,17 @@
 import assert from 'node:assert'
-import plugin from '../src/index.mjs'
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+// 隔离 DSH_HOME：模块加载时会初始化/落盘 allowlist.json，
+// 必须指向临时目录，绝不能碰用户真实的 ~/.dsh/auto-approve/allowlist.json。
+const tempHome = mkdtempSync(join(tmpdir(), 'ag-unittest-'))
+mkdirSync(join(tempHome, 'auto-approve'), { recursive: true })
+process.env.DSH_HOME = tempHome
+
+const plugin = (await import(pathToFileURL(new URL('../src/index.mjs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')).href)).default
+process.on('exit', () => { try { rmSync(tempHome, { recursive: true, force: true }) } catch { /* ignore */ } })
 
 // We will test exported plugin or functions by loading index.mjs or testing its logic
 console.log('Testing dsh-approval-gate...')

@@ -77,11 +77,11 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 | `events.jsonl` | 自动放行事件（供审查 UI 展示，按会话隔离） |
 | `snapshots/` | 自动放行文件的改动前快照（按事件 ID 命名，供 diff 对比与撤销参考） |
 
-`allowlist.json` 结构（v3）：
+`allowlist.json` 结构（v4）：
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "denyKeywords": ["rm -rf", "drop table", "force push", "格式化"],
   "allowRules": [
     { "mode": "workspace-write", "description": "工作区写入自动放行" },
@@ -91,9 +91,31 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
+  "judgeModel": { "provider": "ai-gateway", "model": "workbuddy/deepseek-v4-flash" },
   "learning": { "enabled": true }
 }
 ```
+
+### 多机共享规则
+
+插件包内（仓库根目录）的 `allowlist.json` 是**汇总版规则**。每次加载时，其中的规则数组
+（`denyKeywords` / `allowRules` / `denyRules` / `hardCategories`）会**增量并入**本地
+`$DSH_HOME/auto-approve/allowlist.json`，因此多台机器共用同一份规则：
+
+- **只增不减**：本机自定义规则保留，不会被仓库版本覆盖或删除
+- **按特征去重**：同一规则（`tool`/`mode`/`category`/`contains` 四元组）不会重复追加
+- **幂等**：重复加载不会产生重复条目
+- **版本以仓库为准**：`version` 跟随汇总文件，本机不会自行降级
+
+以下配置属于**机器本地**，不参与同步（各机按实际环境自行设置）：
+
+- `riskyThreshold`、`judgeTimeoutMs`、`learning`
+- `judgeModel`：判定模型。各机的自定义提供商名称可能不同（如 `ai-gateway`），
+  必须按本机实际配置填写，不要照搬另一台机器的值
+
+> 旧版本（上游 0.5.0）使用的 `model` 字段已更名为 `judgeModel`。加载时会自动迁移：
+> 保留本机原有取值写入 `judgeModel`，并移除旧的 `model` 键；若已显式配置
+> `judgeModel`，则以它为准。
 
 - `denyKeywords`：命中即转人工（不可逆危险操作）
 - `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` 均满足才放行（缺省表示任意）。学习沉淀的规则也会写入这里
