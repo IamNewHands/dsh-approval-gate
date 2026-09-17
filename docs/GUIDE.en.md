@@ -2,7 +2,7 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.7.0: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.7.1: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
@@ -214,7 +214,7 @@ Review entry points appear on auto-approval or human-approval (strict DSH design
 1. **Notice strip** (a dedicated row above the composer, `conversation.input.dock` order=30, does not scroll with the conversation):
    - Auto-approval → green ✅: tool + summary + verdict label (allowlist / flash-safe / learned / confirmed / flash-same), auto-dismisses after a few seconds
    - **Escalated to human → amber** (`--dsw-alias-state-warn-*`): "Waiting for human approval: <operation>", **stays until you decide**
-   - **Silent / manual rejection → red** (v0.7.0+): "Rejected outright: <operation>" or "Rejected: <operation>", and it **never auto-dismisses** — it stays above the composer until you switch to the "Approval" tab or press an action button. The strip offers:
+   - **Silent / manual rejection → red** (v0.7.0+): "Rejected outright: <operation>" or "Rejected: <operation>", and it **never auto-dismisses** — it stays above the composer until you switch to the "Approval" tab or press an action button. A reconsidered rejection is no longer pending, so it is not restored as a red notice on reload and its wording flips to "Reconsideration approved" (v0.7.1). The strip offers:
      - **"View approval log"**: switches to the "Approval" tab (which also counts as reading it, so the strip collapses)
      - **"Re-approve"**: shown only when the rejection is **reconsiderable** (see below); pressing it writes an auto-approve rule and lets the AI retry the operation
    - Human approved → amber "Learning n/N, auto-approves after N" (dismisses after a few seconds)
@@ -224,7 +224,7 @@ Review entry points appear on auto-approval or human-approval (strict DSH design
 3. **Reconsideration ("Re-approve", v0.7.0+)**: a rejected record can be reconsidered, which **writes an auto-approve rule carrying the operation fingerprint and delivers a retry instruction to the session** (so the AI re-runs the operation instead of you retyping it). Two fences:
    - **Only judge-layer silent rejections are reconsiderable**: `judge-deny` (a judge `deny` verdict, or a silent rejection after consecutive failures). The **deterministic hard-deny tier** (`hard-reject`: credential exfiltration, filesystem-root and system-path destruction) runs first and no allowlist rule can override it, so offering a button would be a false promise — it is not offered
    - **Hard-risk categories are not reconsiderable**: `deletion` / `credential` / `remote` / `system` / `bulk` mean "must be confirmed by a human every time", so reconsideration-based auto-approval is refused; loosen `hardCategories` or add an explicit allowlist rule instead
-   - Reconsidering twice is idempotent (the rule is not written again); a reconsidered record is labelled "Reconsidered" and drops out of the pending count
+   - Reconsidering twice is idempotent (the rule is not written again); a reconsidered record is labelled "Reconsideration approved · <reason> (was rejected outright)" and drops out of the pending count (since v0.7.1 the wording and colour flip together, so it no longer looks like it is still rejected)
 4. **File diff & revert** (v0.5.0+): when an auto-approval involves files, the host saves a **pre-change snapshot** at approval time (before the write). In the history view the corresponding event's **file chips become clickable** (blue outline) and open a diff panel:
    - **Changed lines only**: green `+` rows are additions, red `-` rows are deletions (classic diff semantics); the header shows +N / -M stats and unchanged-line count; a missing file is flagged
    - **Revert this change**: posts a revert instruction to the conversation (operation, files, event time, snapshot directory) so the AI restores the files to their pre-approval state
@@ -235,7 +235,7 @@ Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.js
 
 > `hard-reject` and `judge-deny` are **judge-layer silent rejections** (no dialog was shown): the hard-deny tier and a judge `deny` / consecutive failure respectively. The review view shows both in red as "Rejected outright" with the concrete reason.
 >
-> `reconsidered` is a **reconsideration record** (v0.7.0+): its `reconsiderOf` points back at the original event. The events API filters the reconsideration records out and adds `reconsidered: true` to the original event, which the frontend uses to label it "Reconsidered" and drop it from the pending count.
+> `reconsidered` is a **reconsideration record** (v0.7.0+): its `reconsiderOf` points back at the original event. The events API filters the reconsideration records out and adds `reconsidered: true` to the original event, which the frontend uses to label it "Reconsideration approved · … (was rejected outright)" and drop it from the pending count. Reconsideration does not rewrite the original event: the rejection did happen, so the reason stays visible in parentheses (v0.7.1 wording).
 
 ## Reconsideration API (v0.7.0+)
 

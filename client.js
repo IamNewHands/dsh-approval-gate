@@ -180,6 +180,18 @@ window.__ModuleLoader__.load({
       return '已直接拒绝'
     }
 
+    /**
+     * 追认后的文案：原事件**仍是那次拒绝**（审计事实不改写，`path` 保留拒绝原因），
+     * 但用户已追认 → 该操作**已放行**。因此措辞与配色都从「被拒」翻转为「已解决」，
+     * 不再计为待处理拒绝；「曾直接拒绝」留在括号里，不隐瞒历史。
+     */
+    function reconsideredLabel(ev) {
+      const p = ev && ev.path
+      if (p === 'judge-unavailable') return '已追认放行 · 判定器不可用（曾直接拒绝）'
+      if (p === 'classifier-deny') return '已追认放行 · 判定为有害或越权（曾直接拒绝）'
+      return '已追认放行 · 曾直接拒绝'
+    }
+
     function fmtTime(iso) {
       try {
         const d = new Date(iso)
@@ -252,6 +264,7 @@ window.__ModuleLoader__.load({
 
     /** 该事件能否被追认（与 host 端围栏一致：判定层静默拒绝 + 非硬风险类别） */
     function isReconsiderable(ev) {
+      // 已追认（reconsidered）的记录不再给按钮：终态已翻转为「已放行」，再点就是重复追认
       return Boolean(ev) && ev.kind === 'judge-deny' && !ev.reconsidered
         && !HARD_CATEGORIES.has(String(ev.category || 'neutral'))
     }
@@ -365,10 +378,10 @@ window.__ModuleLoader__.load({
         if (!sessionId) return
 
         // 待处理拒绝的恢复：刷新页面后仍要看到「直接拒绝」的提示条（用户没看过就不该消失）。
-        // 只恢复最近一条，避免历史拒绝刷屏。
+        // 只恢复最近一条，避免历史拒绝刷屏。已追认的不算待处理（终态已翻转为已放行），不恢复。
         const restorePending = function (evs) {
           const seen = new Set(readJson(SEEN_REJECTS_KEY, []))
-          const pending = evs.filter(function (ev) { return isRejectEvent(ev) && !seen.has(ev.id) })
+          const pending = evs.filter(function (ev) { return isRejectEvent(ev) && !ev.reconsidered && !seen.has(ev.id) })
           if (pending.length > 0) {
             const last = pending[pending.length - 1]
             setNotice(last)
@@ -446,9 +459,11 @@ window.__ModuleLoader__.load({
         tagText = '人工审批中'
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '◔')
       } else if (isSilentReject) {
-        title = '已直接拒绝：' + (notice.justification || notice.reason || '')
-        tagText = silentRejectLabel(notice)
-        glyph = React.createElement('span', { className: 'ag-notice-glyph-err' }, '✕')
+        // 已被追认（可能在另一个窗口点的）：状态已翻转为「已放行」，不该再吓人
+        const done = Boolean(notice.reconsidered)
+        title = (done ? '已追认放行：' : '已直接拒绝：') + (notice.justification || notice.reason || '')
+        tagText = done ? reconsideredLabel(notice) : silentRejectLabel(notice)
+        glyph = React.createElement('span', { className: done ? 'ag-notice-glyph' : 'ag-notice-glyph-err' }, done ? '✓' : '✕')
       } else if (kind === 'manual-approved') {
         const lc = notice.learningCount !== undefined ? notice.learningCount : null
         const th = notice.threshold || 3
@@ -467,7 +482,8 @@ window.__ModuleLoader__.load({
       }
       const cardCls = 'ag-notice-card'
         + (isPending ? ' ag-notice-card-pending' : isManual ? ' ag-notice-card-manual' : '')
-        + (isReject ? ' ag-notice-card-reject' : '')
+        // 追认过的静默拒绝不再是「错误状态」：去掉红色告警底，回到中性卡片
+        + (isReject && !notice.reconsidered ? ' ag-notice-card-reject' : '')
       // 拒绝类提示条：不自动消失，提供「查看审批记录」与（可追认时）「重新审批通过」
       const canReconsider = isReconsiderable(notice)
       return React.createElement('div', { className: 'ag-notice' },
@@ -479,9 +495,9 @@ window.__ModuleLoader__.load({
               React.createElement('span', { className: 'ag-notice-text' }, title),
             ),
             React.createElement('div', { className: 'ag-notice-meta' },
-              React.createElement('span', { className: isPending ? 'ag-tag-warn' : (kind === 'manual-rejected' || isSilentReject) ? 'ag-tag-err' : kind === 'manual-approved' ? 'ag-tag-warn' : 'ag-tag' + (VERDICT_NEUTRAL.has(notice.verdict) ? ' ag-tag-neutral' : '') }, tagText),
+              React.createElement('span', { className: isPending ? 'ag-tag-warn' : (kind === 'manual-rejected' || (isSilentReject && !notice.reconsidered)) ? 'ag-tag-err' : (kind === 'manual-approved' || notice.reconsidered) ? 'ag-tag-warn' : 'ag-tag' + (VERDICT_NEUTRAL.has(notice.verdict) ? ' ag-tag-neutral' : '') }, tagText),
               React.createElement('span', { className: 'ag-time' }, fmtTime(notice.ts)),
-              isReject
+              isReject && !notice.reconsidered
                 ? React.createElement('span', { className: 'ag-notice-hint' }, '未读 · 切到「审批」tab 后自动收起')
                 : null,
             ),
@@ -834,12 +850,21 @@ window.__ModuleLoader__.load({
                     // 按拒绝路径精确分类文案（reason 由 host 记录）
                     // hard-reject / judge-deny 是判定层静默拒绝（未弹窗）
                     const silent = kind === 'hard-reject' || kind === 'judge-deny'
-                    tagText = silent ? silentRejectLabel(ev) : rejectLabel(ev)
-                    // 已被用户追认：明确标注，避免误以为仍然被拒
-                    if (ev.reconsidered) tagText = '已追认 · ' + tagText
-                    tagCls = 'ag-tag-err'
-                    glyphCls = 'ag-row-glyph-err'
-                    glyph = React.createElement('span', null, '✕')
+                    if (ev.reconsidered && silent) {
+                      // 追认已把终态翻转为「已放行」：文案与配色一起改，不再算待处理拒绝；
+                      // 原拒绝事实不隐瞒，收在括号里（「曾直接拒绝」）。
+                      tagText = reconsideredLabel(ev)
+                      tagCls = 'ag-tag-warn'
+                      glyphCls = 'ag-row-glyph-warn'
+                      glyph = React.createElement('span', null, '✓')
+                    } else {
+                      tagText = silent ? silentRejectLabel(ev) : rejectLabel(ev)
+                      // 已被用户追认：明确标注，避免误以为仍然被拒
+                      if (ev.reconsidered) tagText = '已追认 · ' + tagText
+                      tagCls = 'ag-tag-err'
+                      glyphCls = 'ag-row-glyph-err'
+                      glyph = React.createElement('span', null, '✕')
+                    }
                   } else {
                     tagText = '自动放行 · ' + (VERDICT_LABELS[ev.verdict] || ev.verdict || 'auto')
                     tagCls = 'ag-tag' + (VERDICT_NEUTRAL.has(ev.verdict) ? ' ag-tag-neutral' : '')

@@ -4,6 +4,20 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.7.1] — 2026-09-17
+
+Fixes a display defect that made a reconsidered record **still look rejected**.
+
+### Fixed
+
+- **A reconsidered record now reads as released**: reconsideration does not rewrite the original event (it really was a rejection, and that audit fact is kept) — it only adds a `reconsidered` flag. The old wording glued the two together as "Reconsidered · Rejected outright · judge unavailable (consecutive failures)" and kept the red ✕ and error background, so right after pressing "Re-approve" the user saw what looked like a failed reconsideration. A reconsidered silent rejection now renders as **"Reconsideration approved · <reason> (was rejected outright)"**, with a ✓ glyph, a done/amber tag and no pending rail; the original reason stays in parentheses so nothing is hidden
+- **A reconsidered record no longer counts as pending and no longer re-surfaces as a pinned notice**: on reload, reconsidered rejections are no longer restored as a red notice (they used to show up again in the "pending N" badge and the notice strip even though the rule was already written and the AI had already retried)
+- The "Re-approve" button now honours the `reconsidered` fence (matching the pending test), so an already-reconsidered row no longer offers the button again
+
+### Tests
+
+- `test/client-render-smoke.test.mjs` gains two cases: a reconsidered row renders as "Reconsideration approved · judge unavailable (was rejected outright)" with a done tag while only the **un-reconsidered** row counts toward "pending 1"; and a reconsidered rejection no longer re-surfaces as a notice after a reload
+
 ## [0.7.0] — 2026-09-16
 
 Fixes an ordering defect in the judgment pipeline and adds user visibility plus a remedy path for silent rejections.

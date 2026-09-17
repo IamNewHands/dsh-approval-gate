@@ -10,6 +10,8 @@
  *   1. 静默拒绝（judge-deny, neutral）渲染常驻提示条，带「重新审批通过」与「查看审批记录」
  *   2. 硬拒档常驻提示条，但**不**给追认按钮（白名单盖不过硬拒层）
  *   3. 审批视图只为可追认的行显示「重新审批通过」
+ *   3c. 追认后的记录文案翻转为「已追认放行」、改用中性色，且不再计入待处理
+ *   3d. 追认过的拒绝刷新后不再弹常驻提示条
  *   4. 打开审批 tab 会把拒绝标记为已读；已读记录刷新后不再弹提示条
  *
  * 垫片只实现 bundle 实际用到的 createElement / useState / useRef / useEffect。
@@ -307,6 +309,46 @@ function inspect(node, out) {
   assert.strictEqual(reapprove.length, 1,
     'exactly the category the server removed from hardCategories offers re-approval; got ' + reapprove.length)
   console.log('  ✓ 追认按钮跟随服务端 hardCategories（自定义类别被拦、被移出的类别放开）')
+}
+
+// ================= 3c. 追认后的记录：文案翻转为「已放行」，且不再算待处理 =================
+{
+  // 追认**不改写**原事件（它仍是那次拒绝，审计事实保留），只加 reconsidered 标记。
+  // 但用户已放行该操作 → 文案与配色必须从「被拒」翻转，否则用户看到红色「已直接拒绝」
+  // 会以为追认没生效（真实踩坑：event 214/215，判定器不可用 → 追认后仍显示红色拒绝）。
+  const env = createEnv([
+    { id: 51, kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral', tool: 'edit', ts: '2026-09-17T11:22:03.000Z', verdict: 'judge-deny', justification: '写 custom_phrase.dict.yaml', files: [], reconsidered: true },
+    { id: 52, kind: 'judge-deny', path: 'classifier-deny', category: 'neutral', tool: 'edit', ts: '2026-09-17T11:23:00.000Z', verdict: 'judge-deny', justification: '仍未追认', files: [] },
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's7' })
+  const info = inspect(tree)
+  assert.ok(/已追认放行 · 判定器不可用（曾直接拒绝）/.test(info.text),
+    'a reconsidered record reads as approved-and-released, keeping the original reason in parentheses')
+  assert.ok(!/已追认 · 已直接拒绝/.test(info.text),
+    'the old "已追认 · 已直接拒绝" wording must be gone (it looked like it was still rejected)')
+  assert.ok(/待处理 1/.test(info.text),
+    'only the still-pending rejection counts; the reconsidered one is released (got: ' + info.text + ')')
+  // 追认行用中性/完成色，未追认行仍是红色错误色
+  assert.ok(info.classes.some((c) => c === 'ag-tag-warn'), 'the reconsidered row uses the done/amber tag')
+  assert.ok(info.classes.some((c) => c === 'ag-tag-err'), 'the still-pending row keeps the red tag')
+  console.log('  ✓ 追认后的记录 → 「已追认放行」文案 + 中性色，且不再计入待处理')
+}
+
+// ================= 3d. 追认过的拒绝不再弹常驻提示条 =================
+{
+  const env = createEnv([{
+    id: 61, kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral',
+    tool: 'edit', ts: '2026-09-17T11:22:03.000Z', verdict: 'judge-deny',
+    justification: '写 custom_phrase.dict.yaml', files: [], reconsidered: true,
+  }])
+  const booted = boot(env)
+  const Notice = booted.component('dsh-approval-gate.notice')
+  const tree = await renderSettled(booted, Notice, { sessionId: 's8' })
+  assert.strictEqual(tree, null,
+    'a reconsidered rejection is released, so it must not re-surface as a red notice after a reload')
+  console.log('  ✓ 追认过的拒绝刷新后不再弹红色提示条')
 }
 
 // ================= 4. 打开审批 tab → 标记已读 =================
