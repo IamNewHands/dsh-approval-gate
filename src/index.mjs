@@ -1074,14 +1074,46 @@ function parseReason(reason) {
 }
 
 // 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）
+// 匹配文本归一化：小写 + 反斜杠统一成斜杠 + 压缩空白。
+// 规则指纹来自「上一次」调用的说明文本，匹配时比对的是「本次」调用的上下文，
+// 同一目标的书写形式常不同（C:\Users\x\Rime 与 C:/Users/x/Rime、大小写、多余空白）。
+function normalizeMatchText(text) {
+  return String(text || '').toLowerCase().replace(/\\/g, '/').replace(/\s+/g, ' ').trim()
+}
+
+// 候选是否被本次上下文涵盖：长候选（路径类）要求「上下文包含候选」，
+// 短候选允许反向（上下文本身是个已归一化的路径/片段时，被候选包含）。
+function matchContains(contextText, candidateText) {
+  const c = normalizeMatchText(candidateText)
+  if (!c) return true
+  // 命中位置必须落在词/路径边界上，否则 `...\Roaming\Rime` 会命中 `...\Roaming\RimeX`
+  let from = 0
+  for (;;) {
+    const at = contextText.indexOf(c, from)
+    if (at === -1) break
+    const next = contextText[at + c.length]
+    if (next === undefined || !/[a-z0-9_@.\-]/.test(next)) return true
+    from = at + 1
+  }
+  return c.length >= 4 && contextText.length >= 4 && c.includes(contextText)
+}
+
+// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）。
+// keywords 为可选的多候选指纹（追认规则会写入），任一候选命中即视为 contains 命中；
+// 仅当规则给出 contains 或 keywords 时才要求命中，二者皆无表示「工具+模式+类别」宽规则。
 function matchRule(rules, toolName, mode, category, justification) {
   const list = rules || []
-  const j = String(justification || '').toLowerCase()
+  const j = normalizeMatchText(justification)
   for (const rule of list) {
     if (rule.tool && rule.tool !== toolName) continue
     if (rule.mode && rule.mode !== mode) continue
     if (category !== null && category !== undefined && rule.category && rule.category !== category) continue
-    if (rule.contains && !j.includes(String(rule.contains).toLowerCase())) continue
+    const candidates = []
+    if (rule.contains) candidates.push(rule.contains)
+    if (Array.isArray(rule.keywords)) {
+      for (const k of rule.keywords) if (k) candidates.push(k)
+    }
+    if (candidates.length > 0 && !candidates.some((c) => matchContains(j, c))) continue
     return rule
   }
   return null
@@ -1160,8 +1192,40 @@ function extractOperationFingerprint(text) {
   return candidates[0].slice(0, 80)
 }
 
+// 追认规则的候选指纹：一次调用常涉及多个目标（目录 + 文件名 + 参数里的绝对路径），
+// 而单条 justification 的措辞与下次调用不同。按「路径 → 引号片段 → 带扩展名文件名 → 多段标识符」
+// 的顺序产出候选，写入规则的 keywords，命中任一即放行（比只留最长片段可靠得多）。
+function extractFingerprintCandidates(text) {
+  const s = String(text || '')
+  if (!s) return []
+  const raw = []
+  const push = (v) => {
+    const seg = String(v || '').trim()
+    if (seg.length < 3 || seg.length > 200) return
+    if (/^(workspace-write|danger-full-access)$/i.test(seg)) return
+    raw.push(seg)
+  }
+  for (const m of s.matchAll(/(?:[a-zA-Z]:[\\/]|(?:~[\\/]|[\\/]|\.[\\/]))[\w@.\-\\/]{2,}/g)) {
+    push(m[0].replace(/[，。；、,.;:：\s]+$/g, ''))
+  }
+  for (const m of s.matchAll(/["'`“‘]([^"'`”’\r\n]{3,120})["'`”’]/g)) push(m[1])
+  for (const m of s.matchAll(/[\w@.\-]+\.(?:md|js|json|ya?ml|env|txt|py|ts|css|html|log|mjs|cjs|dict)/gi)) push(m[0])
+  for (const m of s.matchAll(/\b[a-z][\w-]*(?:[-.][a-z][\w-])+\b/gi)) push(m[0])
+
+  const seen = new Set()
+  const out = []
+  for (const seg of raw) {
+    const key = normalizeMatchText(seg).replace(/\/+$/, '')
+    if (key.length < 3 || seen.has(key)) continue
+    seen.add(key)
+    out.push(seg)
+    if (out.length >= 8) break
+  }
+  return out
+}
+
 // 具名导出：供单元测试直接验证真实实现（而非测试内重复一份逻辑）
-export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, SHARED_RULE_KEYS }
+export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, SHARED_RULE_KEYS, normalizeMatchText, extractFingerprintCandidates }
 
 export default {
   name: NAME,
@@ -1502,18 +1566,33 @@ export default {
 
               // 写入沉淀规则：带操作指纹，只放行同一指纹的操作（宽规则会误放行用户没确认过的其他操作）
               reloadConfig()
-              const fingerprint = extractOperationFingerprint(String(event.justification || event.reason || ''))
+              const fingerprintText = String(event.justification || event.reason || '')
+              const fingerprint = extractOperationFingerprint(fingerprintText)
+              const filesText = Array.isArray(event.files) ? event.files.join(' ') : ''
+              const candidates = extractFingerprintCandidates(fingerprintText + ' ' + filesText)
               const rule = { tool: String(event.tool || 'unknown'), category: cat }
               if (event.mode) rule.mode = String(event.mode)
               if (fingerprint) rule.contains = fingerprint
-              const dup = config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)
+              const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
+              if (keywords.length > 0) rule.keywords = keywords
+              const sameRule = (r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains
+              const dup = config.allowRules.some(sameRule)
               if (!dup) {
                 rule.description = '用户追认：' + (fingerprint ? '同类操作自动放行' : '同类操作自动放行（无指纹，按工具+模式+类别）')
                 config.allowRules.push(rule)
                 saveJson(ALLOWLIST_PATH, config)
                 audit(`RECONSIDER event=${eventId} +allowRule ${JSON.stringify(rule)}`)
               } else {
-                audit(`RECONSIDER event=${eventId} 规则已存在 ${JSON.stringify(rule)}`)
+                // 同一目标重复追认：并集候选，补齐旧规则缺失的指纹形态（旧规则只有最长片段）
+                const merged = config.allowRules.find(sameRule)
+                const union = Array.from(new Set([...(merged.keywords || []), ...keywords]))
+                if (union.length !== (merged.keywords || []).length) {
+                  merged.keywords = union
+                  saveJson(ALLOWLIST_PATH, config)
+                  audit(`RECONSIDER event=${eventId} 规则已存在，补齐 keywords ${JSON.stringify(union)}`)
+                } else {
+                  audit(`RECONSIDER event=${eventId} 规则已存在 ${JSON.stringify(rule)}`)
+                }
               }
 
               // 可选：投递重试指令（与「撤销此改动」同一套通道）
@@ -1845,6 +1924,11 @@ export default {
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
         const toolCmd = resolveToolCallCommand(req.callId, session.events)
         const matchContext = toolCmd ? `${justification} ${toolCmd}` : justification
+        // 规则匹配上下文：justification + 命令 + 本次调用的真实目标文件（write/edit 的 file_path）。
+        // 追认/沉淀规则的路径指纹来自历史事件，若匹配时看不到本次调用的文件路径，规则会静默失效
+        // （2026-09-18：追认后重试同一次写入仍重新进入判定器的直接原因）。
+        // 判定器输入仍用 matchContext，不受影响。
+        const ruleMatchContext = [matchContext, ...(toolFiles || [])].filter(Boolean).join(' ')
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
         const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why) => {
@@ -1891,7 +1975,7 @@ export default {
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        const matchedRule = matchRule(config.allowRules, toolName, mode, null, matchContext)
+        const matchedRule = matchRule(config.allowRules, toolName, mode, null, ruleMatchContext)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', filesOpt)
@@ -1984,14 +2068,14 @@ export default {
         }
 
         // 4f. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
-        if (matchRule(config.denyRules, toolName, mode, cat, matchContext)) {
+        if (matchRule(config.denyRules, toolName, mode, cat, ruleMatchContext)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
         // 4g. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
         const key = learnKey(toolName, mode, cat)
-        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, matchContext)
+        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, ruleMatchContext)
         if (learnedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
