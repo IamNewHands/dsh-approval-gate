@@ -1362,6 +1362,10 @@ export default {
             id: 'ag-revert-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36),
             role: 'user',
             content: textBlock,
+            // DSH 核心多处监听器无保护地读 message.source.kind（dsh-agent-loop isOwned()、
+            // dsh-api-session-controller queueItemsFromInbox()、dsh-webhook invariant）；缺 source 会让
+            // 任何 session/event 监听器抛 TypeError 并中止回合（2026-09-18 事故根因）。
+            source: { kind: 'plugin', plugin: NAME },
           })
           return { ok: true, via: 'followup' }
         }
