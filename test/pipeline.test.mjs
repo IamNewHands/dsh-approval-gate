@@ -40,7 +40,8 @@ writeFileSync(join(dataDir, 'allowlist.json'), JSON.stringify({
 
 process.env.DSH_HOME = DSH_HOME
 const REPO_ROOT = new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
-const plugin = (await import(pathToFileURL(join(REPO_ROOT, 'src', 'index.mjs')).href + '?t=' + Date.now())).default
+const mod = await import(pathToFileURL(join(REPO_ROOT, 'src', 'index.mjs')).href + '?t=' + Date.now())
+const plugin = mod.default
 
 process.on('exit', () => { try { rmSync(tempHome, { recursive: true, force: true }) } catch { /* ignore */ } })
 
@@ -78,7 +79,9 @@ function makeCtx(opts = {}) {
     permissionPresets: {
       current: () => opts.preset === undefined ? 'auto-approve' : opts.preset,
     },
-    get: (key) => (key === 'agentDefaultModel' ? undefined : undefined),
+    get: (key) => (key === 'agentDefaultModel'
+      ? (opts.defaultSelection ? { currentSelection: () => opts.defaultSelection } : undefined)
+      : undefined),
     webServer: undefined,                 // 不注册 HTTP 路由
     inject: (deps, cb) => {
       // 捕获提示层注册，但不执行（避免依赖真实 systemPrompt 服务）
@@ -311,7 +314,10 @@ function boot(opts) {
   console.log('  ✓ 判定 ask → 转人工确认')
 }
 
-// ================= 10. 判定器连续失败计数（1、2 次静默拒绝；第 3 次转人工） =================
+// ================= 10. 判定器不可用 → 第一次就转人工（2026-09-18 语义修正） =================
+// 旧行为：前 N-1 次静默拒绝。它假设"静默拒绝能让 agent 换方案"，但判定器不可用时
+// agent 换不了方案——操作本身没问题。事故现场：用户刚批准一次，7 秒后下一次调用又因
+// 同一个坏判定器被静默拒绝，用户只能反复追认（同会话 8 次审批里 4 次是这个原因）。
 {
   const { state } = boot({ judgeReply: () => { throw new Error('judge down') } })
   const mk = (n) => makeReq({
@@ -322,33 +328,126 @@ function boot(opts) {
     callId: 'c' + n,
   })
 
-  const r1 = await decide(null, mk(1))
-  assert.strictEqual(r1.outcome, 'rejected', '1st consecutive judge failure → silent reject')
-  assert.strictEqual(r1.nextCalls, 0, '1st failure must not prompt')
+  const r1 = await decide(null, mk(1), 'allowed-once')
+  assert.strictEqual(r1.nextCalls, 1, '1st judge failure must prompt the human immediately')
+  assert.strictEqual(r1.outcome, 'allowed-once', 'manual fallback returns the answerer outcome')
 
-  const r2 = await decide(null, mk(2))
-  assert.strictEqual(r2.outcome, 'rejected', '2nd consecutive judge failure → silent reject')
-  assert.strictEqual(r2.nextCalls, 0, '2nd failure must not prompt')
+  // 计数在转人工后清零：下一次失败同样直接转人工
+  const r2 = await decide(null, mk(2), 'allowed-once')
+  assert.strictEqual(r2.nextCalls, 1, 'counter resets after the manual fallback')
+  assert.strictEqual(r2.outcome, 'allowed-once', 'second failure also reaches the human')
 
-  const r3 = await decide(null, mk(3), 'allowed-once')
-  assert.strictEqual(r3.nextCalls, 1, '3rd consecutive judge failure → one manual fallback')
-  assert.strictEqual(r3.outcome, 'allowed-once', 'manual fallback returns the answerer outcome')
+  assert.ok(state.streamAttempts >= 4, 'each failed judgement retried at least once')
+  console.log('  ✓ 判定器不可用：第一次失败即转人工（不再静默拒绝）')
+}
 
-  // 计数在转人工后清零：下一次失败重新从 1 开始（静默拒绝）
-  const r4 = await decide(null, mk(4))
-  assert.strictEqual(r4.outcome, 'rejected', 'counter resets after the manual fallback')
-  assert.strictEqual(r4.nextCalls, 0, 'post-reset failure is silent again')
+// ================= 10b. judgeFailureLimit > 1 时保留旧的"先静默拒绝"节奏 =================
+{
+  const cfgPath = join(dataDir, 'allowlist.json')
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+  cfg.judgeFailureLimit = 3
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
 
-  assert.ok(state.streamAttempts >= 6, 'each failed judgement retried at least once')
-  console.log('  ✓ 判定器连续失败：1/2 次静默拒绝，第 3 次转人工，随后清零')
+  boot({ judgeReply: () => { throw new Error('judge down') } })
+  const mk = (n) => makeReq({
+    sessionId: 's-failcount-legacy',
+    toolName: 'pwsh',
+    justification: '第' + n + '次尝试',
+    args: { command: 'legacy-' + n },
+    callId: 'L' + n,
+  })
+  assert.strictEqual((await decide(null, mk(1))).nextCalls, 0, 'limit=3: 1st failure is silent')
+  assert.strictEqual((await decide(null, mk(2))).nextCalls, 0, 'limit=3: 2nd failure is silent')
+  assert.strictEqual((await decide(null, mk(3), 'allowed-once')).nextCalls, 1, 'limit=3: 3rd failure prompts')
+
+  cfg.judgeFailureLimit = 1
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+  console.log('  ✓ judgeFailureLimit 可配置回旧节奏（1/2 静默，第 3 次人工）')
+}
+
+// ================= 10c. 判定器不可用转人工、用户批准 → 沉淀带指纹的放行规则 =================
+// 事故根因之一：flash-failed 分支只记学习样本、不写规则，下一次同目标调用仍要过坏判定器。
+{
+  const cfgPath = join(dataDir, 'allowlist.json')
+  const target = 'C:\\Users\\example\\AppData\\Roaming\\Rime\\my_phrase.dict.yaml'
+  boot({ judgeReply: () => { throw new Error('judge down') } })
+  const req = makeReq({
+    sessionId: 's-flash-failed-learn',
+    toolName: 'write',
+    justification: '把官方 custom_phrase 中用户实际在用的 4 条词条并入独立词典，避免切换词典后丢失。',
+    args: { file_path: target, content: 'x' },
+    callId: 'ff1',
+  })
+  const r = await decide(null, req, 'allowed-once')
+  assert.strictEqual(r.outcome, 'allowed-once', 'human approves the judge-unavailable operation')
+
+  // 注意：磁盘上的 allowRules 会被 normalizeConfig 补齐默认规则，所以不能拿"磁盘前后差集"当基线；
+  // 按指纹特征断言（同一指纹只能有一条规则）。
+  const readRules = () => JSON.parse(readFileSync(cfgPath, 'utf8')).allowRules
+  const seeded = readRules().filter((rule) =>
+    rule.tool === 'write' && rule.mode === 'danger-full-access'
+    && Array.isArray(rule.keywords) && rule.keywords.some((k) => k.toLowerCase() === 'my_phrase.dict.yaml'))
+  assert.strictEqual(seeded.length, 1, 'approval writes exactly one rule carrying the real target fingerprint')
+  const rule = seeded[0]
+  assert.strictEqual(rule.category, 'neutral', 'rule keeps the neutral category')
+  assert.strictEqual(rule.contains, target, 'rule records the absolute target as its primary fingerprint')
+
+  // 关键回归：下一次同目标调用走白名单层，不再调用判定器
+  const { state: state2 } = boot({ judgeReply: () => { throw new Error('judge must not be called') } })
+  const again = makeReq({
+    sessionId: 's-flash-failed-learn',
+    toolName: 'write',
+    justification: '同一目标再写一次（措辞不同）',
+    args: { file_path: target, content: 'y' },
+    callId: 'ff2',
+  })
+  const r2 = await decide(null, again)
+  assert.strictEqual(r2.outcome, 'allowed-once', 'same target is now allowlisted')
+  assert.strictEqual(r2.nextCalls, 0, 'allowlisted target does not prompt')
+  assert.strictEqual(state2.streamAttempts, 0, 'allowlisted target does not call the judge at all')
+
+  // 还原：移除本用例沉淀的规则
+  const cfgReset = JSON.parse(readFileSync(cfgPath, 'utf8'))
+  cfgReset.allowRules = cfgReset.allowRules.filter((r0) => r0 !== rule)
+  writeFileSync(cfgPath, JSON.stringify(cfgReset, null, 2) + '\n', 'utf8')
+  console.log('  ✓ 判定器不可用转人工 + 批准 → 沉淀带指纹规则，同类调用不再过判定器')
+}
+
+// ================= 10d. 失败原因进入事件与审计（排障依据） =================
+{
+  const { state } = boot({ judgeReply: () => { throw new Error('upstream 502 runaway') } })
+  const req = makeReq({
+    sessionId: 's-failreason',
+    toolName: 'pwsh',
+    justification: '跑一个任务',
+    args: { command: 'run-task' },
+    callId: 'fr1',
+  })
+  await decide(null, req, 'allowed-once')
+  const eventsPath = join(dataDir, 'events.jsonl')
+  const events = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const mine = events.filter((e) => e.sessionId === 's-failreason')
+  const pending = mine.find((e) => e.kind === 'manual-pending')
+  assert.ok(pending, 'judge-unavailable escalates to a human (pending event recorded)')
+  assert.strictEqual(pending.path, 'flash-failed', 'pending event marks the flash-failed path')
+  assert.ok(/upstream 502 runaway/.test(String(pending.failureReason || '')),
+    'the real judge failure reason is recorded on the event')
+  assert.strictEqual(state.streamAttempts, 2, 'failure retried exactly once before escalating')
+  console.log('  ✓ 失败原因落进事件（超时/上游报错/正文为空可区分）')
 }
 
 // ================= 11. 判定成功后失败计数清零 =================
 {
-  // 同一 apply 作用域内：先失败 2 次（静默），再成功 1 次（放行、清零），
-  // 然后再次失败 —— 必须是「第 1 次失败」（静默），而不是累计第 3 次（转人工）。
+  // 同一 apply 作用域内：judgeFailureLimit=2（第一次失败静默、第二次转人工）。
+  // 先失败 1 次（静默），再成功 1 次（放行、清零），然后再次失败 —— 必须是「第 1 次失败」（静默），
+  // 而不是累计第 2 次（转人工）。验证成功会清零计数。
+  const cfgPath = join(dataDir, 'allowlist.json')
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+  cfg.judgeFailureLimit = 2
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+
   let mode = 'fail'
-  const { state } = boot({
+  boot({
     judgeReply: () => {
       if (mode === 'fail') throw new Error('judge down')
       return '{"decision":"allow","reason":"ok","category":"neutral"}'
@@ -362,19 +461,21 @@ function boot(opts) {
     callId: 'r' + n,
   })
 
-  assert.strictEqual((await decide(null, req(1))).outcome, 'rejected', 'failure 1 → silent reject')
-  assert.strictEqual((await decide(null, req(2))).outcome, 'rejected', 'failure 2 → silent reject')
+  assert.strictEqual((await decide(null, req(1))).outcome, 'rejected', 'failure 1 of 2 → silent reject')
 
   mode = 'ok'
-  const ok = await decide(null, req(3))
+  const ok = await decide(null, req(2))
   assert.strictEqual(ok.outcome, 'allowed-once', 'recovered judge allows the call')
   assert.strictEqual(ok.nextCalls, 0, 'recovered judge does not prompt')
 
   mode = 'fail'
-  const after = await decide(null, req(4))
+  const after = await decide(null, req(3))
   assert.strictEqual(after.nextCalls, 0,
-    'after a success the counter is reset, so the next failure is silent (not the 3rd strike)')
+    'after a success the counter is reset, so the next failure is the 1st strike again (silent)')
   assert.strictEqual(after.outcome, 'rejected', 'post-reset failure is a silent reject')
+
+  cfg.judgeFailureLimit = 1
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
   console.log('  ✓ 判定成功 → 放行且失败计数清零（同一 apply 作用域内验证）')
 }
 
@@ -420,6 +521,71 @@ function boot(opts) {
   assert.strictEqual(outcome, 'allowed-once', 'downstream outcome is passed through')
   assert.strictEqual(state.streamAttempts, 0, 'other presets must not invoke the judge')
   console.log('  ✓ 预设门控：非 auto-approve 时完全交还下游')
+}
+
+// ================= 14. 判定模型候选链：单通道挂掉不再等于判定器整体不可用 =================
+// 事故：judgeModel 是单一通道，workbuddy 通道 502 时所有越界操作的判定一起失败。
+// 现在主模型失败会依次落到「会话默认模型」→「内置兜底」。
+{
+  const cfgPath = join(dataDir, 'allowlist.json')
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+  cfg.judgeModel = { provider: 'ai-gateway', model: 'workbuddy/deepseek-v4-flash' }
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+
+  // 宿主模拟：只有 sensenova 通道可用，workbuddy 通道一律 502
+  const built = makeCtx({ judgeReply: () => '{"decision":"allow","reason":"ok","category":"neutral"}' })
+  const seen = []
+  const originalStream = built.ctx.llm.stream
+  built.ctx.llm.stream = function (options) {
+    seen.push(options.provider + '/' + options.model)
+    if (options.model.startsWith('workbuddy/')) {
+      return (async function* () { throw new Error('502 upstream_runaway') })()
+    }
+    return originalStream.call(this, options)
+  }
+  built.ctx.get = (key) => (key === 'agentDefaultModel'
+    ? { currentSelection: () => ({ provider: 'ai-gateway', model: 'sensenova/deepseek-v4-flash' }) }
+    : undefined)
+  plugin.apply(built.ctx)
+  makeCtx.__last = built
+
+  const req = makeReq({
+    sessionId: 's-fallback',
+    toolName: 'pwsh',
+    justification: '运行任务',
+    args: { command: 'run-task' },
+    callId: 'fb1',
+  })
+  const { outcome, nextCalls } = await decide(null, req)
+  assert.strictEqual(outcome, 'allowed-once', 'fallback model judges successfully')
+  assert.strictEqual(nextCalls, 0, 'a working fallback means no human prompt')
+  assert.ok(seen.some((m) => m === 'ai-gateway/workbuddy/deepseek-v4-flash'),
+    'the configured primary judge is tried first')
+  assert.ok(seen.some((m) => m === 'ai-gateway/sensenova/deepseek-v4-flash'),
+    'a dead primary falls through to the session default model')
+  console.log('  ✓ 判定候选链：主通道 502 → 落到备用通道，判定成功且不打扰用户')
+
+  cfg.judgeModel = undefined
+  delete cfg.judgeModel
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+}
+
+// ================= 15. 候选链纯函数：去重、丢空值、保序 =================
+{
+  const { judgeModelCandidates } = mod
+  assert.deepStrictEqual(
+    judgeModelCandidates({ provider: 'a', model: 'x' }, { provider: 'a', model: 'x' }),
+    [{ provider: 'a', model: 'x' }, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }],
+    'duplicates are collapsed, built-in fallback is last')
+  assert.deepStrictEqual(
+    judgeModelCandidates(null, null),
+    [{ provider: 'deepseek-official', model: 'deepseek-v4-flash' }],
+    'with nothing configured only the built-in fallback remains')
+  assert.deepStrictEqual(
+    judgeModelCandidates({ provider: 'a', model: '' }, { provider: 'b', model: 'y' }),
+    [{ provider: 'b', model: 'y' }, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }],
+    'empty provider/model entries are dropped')
+  console.log('  ✓ 候选链纯函数：去重 / 丢空值 / 保序')
 }
 
 console.log('All pipeline tests passed successfully!')

@@ -428,6 +428,11 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   if (o.category) ev.category = o.category
   // path：判定路径标识（hard-category / unknown-category / deny-rule / deny / flash-failed / neutral-reject / neutral-confirm）
   if (o.path) ev.path = o.path
+  // failureReason：判定器失败的真实原因（超时/上游报错/正文为空/JSON 不合规），排障用
+  if (o.failureReason) ev.failureReason = String(o.failureReason).slice(0, 300)
+  // command：本次调用的真实命令文本（pwsh 等命令类工具没有 file_path，追认规则需要它做指纹，
+  // 否则只能退化成 justification 里的偶然词，如 2026-09-18 的 contains:"job"）
+  if (o.command) ev.command = String(o.command).slice(0, 400)
   // reconsiderOf：追认记录指回被追认的原事件 id（供审查视图标注「已追认」）
   if (Number.isInteger(o.reconsiderOf)) ev.reconsiderOf = o.reconsiderOf
   try {
@@ -650,7 +655,8 @@ function getRulesSnapshot(permissionPresets) {
       hardCategories: config.hardCategories || [],
       riskyThreshold: config.riskyThreshold || 3,
       judgeTimeoutMs: config.judgeTimeoutMs || 20000,
-      judgeFailureLimit: config.judgeFailureLimit || 3,
+      judgeFailureLimit: config.judgeFailureLimit || 1,
+      judgeMaxTokens: config.judgeMaxTokens || 1024,
       learning: { enabled: learning.enabled !== false }
     },
     learning: {
@@ -752,8 +758,8 @@ function ensureAutoApprovePreset(permissionPresets) {
 function applyRuleOp(op, kind, value) {
   reloadConfig()
 
-  // 数值类配置（阈值/超时）
-  if (kind === 'riskyThreshold' || kind === 'judgeTimeoutMs') {
+  // 数值类配置（阈值/超时/失败上限/判定输出上限）
+  if (kind === 'riskyThreshold' || kind === 'judgeTimeoutMs' || kind === 'judgeMaxTokens' || kind === 'judgeFailureLimit') {
     if (op !== 'set') return { ok: false, error: `${kind} 使用 set 操作` }
     const n = Number(value)
     if (!Number.isFinite(n) || n <= 0) return { ok: false, error: '无效数值' }
@@ -970,9 +976,12 @@ function normalizeConfig(raw) {
   cfg.hardCategories = cfg.hardCategories || DEFAULT_HARD_CATEGORIES
   cfg.riskyThreshold = cfg.riskyThreshold || 3
   cfg.judgeTimeoutMs = cfg.judgeTimeoutMs || 20000
-  // 判定器连续失败多少次后放弃自动判定、转一次人工（吸收自 dsh-auto-mode：
-  // 前 N-1 次静默拒绝让 agent 改方案，第 N 次人工，避免判定器长期不可用时卡死任务）
-  cfg.judgeFailureLimit = cfg.judgeFailureLimit || 3
+  // 判定器不可用后转人工前的连续失败次数（默认 1 = 第一次失败即转人工）。
+  // 旧默认 3（前 2 次静默拒绝）在判定器长期不可用时表现为「agent 莫名被拒、用户事后才发现」，
+  // 2026-09-18 事故后改为 1；保留可配置是为了让"判定器偶发抖动、不想被打扰"的用户调回去。
+  cfg.judgeFailureLimit = cfg.judgeFailureLimit || 1
+  // 判定调用输出上限：推理与正文共享 max_tokens，过小会让推理吃光额度、正文为空
+  cfg.judgeMaxTokens = cfg.judgeMaxTokens || 1024
   cfg.learning = cfg.learning || { enabled: true }
   // 判定模型：先迁移旧字段（本机取值），再规范化
   migrateJudgeModel(cfg)
@@ -1002,6 +1011,8 @@ if (!config || typeof config !== 'object') {
     hardCategories: DEFAULT_HARD_CATEGORIES,
     riskyThreshold: 3,
     judgeTimeoutMs: 20000,
+    judgeFailureLimit: 1,
+    judgeMaxTokens: 1024,
     learning: { enabled: true }
   }
   config = normalizeConfig(config)
@@ -1225,6 +1236,31 @@ function extractFingerprintCandidates(text) {
 }
 
 // 具名导出：供单元测试直接验证真实实现（而非测试内重复一份逻辑）
+/**
+ * 判定模型候选链（纯函数，便于单测）：主判定模型 → 会话默认模型 → 内置兜底。
+ *
+ * 为什么需要候选链（2026-09-18 事故）：judgeModel 之前是**单一通道**，一旦该通道抖动
+ * （workbuddy 在 09-17 出现过 502 upstream_runaway），所有越界操作的判定一起失败，
+ * 用户看到的是"判定器不可用"。换一条通道重试即可绕开单点。
+ *
+ * 顺序即优先级：配置的 judgeModel 是用户显式选择，优先；会话默认模型是同一宿主已经
+ * 在用的通道（必然可用）；deepseek-official 是内置兜底。去重后返回，空值一律丢弃。
+ */
+export function judgeModelCandidates(judgeModel, selection) {
+  const out = []
+  const push = (p, m) => {
+    const provider = String(p || '').trim()
+    const model = String(m || '').trim()
+    if (!provider || !model) return
+    if (out.some((c) => c.provider === provider && c.model === model)) return
+    out.push({ provider, model })
+  }
+  if (judgeModel && typeof judgeModel === 'object') push(judgeModel.provider, judgeModel.model)
+  if (selection && typeof selection === 'object') push(selection.provider, selection.model)
+  push('deepseek-official', 'deepseek-v4-flash')
+  return out
+}
+
 export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, SHARED_RULE_KEYS, normalizeMatchText, extractFingerprintCandidates }
 
 export default {
@@ -1569,7 +1605,11 @@ export default {
               const fingerprintText = String(event.justification || event.reason || '')
               const fingerprint = extractOperationFingerprint(fingerprintText)
               const filesText = Array.isArray(event.files) ? event.files.join(' ') : ''
-              const candidates = extractFingerprintCandidates(fingerprintText + ' ' + filesText)
+              // 命令类工具（pwsh）没有 file_path：把记录下来的真实命令并入指纹文本，
+              // 否则 keywords 只能来自 justification 的偶然词（事故：contains:"job" 只匹配
+              // 含 "job" 的那一次，下一次同目标调用措辞一变就失效）。
+              const commandText = String(event.command || '')
+              const candidates = extractFingerprintCandidates(fingerprintText + ' ' + filesText + ' ' + commandText)
               const rule = { tool: String(event.tool || 'unknown'), category: cat }
               if (event.mode) rule.mode = String(event.mode)
               if (fingerprint) rule.contains = fingerprint
@@ -1578,7 +1618,19 @@ export default {
               const sameRule = (r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains
               const dup = config.allowRules.some(sameRule)
               if (!dup) {
-                rule.description = '用户追认：' + (fingerprint ? '同类操作自动放行' : '同类操作自动放行（无指纹，按工具+模式+类别）')
+                // 围栏 3：无任何指纹时不写规则。
+                // 旧行为写的是「工具+模式+类别」宽规则，等于放行该工具在 danger-full-access 下的
+                // 一切操作（事故：2026-09-18 20:43:39 落了一条 {tool:write, mode:danger-full-access,
+                // category:neutral} 无指纹规则，覆盖了此后所有 write 提权）。宁可这次不放行，
+                // 也不要把一次追认放大成永久全工具放行。
+                if (!fingerprint && keywords.length === 0) {
+                  audit(`RECONSIDER event=${eventId} 无可用指纹 → 不写宽规则（拒绝把一次追认放大为全工具放行）`)
+                  return send(res, 400, {
+                    ok: false,
+                    error: '该记录没有可用的操作指纹（无文件路径、无命令、说明中也没有可识别目标），无法安全地只放行同类操作；请改用设置页的「白名单规则」按工具/路径手动放行。',
+                  })
+                }
+                rule.description = '用户追认：同类操作自动放行'
                 config.allowRules.push(rule)
                 saveJson(ALLOWLIST_PATH, config)
                 audit(`RECONSIDER event=${eventId} +allowRule ${JSON.stringify(rule)}`)
@@ -1702,38 +1754,46 @@ export default {
       if (offSnapClearRoute) { try { offSnapClearRoute() } catch (e) {} }
     })
 
-    const resolveModel = () => {
-      const jm = config.judgeModel
-      if (jm && typeof jm === 'object' && typeof jm.provider === 'string' && jm.provider && typeof jm.model === 'string' && jm.model) {
-        return { provider: jm.provider, model: jm.model }
-      }
+    /**
+     * 判定模型候选链：主模型 → 会话默认模型 → 内置兜底（见 judgeModelCandidates）。
+     * 每次审批时求值（reloadConfig 已热更新 config），所以改设置立即生效。
+     */
+    const resolveModels = () => {
+      let selection
       try {
-        const sel = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
+        selection = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
           ? agentDefaultModel.currentSelection()
           : undefined
-        if (sel && typeof sel.provider === 'string' && sel.provider && typeof sel.model === 'string' && sel.model) {
-          return { provider: sel.provider, model: sel.model }
-        }
       } catch (error) {
         console.error(`[${NAME}] agentDefaultModel.currentSelection() failed`, error)
       }
-      return { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+      return judgeModelCandidates(config.judgeModel, selection)
     }
 
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
      * 针对各 provider 差异做容错：
-     * 1. reasoning-delta 与 text-delta 分离，优先取 text-delta，避免思考模型长思考污染 SAFE/RISKY 判定。
+     * 1. reasoning-delta 与 text-delta 分离，只把 text-delta 当判定正文（见下「为什么不再回退 reasoning」）。
      * 2. finish chunk 的 reason 是可选字段，做防御性读取。
      * 3. reasoningEffort: 'off' 在自定义/中转/特殊 provider 上可能不被支持（UNSUPPORTED_REASONING_EFFORT），抛错时回退到默认 effort 重试。
+     *
+     * 为什么不再回退 reasoning 当正文（2026-09-18 事故根因之一）：
+     * 此前正文为空时 `return reasoning`，把模型的思考文本当判定结果交给 JSON 解析，
+     * 必然解析失败——失败原因被掩盖成「格式不合规」，而真实原因是**正文根本没产出**。
+     * 典型成因：中转（ai-gateway）对 DeepSeek 系强制 thinking=enabled 并把 effort 补成 high，
+     * 推理与正文共享 max_tokens，256 token 被推理吃光 → 无正文。
+     * 现在改为显式抛错（带 reasoning 长度），让 withRetry 重试并把真实原因写进 audit.log。
      */
     const isEffortRejection = (error) =>
       /does not support reasoning effort/i.test(String(error && error.message ? error.message : error))
 
     const callFlash = async (userText, systemPrompt, signal) => {
-      const { provider, model } = resolveModel()
+      const models = resolveModels()
+      // 判定正文只有几十字符的 JSON，但推理阶段与正文共享 max_tokens：
+      // 上限过小会让推理吃光额度、正文为空（判定器"失败"的常见真因）。
+      const maxTokens = config.judgeMaxTokens || 1024
 
-      const streamOnce = async (reasoningEffort) => {
+      const streamOnce = async (provider, model, reasoningEffort) => {
         let text = ''
         let reasoning = ''
         for await (const chunk of llm.stream({
@@ -1743,7 +1803,7 @@ export default {
           system: systemPrompt,
           temperature: 0,
           ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-          maxTokens: 256,
+          maxTokens,
           signal
         })) {
           if (chunk.type === 'text-delta') text += chunk.text
@@ -1756,16 +1816,33 @@ export default {
             }
           }
         }
-        return text.trim() !== '' ? text : reasoning
+        if (text.trim() === '') {
+          throw new Error(`判定模型未产出正文（reasoning ${reasoning.length} 字符，maxTokens=${maxTokens}）`)
+        }
+        return text
       }
 
-      try {
-        return await streamOnce('off')
-      } catch (error) {
-        if (!isEffortRejection(error)) throw error
-        console.warn(`[${NAME}] provider "${provider}" model "${model}" 不支持 reasoning effort "off"，去掉 effort 参数重试`)
-        return await streamOnce(undefined)
+      // 逐候选尝试：单通道抖动（502 / 超时 / 无正文）不再等于判定器整体不可用。
+      // 调用方（withRetry）仍会整体重试一次，两层的组合是「候选 × 重试」。
+      const failures = []
+      for (const { provider, model } of models) {
+        try {
+          return await streamOnce(provider, model, 'off')
+        } catch (error) {
+          if (!isEffortRejection(error)) {
+            failures.push(`${provider}/${model}: ${String((error && error.message) || error)}`)
+            continue
+          }
+          console.warn(`[${NAME}] provider "${provider}" model "${model}" 不支持 reasoning effort "off"，去掉 effort 参数重试`)
+          try {
+            return await streamOnce(provider, model, undefined)
+          } catch (retryError) {
+            failures.push(`${provider}/${model}: ${String((retryError && retryError.message) || retryError)}`)
+            continue
+          }
+        }
       }
+      throw new Error('所有判定模型候选均失败 → ' + failures.join(' | '))
     }
 
     /**
@@ -1829,10 +1906,19 @@ export default {
 
     /**
      * 通用超时 + 重试包装：runFn(signal) 返回结果对象；
-     * 超时 abort 并重试 1 次，仍失败 → { failed: true }（调用方按 fail-safe 处理）。
+     * 超时 abort 并重试 1 次，仍失败 → { failed: true, failureReason }（调用方按 fail-safe 处理）。
+     *
+     * failureReason 是排障的唯一线索：此前只返回 { failed: true }，判定器为何失败
+     * （超时 / 上游报错 / 正文为空 / JSON 不合规）全部丢失，只能看到"判定器不可用"。
+     * 现在把每次尝试的真实错误消息收敛成一行，写入 audit.log 与事件记录。
      */
     const withRetry = async (runFn, label) => {
       const timeoutMs = config.judgeTimeoutMs || 20000
+      const reasons = []
+      const describe = (error) => {
+        const msg = error && error.message ? error.message : String(error)
+        return String(msg).replace(/\s+/g, ' ').slice(0, 200)
+      }
       const runOnce = async () => {
         const controller = new AbortController()
         const timer = ctx.timeout(timeoutMs).then(() => {
@@ -1854,17 +1940,21 @@ export default {
       try {
         const first = await runOnce()
         if (!first.timedOut) return first
+        reasons.push(`超时(${timeoutMs}ms)`)
         console.warn(`[${NAME}] ${label} 超时(${timeoutMs}ms)，重试 1 次`)
       } catch (error) {
+        reasons.push(describe(error))
         console.error(`[${NAME}] ${label} 异常，重试 1 次`, error)
       }
       try {
         const second = await runOnce()
         if (!second.timedOut) return second
+        reasons.push(`超时(${timeoutMs}ms)`)
       } catch (error) {
+        reasons.push(describe(error))
         console.error(`[${NAME}] ${label} 重试仍异常`, error)
       }
-      return { failed: true }
+      return { failed: true, failureReason: reasons.join(' | ') || '未知原因' }
     }
 
     const judgeWithFlash = async (fields) => {
@@ -1921,8 +2011,12 @@ export default {
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, session.events)
-        const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
         const toolCmd = resolveToolCallCommand(req.callId, session.events)
+        // command 一并落进事件：命令类工具没有 file_path，追认/沉淀规则的指纹需要它
+        const filesOpt = Object.assign(
+          toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
+          toolCmd ? { command: toolCmd } : {}
+        )
         const matchContext = toolCmd ? `${justification} ${toolCmd}` : justification
         // 规则匹配上下文：justification + 命令 + 本次调用的真实目标文件（write/edit 的 file_path）。
         // 追认/沉淀规则的路径指纹来自历史事件，若匹配时看不到本次调用的文件路径，规则会静默失效
@@ -1931,8 +2025,10 @@ export default {
         const ruleMatchContext = [matchContext, ...(toolFiles || [])].filter(Boolean).join(' ')
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
-        const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why) => {
-          recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt))
+        const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why, failureReason) => {
+          const evOpts = Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt)
+          if (failureReason) evOpts.failureReason = failureReason
+          recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', evOpts)
           const out = await next()
           if (out === 'allowed-once') {
             // 若因 Flash 调用失败/超时转人工，用户通过后依然记入学习样本与统计，避免因网络抖动丢失学习积累
@@ -1943,7 +2039,36 @@ export default {
               recordSample(k, jst)
               saveJson(LEARNING_PATH, learning)
             }
-            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt))
+            // 判定器不可用而转人工的操作，用户批准即等于「这个目标我已经确认过了」：
+            // 直接沉淀一条放行规则（带本次调用的真实目标路径做候选指纹）。
+            // 事故现场（2026-09-18 20:43:23 批准 → 20:43:35 又被拒）：此前 flash-failed 分支
+            // 只记学习样本、不写规则，下一次同目标调用仍要过坏判定器，于是被静默拒绝，
+            // 用户只能反复追认。写入规则后，同类调用在管道第 2 层（白名单）直接放行。
+            if (why === 'flash-failed' && learning.enabled) {
+              const fpText = String(jst || '') + ' ' + ((toolFiles || []).join(' '))
+              const fingerprint = extractOperationFingerprint(fpText)
+              const candidates = extractFingerprintCandidates(fpText)
+              const rule = { tool: tName, category: cat || 'neutral' }
+              if (tMode) rule.mode = tMode
+              if (fingerprint) rule.contains = fingerprint
+              const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
+              if (keywords.length > 0) rule.keywords = keywords
+              // 无任何指纹时**不写宽规则**：那会放行该工具在 danger-full-access 下的一切操作。
+              if (fingerprint || keywords.length > 0) {
+                const sameRule = (r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains
+                if (!config.allowRules.some(sameRule)) {
+                  rule.description = '判定器不可用，人工批准后沉淀：' + (fingerprint || keywords[0])
+                  config.allowRules.push(rule)
+                  saveJson(ALLOWLIST_PATH, config)
+                  audit(`LEARN   判定器不可用转人工已批准，沉淀白名单 ${JSON.stringify(rule)}`)
+                }
+              } else {
+                audit(`LEARN   判定器不可用转人工已批准，但无可用指纹 → 不沉淀宽规则`)
+              }
+            }
+            const approvedOpts = Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt)
+            if (failureReason) approvedOpts.failureReason = failureReason
+            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', approvedOpts)
           } else if (out === 'rejected') {
             recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, filesOpt))
           }
@@ -2007,23 +2132,32 @@ export default {
 
         // 4. flash 判定（结构化 JSON 协议）
         const judged = await judgeWithFlash(judgeFields)
-        const { decision, category, failed } = judged
+        const { decision, category, failed, failureReason } = judged
         const cat = category || 'neutral'
 
-        // 4a. 判定器连续失败 → 计数（吸收自 dsh-auto-mode）：
-        //     前 N-1 次静默拒绝让 agent 改方案；第 N 次转一次人工，避免长期卡死任务。
+        // 4a. 判定器不可用 → 第一次就转人工（2026-09-18 语义修正）。
+        //
+        // 旧行为：前 N-1 次（默认 2 次）**静默拒绝**，第 N 次才转人工。它假设"静默拒绝能让
+        // agent 换方案"，但判定器不可用时 agent 换不了方案——操作本身没问题，只是判定器挂了。
+        // 事故现场（2026-09-18）：用户刚在审批记录里批准一次，7 秒后的下一次调用又因同一个
+        // 坏判定器被静默拒绝，用户只能反复追认；同会话 8 次审批里 4 次是这个原因。
+        //
+        // 新行为：判定器不可用 = 判定层失去能力，不是"这个操作有害"。第一次就转人工，
+        // 由用户裁决；并在事件里带上失败原因，UI 显示为「判定器不可用」而不是「有害」。
+        // judgeFailureLimit 保留为配置项：值 >1 时仍可回到旧的"先静默拒绝"节奏。
         if (failed) {
-          const limit = config.judgeFailureLimit || 3
+          const limit = Math.max(1, config.judgeFailureLimit || 3)
           const seen = (judgeFailures.get(sessionId) || 0) + 1
+          const why = failureReason || '未知原因'
           if (seen >= limit) {
             judgeFailures.delete(sessionId)
-            audit(`FAILED  ${toolName} 判定器连续失败 ${seen} 次 → 转人工 | ${reason.slice(0, 120)}`)
-            return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'flash-failed')
+            audit(`FAILED  ${toolName} 判定器不可用（第 ${seen} 次）→ 转人工 | ${why} | ${reason.slice(0, 100)}`)
+            return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'flash-failed', why)
           }
           judgeFailures.set(sessionId, seen)
-          audit(`FAILED  ${toolName} 判定器失败 ${seen}/${limit} → 静默拒绝 | ${reason.slice(0, 120)}`)
+          audit(`FAILED  ${toolName} 判定器失败 ${seen}/${limit} → 静默拒绝 | ${why} | ${reason.slice(0, 100)}`)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'judge-deny',
-            Object.assign({ kind: 'judge-deny', path: 'judge-unavailable', category: cat }, filesOpt))
+            Object.assign({ kind: 'judge-deny', path: 'judge-unavailable', category: cat, failureReason: why }, filesOpt))
           return 'rejected'
         }
         // 判定成功 → 清零失败计数

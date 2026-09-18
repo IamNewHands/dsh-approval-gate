@@ -175,7 +175,7 @@ window.__ModuleLoader__.load({
     function silentRejectLabel(ev) {
       const p = ev && ev.path
       if (p === 'hard-deny') return '已直接拒绝 · 凭据外泄或系统路径销毁'
-      if (p === 'judge-unavailable') return '已直接拒绝 · 判定器不可用（连续失败）'
+      if (p === 'judge-unavailable') return '已直接拒绝 · 判定器不可用（非操作本身有问题）'
       if (p === 'classifier-deny') return '已直接拒绝 · 判定为有害或越权'
       return '已直接拒绝'
     }
@@ -467,8 +467,11 @@ window.__ModuleLoader__.load({
       } else if (kind === 'manual-approved') {
         const lc = notice.learningCount !== undefined ? notice.learningCount : null
         const th = notice.threshold || 3
-        title = '人工审批通过：' + (notice.justification || notice.reason || '')
-        tagText = lc !== null ? ('学习 ' + lc + '/' + th + '，满 ' + th + ' 次后自动放行') : '人工审批通过'
+        const viaJudge = notice.path === 'flash-failed'
+        title = (viaJudge ? '人工审批通过（判定器不可用）：' : '人工审批通过：') + (notice.justification || notice.reason || '')
+        tagText = viaJudge
+          ? ('判定器不可用，人工放行' + (lc !== null ? ' · 学习 ' + lc + '/' + th : ''))
+          : (lc !== null ? ('学习 ' + lc + '/' + th + '，满 ' + th + ' 次后自动放行') : '人工审批通过')
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '✓')
       } else if (kind === 'manual-rejected') {
         title = '已拒绝：' + (notice.justification || notice.reason || '')
@@ -842,7 +845,10 @@ window.__ModuleLoader__.load({
                   if (kind === 'manual-approved') {
                     const lc = ev.learningCount !== undefined ? ev.learningCount : null
                     const th = ev.threshold || 3
-                    tagText = lc !== null ? ('人工通过 · 学习 ' + lc + '/' + th + '（满 ' + th + ' 次自动放行）') : '人工通过'
+                    const viaJudge = ev.path === 'flash-failed'
+                    tagText = viaJudge
+                      ? '人工通过 · 判定器不可用，人工放行'
+                      : (lc !== null ? ('人工通过 · 学习 ' + lc + '/' + th + '（满 ' + th + ' 次自动放行）') : '人工通过')
                     tagCls = 'ag-tag-warn'
                     glyphCls = 'ag-row-glyph-warn'
                     glyph = React.createElement('span', null, '✓')
@@ -912,6 +918,13 @@ window.__ModuleLoader__.load({
                           )
                         : null,
                     ),
+                    // 判定器不可用时显示真实失败原因（超时/上游报错/正文为空），
+                    // 否则用户只能看到"判定器不可用"，无法判断该换模型还是该修网络
+                    ev.failureReason
+                      ? React.createElement('div', { className: 'ag-row-files' },
+                          React.createElement('span', { className: 'ag-set-item-meta' }, '判定器失败原因：' + ev.failureReason),
+                        )
+                      : null,
                   )
                 }).filter(Boolean),
               ),
@@ -948,6 +961,8 @@ window.__ModuleLoader__.load({
       const [newRule, setNewRule] = React.useState({ tool: '', mode: '', category: '', contains: '' })
       const [threshold, setThreshold] = React.useState('3')
       const [timeoutMs, setTimeoutMs] = React.useState('20000')
+      const [failureLimit, setFailureLimit] = React.useState('1')
+      const [judgeMaxTokens, setJudgeMaxTokens] = React.useState('1024')
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -957,6 +972,8 @@ window.__ModuleLoader__.load({
               setSnapshot(data)
               setThreshold(String(data.config.riskyThreshold))
               setTimeoutMs(String(data.config.judgeTimeoutMs))
+              setFailureLimit(String(data.config.judgeFailureLimit === undefined ? 1 : data.config.judgeFailureLimit))
+              setJudgeMaxTokens(String(data.config.judgeMaxTokens === undefined ? 1024 : data.config.judgeMaxTokens))
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -1234,6 +1251,32 @@ window.__ModuleLoader__.load({
               type: 'button', className: 'ag-set-btn', disabled: busy,
               onClick: function () { api({ op: 'set', kind: 'judgeTimeoutMs', value: Number(timeoutMs) }) },
             }, '保存'),
+          ),
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('span', { className: 'ag-set-item-meta' }, '判定器失败即转人工（次）：'),
+            React.createElement('input', {
+              className: 'ag-set-input ag-set-input-num', type: 'number', min: 1, value: failureLimit,
+              onChange: function (e) { setFailureLimit(e.target.value) },
+            }),
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn', disabled: busy,
+              onClick: function () { api({ op: 'set', kind: 'judgeFailureLimit', value: Number(failureLimit) }) },
+            }, '保存'),
+            React.createElement('span', { className: 'ag-set-item-meta' },
+              '1 = 判定器不可用时立刻弹人工审批；大于 1 时前几次静默拒绝（旧行为）'),
+          ),
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('span', { className: 'ag-set-item-meta' }, '判定输出上限(tokens)：'),
+            React.createElement('input', {
+              className: 'ag-set-input ag-set-input-num', type: 'number', min: 128, value: judgeMaxTokens,
+              onChange: function (e) { setJudgeMaxTokens(e.target.value) },
+            }),
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn', disabled: busy,
+              onClick: function () { api({ op: 'set', kind: 'judgeMaxTokens', value: Number(judgeMaxTokens) }) },
+            }, '保存'),
+            React.createElement('span', { className: 'ag-set-item-meta' },
+              '推理与正文共享该额度；过小会让推理吃光额度、正文为空（表现为「判定器不可用」）'),
           ),
         ),
 

@@ -4,6 +4,37 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.0] — 2026-09-18
+
+Fixes the chain of false rejections caused by treating "judge unavailable" as "this operation is harmful": right after approving one operation, the next similar call was silently rejected again, forcing the user to re-approve repeatedly.
+
+Evidence (session `session-c44df57e`, 2026-09-18 20:27–20:48): **4 of 8** approval requests were caused by an unavailable judge; `audit.log` holds 49 `FAILED` lines, 8 of them on 09-17/09-18.
+
+### Fixed
+
+- **The judge no longer treats reasoning as its answer**: `callFlash` used to `return reasoning` when the answer text was empty, handing chain-of-thought to a JSON parser — a guaranteed parse failure that masked the real cause (no answer text at all). It now throws explicitly with the reasoning length
+- **Judge output cap 256 → 1024 (`judgeMaxTokens`, configurable)**: relays (ai-gateway) force `thinking=enabled` for DeepSeek models and fill in `effort=high`; reasoning and the answer share `max_tokens`, so 256 tokens were eaten by reasoning and the answer came back empty. This is the most common real cause of a "judge failure"
+- **Judge unavailable → straight to a human on the first failure** (`judgeFailureLimit` default 3 → 1): an unavailable judge means the judging layer lost its capability, not that the operation is harmful. Silent rejection just makes the agent bang its head against the same wall while the user finds out later. The setting remains: values >1 restore the old rhythm
+- **`flash-failed` escalations now seed an allow rule when the human approves**: the branch previously only recorded a learning sample, so the next call to the same target hit the same broken judge and was silently rejected again (the direct cause of "approved at 20:43:23, rejected again at 20:43:35")
+- **Failure reasons reach `audit.log` and the event record**: previously only `{ failed: true }` came back, so timeout / upstream error / empty answer / invalid JSON were indistinguishable and diagnosis was blind
+- **Reconsideration without a fingerprint no longer writes a broad rule**: the old behaviour wrote a tool+mode+category rule, i.e. it released everything that tool did in the escalated mode (at 20:43:39 a fingerprint-less `write` rule was written, covering every later `write` escalation). Now it returns 400 and points at the settings-page allowlist instead
+- **Command-line tools (pwsh) take their fingerprint from the real command**: events now carry a `command` field. Previously a pwsh reconsideration could only pick an incidental word out of the justification (incident: `contains:"job"` matched only the call that happened to contain "job"; the next call phrased it as "in the background" and missed)
+- **Judge model candidate chain**: configured judge → session default model → built-in fallback. A single flaky channel (the 09-17 workbuddy `502 upstream_runaway`) no longer means the judge is entirely unavailable
+
+### Added
+
+- Two new settings: **judge failures before a human prompt** and **judge output cap (tokens)**
+- Approval records show the **real failure reason** (timeout / upstream error / empty answer), and "judge unavailable" is now clearly distinguished from "judged harmful"
+- Three built-in allow rules: Rime user directory (`%APPDATA%\Rime`) write/edit, and the Weasel `WeaselDeployer.exe` deployment. That directory was human-approved two days running and is a known-safe target
+- The seed `allowlist.json` now carries `judgeFailureLimit` / `judgeMaxTokens` defaults
+
+### Tests
+
+- `test/pipeline.test.mjs`: case 10 now asserts "first failure prompts a human"; new cases 10b (`judgeFailureLimit>1` keeps the old rhythm), 10c (approval seeds a fingerprint rule and the next same-target call makes **zero judge calls**), 10d (failure reason lands on the event), 14 (candidate chain: dead primary → fallback judges successfully), 15 (candidate-chain helper dedupes/drops empties/keeps order); case 11 now uses `judgeFailureLimit=2` to verify the success reset
+- `test/reconsider-match.test.mjs`: new cases for "fingerprint-less reconsideration → 400, no broad rule" and "command-line fingerprints come from `event.command` and survive rewording"
+- `test/client-render-smoke.test.mjs`: new assertions separating judge-unavailable from harmful wording and showing the failure reason; settings page asserts both new controls; the `/api/auto-approve/rules` stub is completed
+- `test/absorbed.test.mjs`: updated default assertions (`judgeFailureLimit=1`, `judgeMaxTokens=1024`) and the source contract for failure reasons reaching the audit log
+
 ## [0.7.1] — 2026-09-17
 
 Fixes a display defect that made a reconsidered record **still look rejected**.

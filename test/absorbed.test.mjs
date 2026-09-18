@@ -236,12 +236,20 @@ console.log('Testing absorbed features (dsh-auto-mode port)...')
   assert.ok(/judgeFailures\.delete\(sessionId\)/.test(text), 'counter is cleared on success')
   assert.ok(/seen >= limit/.test(text), 'counter falls back to human at the limit')
   assert.ok(/judgeFailureLimit/.test(text), 'limit is configurable')
-  // 配置默认值与规范化
+  // 配置默认值与规范化。
+  // 默认 1（第一次失败即转人工）：2026-09-18 事故后语义修正——判定器不可用是"判定层失去能力"，
+  // 不是"这个操作有害"，静默拒绝只会让 agent 反复撞墙、用户事后才发现。
   const cfg = index.normalizeConfig({})
-  assert.strictEqual(cfg.judgeFailureLimit, 3, 'judgeFailureLimit defaults to 3')
+  assert.strictEqual(cfg.judgeFailureLimit, 1, 'judgeFailureLimit defaults to 1 (fail fast to human)')
   const cfg2 = index.normalizeConfig({ judgeFailureLimit: 5 })
   assert.strictEqual(cfg2.judgeFailureLimit, 5, 'judgeFailureLimit is respected when set')
-  console.log('  ✓ 1. 判定器连续失败计数（成功清零 / 达上限转人工 / 可配置）')
+  // 判定输出上限：推理与正文共享 max_tokens，过小会让正文为空
+  assert.strictEqual(cfg.judgeMaxTokens, 1024, 'judgeMaxTokens defaults to 1024')
+  assert.strictEqual(index.normalizeConfig({ judgeMaxTokens: 2048 }).judgeMaxTokens, 2048, 'judgeMaxTokens is configurable')
+  // 失败原因必须落进审计（此前只返回 { failed: true }，排障无据）
+  assert.ok(/failureReason/.test(text), 'failure reason is captured for audit')
+  assert.ok(/判定模型未产出正文/.test(text), 'empty text is an explicit failure, not a reasoning fallback')
+  console.log('  ✓ 1. 判定器失败处理（默认即刻转人工 / 可配置 / 失败原因入审计）')
 }
 
 // ================= 授权来源 =================

@@ -209,6 +209,42 @@
       "mode": "danger-full-access",
       "contains": "EPERM",
       "description": "沙箱子进程创建受限(EPERM/cmd.exe)自动提权放行"
+    },
+    {
+      "tool": "write",
+      "mode": "danger-full-access",
+      "contains": "appdata/roaming/rime",
+      "keywords": [
+        "appdata/roaming/rime",
+        "my_phrase.dict.yaml",
+        "wanxiang.custom.yaml",
+        "wanxiang_phrase.custom.yaml",
+        "custom_phrase.dict.yaml"
+      ],
+      "description": "Rime 用户目录（%APPDATA%\\Rime）的输入法配置与个人词典写入"
+    },
+    {
+      "tool": "edit",
+      "mode": "danger-full-access",
+      "contains": "appdata/roaming/rime",
+      "keywords": [
+        "appdata/roaming/rime",
+        "my_phrase.dict.yaml",
+        "wanxiang.custom.yaml",
+        "wanxiang_phrase.custom.yaml",
+        "custom_phrase.dict.yaml"
+      ],
+      "description": "Rime 用户目录（%APPDATA%\\Rime）的输入法配置与个人词典修改"
+    },
+    {
+      "tool": "pwsh",
+      "mode": "danger-full-access",
+      "contains": "weaseldeployer.exe",
+      "keywords": [
+        "weaseldeployer.exe",
+        "rime.weasel"
+      ],
+      "description": "小狼毫（Weasel）部署程序重新编译 Rime 词典"
     }
   ],
   "denyRules": [],
@@ -221,6 +257,8 @@
   ],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
+  "judgeFailureLimit": 1,
+  "judgeMaxTokens": 1024,
   "learning": {
     "enabled": true
   }

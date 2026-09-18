@@ -137,6 +137,27 @@ function createEnv(events, opts) {
     if (target.indexOf('/api/auto-approve/snapshots-stats') >= 0) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, count: 0, bytes: 0, ids: [], files: {} }) })
     }
+    if (target.indexOf('/api/auto-approve/rules') >= 0) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          config: Object.assign({
+            riskyThreshold: 3,
+            judgeTimeoutMs: 20000,
+            judgeFailureLimit: 1,
+            judgeMaxTokens: 1024,
+            hardCategories: options.hardCategories || [],
+            allowRules: [],
+            denyRules: [],
+            denyKeywords: [],
+            judgeModel: { provider: 'ai-gateway', model: 'sensenova/deepseek-v4-flash' },
+          }, options.config || {}),
+          learning: { stats: {}, history: {} },
+          predefined: { denyKeywords: [], allowRules: [], hardCategories: [] },
+          setup: { configured: true, patchPath: 'x' },
+        }),
+      })
+    }
     return Promise.resolve({ ok: true, json: () => Promise.resolve({ events, hardCategories: options.hardCategories }) })
   }
   return env
@@ -379,6 +400,25 @@ function inspect(node, out) {
   console.log('  ✓ 已读拒绝刷新后不再弹提示条')
 }
 
+// ================= 3e. 判定器不可用：文案区分「判定器挂了」与「操作有害」，并显示失败原因 =================
+{
+  // 判定器不可用不是"这个操作有害"。文案必须让用户一眼分清，否则会把网络故障误读成自己的操作被否。
+  const env = createEnv([
+    { id: 71, kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral', tool: 'write', ts: '2026-09-18T12:43:35.000Z', verdict: 'judge-deny', justification: '并入词条', files: [], failureReason: '判定模型未产出正文（reasoning 812 字符，maxTokens=256）' },
+    { id: 72, kind: 'judge-deny', path: 'classifier-deny', category: 'neutral', tool: 'write', ts: '2026-09-18T12:44:00.000Z', verdict: 'judge-deny', justification: '判定为有害', files: [] },
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's9' })
+  const info = inspect(tree)
+  assert.ok(/判定器不可用（非操作本身有问题）/.test(info.text),
+    'judge-unavailable reads as an infrastructure problem, not a harmful operation')
+  assert.ok(/判定为有害或越权/.test(info.text), 'classifier-deny keeps its own wording')
+  assert.ok(/判定模型未产出正文/.test(info.text),
+    'the real failure reason is shown so the user can tell timeout from empty output')
+  console.log('  ✓ 判定器不可用 vs 有害：文案区分，并显示真实失败原因')
+}
+
 // ================= 6. 设置页仍可渲染（回归） =================
 {
   const env = createEnv([])
@@ -386,7 +426,10 @@ function inspect(node, out) {
   const Settings = booted.component('dsh-approval-gate.settings')
   const tree = await renderSettled(booted, Settings, {})
   assert.ok(tree, 'the settings section still renders')
-  console.log('  ✓ 设置页仍可渲染')
+  const info = inspect(tree)
+  assert.ok(/判定器失败即转人工/.test(info.text), 'settings expose the judge failure limit')
+  assert.ok(/判定输出上限/.test(info.text), 'settings expose the judge max tokens')
+  console.log('  ✓ 设置页仍可渲染（含判定器失败上限 / 输出上限两个新配置项）')
 }
 
 console.log('All client render smoke tests passed successfully!')

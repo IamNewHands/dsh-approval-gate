@@ -227,4 +227,50 @@ const BASELINE_RULES = readRules().length
   console.log('  ✓ 重复追认：keywords 并集补齐，规则条数不变')
 }
 
+// ================= 7. 无指纹追认：拒绝写宽规则（不得把一次追认放大为全工具放行） =================
+// 事故：2026-09-18 20:43:39 落了一条 {tool:write, mode:danger-full-access, category:neutral}
+// 无指纹规则，覆盖了此后该工具在提权模式下的一切操作。宁可这次不放行，也不写宽规则。
+{
+  seedEvent({
+    id: 13, ts: '2026-09-18T05:57:00.000Z', sessionId: 's-nofp', tool: 'pwsh',
+    mode: 'danger-full-access', reason: 'r',
+    justification: '直接执行',  // 无路径、无文件名、无可识别目标
+    verdict: 'judge-deny', kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral',
+    files: [],
+  })
+  const before = readRules()
+  const res = await call(state, '/api/auto-approve/reconsider', 'POST', { sessionId: 's-nofp', eventId: 13, retry: false })
+  assert.strictEqual(res.status, 400, '无指纹的追认被拒绝（不写宽规则）')
+  assert.ok(/指纹/.test(String(res.payload && res.payload.error || '')), '错误信息说明缺少指纹')
+  assert.strictEqual(readRules().length, before.length, '不写入任何规则')
+  console.log('  ✓ 无指纹追认 → 拒绝写宽规则（避免一次追认变成全工具放行）')
+}
+
+// ================= 8. 命令类工具的指纹：来自 event.command，而不是 justification 的偶然词 =================
+// 事故：追认 pwsh 时规则写成 {contains:"job"}，只匹配含 "job" 的那一次调用；
+// 下一次同目标调用措辞变成「以后台方式」就失效。修复：事件记录真实命令，指纹取自命令。
+{
+  const cmd = 'Start-Process "C:\\Program Files\\Rime\\weasel-0.17.4\\WeaselDeployer.exe" -ArgumentList "/deploy" -Wait'
+  seedEvent({
+    id: 14, ts: '2026-09-18T05:58:00.000Z', sessionId: 's-cmd', tool: 'pwsh',
+    mode: 'danger-full-access', reason: 'r',
+    justification: '需要以后台方式运行小狼毫部署程序重新编译词典，验证 my_phrase.table.bin 是否生成。',
+    verdict: 'judge-deny', kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral',
+    files: [], command: cmd,
+  })
+  const res = await call(state, '/api/auto-approve/reconsider', 'POST', { sessionId: 's-cmd', eventId: 14, retry: false })
+  assert.strictEqual(res.status, 200, '带命令的追认成功')
+  const rule = res.payload.rule
+  assert.ok(Array.isArray(rule.keywords) && rule.keywords.some((k) => /WeaselDeployer/i.test(k)),
+    'keywords 取自真实命令中的可执行文件，而不是 justification 里的偶然词')
+
+  // 下一次调用：措辞完全不同，但目标命令一致 → 命中规则
+  const nextJustification = '需要在沙箱外以后台 job 方式运行小狼毫部署程序，避免子进程随父进程被杀。'
+  assert.ok(matchRule(readRules(), 'pwsh', 'danger-full-access', 'neutral', nextJustification + ' ' + cmd),
+    '同命令的下一次调用命中规则（旧行为：contains:"job" 在此措辞下 MISS）')
+  assert.strictEqual(matchRule(readRules(), 'pwsh', 'danger-full-access', 'neutral', '完全无关的命令 Get-Date'),
+    null, '无关命令不命中')
+  console.log('  ✓ 命令类工具指纹：取自 event.command，措辞变化仍命中')
+}
+
 console.log('All reconsider-match tests passed successfully!')
