@@ -4,6 +4,25 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.1] — 2026-09-21
+
+Chinese approval explanations: the model's `justification` is often English (subagents and other providers especially), and the host template adds an English prefix `escalate sandbox to <mode>:` — so the approver had to read English before deciding.
+
+### Added
+
+- **Every approver-facing explanation is Chinese** (`src/zh.mjs`): the explanation is built from **structured facts** — target sandbox mode, the real command, the real target paths — and states the consequence (writable scope / reversibility / whether anything outside the workspace is touched). Commands, paths and arguments are kept verbatim, never translated or rewritten; when the original is already Chinese only the English host prefix is localized
+- Events carry a new `zh` field: both the approval card body and the approval-view rows render it first, while `justification` / `reason` keep the original text so the audit record stays truthful. Older events have no `zh` and fall back to the original
+
+### Fixed
+
+- **The host's English prefix no longer reaches the approver**: an escalation body now reads "沙箱提权到 danger-full-access：…" instead of `escalate sandbox to danger-full-access: …`
+- **All four human-handoff exits are covered**: `forwardToHuman`, both "first N manual confirmations" branches, and the judge-error fallback. Auto-approved events only gain the display-only `zh` field and never see `reason` rewritten (so downstream matching on the original text is unaffected)
+
+### Tests
+
+- `test/zh.test.mjs` (new): CJK detection, English → Chinese explanation, Chinese original with prefix localization only, the no-escalation-prefix fallback, unknown modes never claiming a false consequence, and truncation
+- `test/client-render-smoke.test.mjs`: new assertions that the notice renders `zh` first and that rows use `zh` when present but fall back to the original justification
+
 ## [0.8.0] — 2026-09-18
 
 Fixes the chain of false rejections caused by treating "judge unavailable" as "this operation is harmful": right after approving one operation, the next similar call was silently rejected again, forcing the user to re-approve repeatedly.

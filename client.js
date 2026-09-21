@@ -455,30 +455,30 @@ window.__ModuleLoader__.load({
       let tagText = ''
       let glyph = null
       if (isPending) {
-        title = '等待人工审批：' + (notice.justification || notice.reason || '')
+        title = '等待人工审批：' + (notice.zh || notice.justification || notice.reason || '')
         tagText = '人工审批中'
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '◔')
       } else if (isSilentReject) {
         // 已被追认（可能在另一个窗口点的）：状态已翻转为「已放行」，不该再吓人
         const done = Boolean(notice.reconsidered)
-        title = (done ? '已追认放行：' : '已直接拒绝：') + (notice.justification || notice.reason || '')
+        title = (done ? '已追认放行：' : '已直接拒绝：') + (notice.zh || notice.justification || notice.reason || '')
         tagText = done ? reconsideredLabel(notice) : silentRejectLabel(notice)
         glyph = React.createElement('span', { className: done ? 'ag-notice-glyph' : 'ag-notice-glyph-err' }, done ? '✓' : '✕')
       } else if (kind === 'manual-approved') {
         const lc = notice.learningCount !== undefined ? notice.learningCount : null
         const th = notice.threshold || 3
         const viaJudge = notice.path === 'flash-failed'
-        title = (viaJudge ? '人工审批通过（判定器不可用）：' : '人工审批通过：') + (notice.justification || notice.reason || '')
+        title = (viaJudge ? '人工审批通过（判定器不可用）：' : '人工审批通过：') + (notice.zh || notice.justification || notice.reason || '')
         tagText = viaJudge
           ? ('判定器不可用，人工放行' + (lc !== null ? ' · 学习 ' + lc + '/' + th : ''))
           : (lc !== null ? ('学习 ' + lc + '/' + th + '，满 ' + th + ' 次后自动放行') : '人工审批通过')
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '✓')
       } else if (kind === 'manual-rejected') {
-        title = '已拒绝：' + (notice.justification || notice.reason || '')
+        title = '已拒绝：' + (notice.zh || notice.justification || notice.reason || '')
         tagText = rejectLabel(notice).replace('人工拒绝', '已拒绝')
         glyph = React.createElement('span', { className: 'ag-notice-glyph-err' }, '✕')
       } else {
-        title = (notice.justification || notice.reason || '')
+        title = (notice.zh || notice.justification || notice.reason || '')
         const label = VERDICT_LABELS[notice.verdict] || notice.verdict || '自动放行'
         tagText = '自动放行 · ' + label
         glyph = React.createElement(GlyphCheck, null)
@@ -886,7 +886,7 @@ window.__ModuleLoader__.load({
                         React.createElement('span', { className: tagCls }, tagText),
                         React.createElement('span', { className: 'ag-time' }, fmtTime(ev.ts)),
                       ),
-                      React.createElement('div', { className: 'ag-row-reason' }, ev.justification || ev.reason || '(无说明)'),
+                      React.createElement('div', { className: 'ag-row-reason' }, ev.zh || ev.justification || ev.reason || '(无说明)'),
                       files.length > 0
                         ? React.createElement('div', { className: 'ag-row-files' },
                             files.map(function (f, i) {

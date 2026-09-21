@@ -38,6 +38,8 @@ import { fileURLToPath } from 'node:url'
 import { sanitizeClassifierText, sanitizeClassifierArguments } from './sanitize.mjs'
 import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential } from './paths.mjs'
 import { parseClassifierText, buildClassifierPayload, CLASSIFIER_SYSTEM_PROMPT } from './classifier.mjs'
+// 审批说明中文化：面向审批人的说明一律中文（命令/路径原样保留）
+import { buildChineseReason } from './zh.mjs'
 
 const NAME = 'dsh-approval-gate'
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -422,6 +424,9 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
     verdict: String(verdict || 'auto'),
     files: Array.isArray(o.files) && o.files.length > 0 ? o.files : extractFiles(justification)
   }
+  // zh：给人看的中文说明（原文是英文时由 zh.mjs 生成）。审查界面优先渲染它，
+  // justification/reason 仍保留原文，审计记录不失真。
+  if (o.zh) ev.zh = String(o.zh).slice(0, 800)
   if (o.kind) ev.kind = o.kind
   if (o.learningCount !== undefined) ev.learningCount = o.learningCount
   if (o.threshold !== undefined) ev.threshold = o.threshold
@@ -2017,6 +2022,21 @@ export default {
           toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
           toolCmd ? { command: toolCmd } : {}
         )
+        // 面向审批人的中文说明：模型 justification 是英文 / 含宿主英文前缀时，
+        // 用结构化事实（目标模式、命令、目标路径）拼一条中文说明，命令与路径原样保留。
+        const zhReason = buildChineseReason({
+          toolName,
+          mode,
+          justification,
+          command: toolCmd,
+          files: toolFiles,
+          cwd: sessionCwd
+        })
+        // 记录用 opts：filesOpt 语义不变，仅追加 zh（审查界面渲染用）
+        const displayOpts = zhReason ? Object.assign({}, filesOpt, { zh: zhReason }) : filesOpt
+        // 卡正文来自 req.reason（宿主 approval/asked 已按原文落库，这里只改给人看的那一份）。
+        // 只在真正落到人工面前的出口调用：自动放行路径不动 req.reason。
+        const showChineseReason = () => { if (zhReason) req.reason = zhReason }
         const matchContext = toolCmd ? `${justification} ${toolCmd}` : justification
         // 规则匹配上下文：justification + 命令 + 本次调用的真实目标文件（write/edit 的 file_path）。
         // 追认/沉淀规则的路径指纹来自历史事件，若匹配时看不到本次调用的文件路径，规则会静默失效
@@ -2026,9 +2046,11 @@ export default {
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
         const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why, failureReason) => {
-          const evOpts = Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt)
+          const evOpts = Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, displayOpts)
           if (failureReason) evOpts.failureReason = failureReason
           recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', evOpts)
+          // 卡正文来自 req.reason（宿主 approval/asked 已按原文落库，这里只改给人看的那一份）
+          showChineseReason()
           const out = await next()
           if (out === 'allowed-once') {
             // 若因 Flash 调用失败/超时转人工，用户通过后依然记入学习样本与统计，避免因网络抖动丢失学习积累
@@ -2066,11 +2088,11 @@ export default {
                 audit(`LEARN   判定器不可用转人工已批准，但无可用指纹 → 不沉淀宽规则`)
               }
             }
-            const approvedOpts = Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt)
+            const approvedOpts = Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, displayOpts)
             if (failureReason) approvedOpts.failureReason = failureReason
             recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', approvedOpts)
           } else if (out === 'rejected') {
-            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, filesOpt))
+            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, displayOpts))
           }
           return out
         }
@@ -2085,7 +2107,7 @@ export default {
             // 直接拒绝：让 agent 改方案，不弹窗（凭据外泄 / 根与系统路径销毁）
             audit(`HARDREJ ${toolName} | ${hardFacts.reason}`)
             recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'hard-reject',
-              Object.assign({ kind: 'hard-reject', path: 'hard-deny', category: 'credential' }, filesOpt))
+              Object.assign({ kind: 'hard-reject', path: 'hard-deny', category: 'credential' }, displayOpts))
             return 'rejected'
           }
           // 人工档：DSH_HOME / home 根等，保留手动放行能力
@@ -2103,7 +2125,7 @@ export default {
         const matchedRule = matchRule(config.allowRules, toolName, mode, null, ruleMatchContext)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
-          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', filesOpt)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', displayOpts)
           return 'allowed-once'
         }
 
@@ -2157,7 +2179,7 @@ export default {
           judgeFailures.set(sessionId, seen)
           audit(`FAILED  ${toolName} 判定器失败 ${seen}/${limit} → 静默拒绝 | ${why} | ${reason.slice(0, 100)}`)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'judge-deny',
-            Object.assign({ kind: 'judge-deny', path: 'judge-unavailable', category: cat, failureReason: why }, filesOpt))
+            Object.assign({ kind: 'judge-deny', path: 'judge-unavailable', category: cat, failureReason: why }, displayOpts))
           return 'rejected'
         }
         // 判定成功 → 清零失败计数
@@ -2184,14 +2206,14 @@ export default {
         if (decision === 'deny') {
           audit(`JUDGEDENY ${toolName} mode=${mode || 'none'} category=${cat} | ${judged.reason || ''}`)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'judge-deny',
-            Object.assign({ kind: 'judge-deny', path: 'classifier-deny', category: cat }, filesOpt))
+            Object.assign({ kind: 'judge-deny', path: 'classifier-deny', category: cat }, displayOpts))
           return 'rejected'
         }
 
         // 4d. allow（非硬风险类别）→ 自动放行
         if (decision === 'allow') {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (judge-allow${cat !== 'neutral' ? ' category=' + cat : ''})`)
-          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-safe', filesOpt)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-safe', displayOpts)
           return 'allowed-once'
         }
 
@@ -2214,7 +2236,7 @@ export default {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
           saveJson(LEARNING_PATH, learning)
-          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'learned', filesOpt)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'learned', displayOpts)
           return 'allowed-once'
         }
 
@@ -2244,7 +2266,7 @@ export default {
             delete learning.stats[key]
             delete learning.history[key]
             saveJson(LEARNING_PATH, learning)
-            recordAutoAllow(sessionId, toolName, mode, reason, justification, 'fpHit', filesOpt)
+            recordAutoAllow(sessionId, toolName, mode, reason, justification, 'fpHit', displayOpts)
             return 'allowed-once'
           }
 
@@ -2271,7 +2293,7 @@ export default {
                 audit(`SAME    ${toolName} mode=${mode || 'none'} category=${cat} flash 判同类（无指纹，未沉淀）| ${reason.slice(0, 100)}`)
               }
               audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-same) | ${reason.slice(0, 100)}`)
-              recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-same', filesOpt)
+              recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-same', displayOpts)
               return 'allowed-once'
             }
             // 判 DIFFERENT / 验证失败 → 落人工确认
@@ -2280,14 +2302,15 @@ export default {
 
           // 指纹未命中（且无样本可验证 / 判不同类）：转人工确认
           audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat} confirm=${confirmed + 1}/${threshold}（操作未确认过）→ 人工 outcome=? | ${reason.slice(0, 120)}`)
-          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, filesOpt))
+          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, displayOpts))
+          showChineseReason()
           const outcome = await next()
           audit(`OUTCOME ${key} outcome=${outcome} | ${reason.slice(0, 80)}`)
           if (outcome === 'allowed-once' && learning.enabled) {
             // 批准 → 记录本次操作样本（背景+指纹）；计数保持阈值位
             recordSample(key, justification)
             saveJson(LEARNING_PATH, learning)
-            recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed, threshold, category: cat, path: 'neutral-confirm' }, filesOpt))
+            recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
           } else if (outcome === 'rejected') {
             // 拒绝 → 永久人工（带指纹；提取不到则拦全部同类，拒绝从严）
             const rule = { tool: toolName, category: cat }
@@ -2301,14 +2324,15 @@ export default {
             delete learning.stats[key]
             delete learning.history[key]
             saveJson(LEARNING_PATH, learning)
-            recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, filesOpt))
+            recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, displayOpts))
           }
           return outcome
         }
 
         // 前 N 次 → 人工确认
         audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat} confirm=${confirmed + 1}/${threshold} → 人工 outcome=? | ${reason.slice(0, 120)}`)
-        recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, filesOpt))
+        recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, displayOpts))
+        showChineseReason()
         const outcome = await next()
         audit(`OUTCOME ${key} outcome=${outcome} | ${reason.slice(0, 80)}`)
 
@@ -2317,7 +2341,7 @@ export default {
           learning.stats[key] = confirmed + 1
           recordSample(key, justification)
           saveJson(LEARNING_PATH, learning)
-          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed + 1, threshold, category: cat, path: 'neutral-confirm' }, filesOpt))
+          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed + 1, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
         } else if (outcome === 'rejected') {
           // 拒绝 → 升级为永久人工规则（带操作指纹；提取不到则拦全部同类，拒绝从严）
           const fingerprint = extractOperationFingerprint(justification)
@@ -2332,12 +2356,13 @@ export default {
           delete learning.stats[key]
           delete learning.history[key]
           saveJson(LEARNING_PATH, learning)
-          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, filesOpt))
+          recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, displayOpts))
         }
         // cancelled/unavailable：不计数（用户未表态，下次仍人工确认）
         return outcome
       } catch (error) {
         console.error(`[${NAME}] 判断过程出错，回退人工`, error)
+        showChineseReason()
         return next()
       }
     }, { prepend: true })

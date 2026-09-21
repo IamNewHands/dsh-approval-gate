@@ -432,4 +432,44 @@ function inspect(node, out) {
   console.log('  ✓ 设置页仍可渲染（含判定器失败上限 / 输出上限两个新配置项）')
 }
 
+// ================= 7. 审批说明中文化：zh 字段优先渲染 =================
+{
+  // 模型写的 justification 可能是英文（子代理/其他 provider 尤其常见）；host 侧会用结构化
+  // 事实（目标沙箱模式 / 真实命令 / 真实目标路径）生成中文说明放进 zh 字段。
+  // 提示条必须优先显示 zh，否则审批人又要读英文才能决定批不批。
+  const EN = 'Same sandbox denial as before: msys bash cannot create its signal pipe.'
+  const ZH = '沙箱提权到 danger-full-access：可读写工作区之外的任意路径（含系统位置），改动不再受沙箱限制，也无法自动回滚。\n模型说明原文（未翻译）：' + EN
+  const env = createEnv([{
+    id: 81, kind: 'judge-deny', path: 'classifier-deny', category: 'neutral',
+    tool: 'pwsh', mode: 'danger-full-access', ts: '2026-09-21T07:30:06.000Z',
+    verdict: 'judge-deny', justification: EN, zh: ZH, files: [],
+  }])
+  const booted = boot(env)
+  const Notice = booted.component('dsh-approval-gate.notice')
+  const tree = await renderSettled(booted, Notice, { sessionId: 's10' })
+  const info = inspect(tree)
+  assert.ok(tree, 'a pending rejection must surface as a notice')
+  assert.ok(/已直接拒绝/.test(info.text), 'the notice keeps its own label')
+  assert.ok(info.text.indexOf('沙箱提权到 danger-full-access') >= 0,
+    'the notice renders the Chinese zh text instead of leading with the English original')
+  console.log('  ✓ 提示条：优先渲染 zh 中文说明')
+}
+
+// ================= 7b. 审批记录行：有 zh 用中文，无 zh 回退原文 =================
+{
+  const env = createEnv([
+    { id: 82, kind: 'judge-deny', path: 'classifier-deny', category: 'neutral', tool: 'edit', ts: '2026-09-21T07:31:00.000Z', verdict: 'judge-deny', justification: '编辑 Merge.yaml', files: [] },
+    { id: 83, kind: 'auto', tool: 'pwsh', ts: '2026-09-21T07:32:00.000Z', verdict: 'rule', justification: 'git status', files: [], zh: '沙箱提权到 workspace-write：可修改工作区内的文件，工作区之外的路径仍会被拒绝。\n做什么：命令：git status' },
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's11' })
+  const info = inspect(tree)
+  assert.ok(info.text.indexOf('沙箱提权到 workspace-write') >= 0,
+    'a recorded event with zh renders the Chinese explanation')
+  assert.ok(info.text.indexOf('编辑 Merge.yaml') >= 0,
+    'a recorded event without zh still falls back to the original justification (old records must not go blank)')
+  console.log('  ✓ 审批记录行：zh 优先，缺 zh 时回退 justification 原文')
+}
+
 console.log('All client render smoke tests passed successfully!')

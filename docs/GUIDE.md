@@ -206,7 +206,9 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
    - **diff 快照管理**：视图顶部显示「diff 快照 占用 · 条数」，并提供两个清理入口——**「仅清本会话」**（只删除当前会话的快照，不影响其他会话未查看的 diff）与**「清空全部」**（二次确认后清空所有会话；均仅删除对比数据，不影响审批记录本身，删除后历史文件不可再查看对比）
    - 限制：仅文本文件（单文件 ≤256KB、每事件 ≤5 个文件）会保存快照，二进制/超限文件不可点击
 
-数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
+数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold，以及 v0.8.1 起的中文说明 `zh`），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
+
+> `zh` 是**面向审批人的中文说明**（v0.8.1+）：原文是英文或带宿主前缀 `escalate sandbox to <mode>:` 时由 `src/zh.mjs` 用真实事实（目标模式 / 真实命令 / 真实目标路径）生成，并交代后果；命令与路径原样保留，模型原文追加为附注。前端优先渲染 `zh`，缺 `zh`（老事件）回退 `justification`；`justification` 永远保存原文。
 
 > `hard-reject` 与 `judge-deny` 是**判定层静默拒绝**（未弹窗）：分别对应硬拒档与判定器 `deny`／连续失败。审查视图对它们显示红色「已直接拒绝」并标注具体原因。
 >
