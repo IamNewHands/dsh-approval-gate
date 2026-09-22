@@ -4,6 +4,27 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.2] — 2026-09-22
+
+Fixes "auto-learning has no effect": the confirmation counter was long past the threshold, yet every escalation still prompted a human.
+
+### Problem
+
+- **The judge-unavailable branch ran before the confirmation-count check**: whenever the judge timed out or errored, the code went straight to a human and never reached the "confirmed N times" path. Evidence (session `session-c7c21920`, 2026-09-22 20:15–21:10): `learning.json` had `pwsh|danger-full-access|neutral` at **8/3**, while the approval records kept reading "manually approved · learning 6/3 (auto-approves after 3)" — the counter climbed, the prompts did not stop
+- **The failure was upstream flakiness, not the operation**: the judge reported `Stream ended without finish_reason`, upstream `code=4001`, and 20s timeouts — the judging layer had lost its capability. Escalating to a human neither fixes the judge nor honours the learning that already happened
+- Counting and releasing were therefore decoupled: `learning.stats` said 8/3 while behaviour was identical to 0/3, and re-approving manually never changed the next outcome
+
+### Fixed
+
+- **An unavailable judge now honours completed learning first** (`src/index.mjs`): the failure branch checks the confirmation count for that `tool|mode|neutral` key, and when `learning.enabled` and the count is ≥ `riskyThreshold` it auto-approves and records the event (`path: learned-judge-unavailable`) instead of escalating; the session's judge-failure counter is cleared at the same time
+- **Hard-risk gates are unaffected**: hard denies (credential exfiltration / system-path destruction), hard facts (`DSH_HOME` / home root), dangerous keywords, the allowlist and `denyRules` all run before the judge, and hard categories still require a human every time. This fallback applies only to `neutral` keys that already met the threshold
+- **Trade-off (recorded deliberately)**: with the judge unavailable there is no semantic similarity check, so this releases on the **confirmation count alone** — looser than the healthy path, which still asks the judge to verify sameness when the fingerprint misses. That is intentional: a broken judge must not park already-confirmed same-class operations in human approval indefinitely
+
+### Tests
+
+- `test/pipeline.test.mjs` gains case 10c: with `pwsh|danger-full-access|neutral = 6` seeded and the judge throwing every time, it asserts `allowed-once` and `nextCalls = 0` (**zero human prompts**) while confirming the judge really was called (proving the failure fallback ran, not an allowlist hit)
+- Cases 10 / 10b / 10d now clear `learning.json` first: they verify "below threshold → human", and were previously polluted by learning counts accumulated earlier in the same process
+
 ## [0.8.1] — 2026-09-21
 
 Chinese approval explanations: the model's `justification` is often English (subagents and other providers especially), and the host template adds an English prefix `escalate sandbox to <mode>:` — so the approver had to read English before deciding.
