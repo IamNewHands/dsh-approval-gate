@@ -319,6 +319,10 @@ function boot(opts) {
 // agent 换不了方案——操作本身没问题。事故现场：用户刚批准一次，7 秒后下一次调用又因
 // 同一个坏判定器被静默拒绝，用户只能反复追认（同会话 8 次审批里 4 次是这个原因）。
 {
+  // 隔离前一个确认制学习用例，确保本用例验证的是未达到学习阈值时的失败回退。
+  const learningPath = join(dataDir, 'learning.json')
+  writeFileSync(learningPath, JSON.stringify({ enabled: true, stats: {}, history: {} }, null, 2) + '\n', 'utf8')
+
   const { state } = boot({ judgeReply: () => { throw new Error('judge down') } })
   const mk = (n) => makeReq({
     sessionId: 's-failcount',
@@ -348,6 +352,10 @@ function boot(opts) {
   cfg.judgeFailureLimit = 3
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
 
+  // 隔离上一用例累计的学习次数，确保这里只验证 judgeFailureLimit 的三次失败节奏。
+  const learningPath = join(dataDir, 'learning.json')
+  writeFileSync(learningPath, JSON.stringify({ enabled: true, stats: {}, history: {} }, null, 2) + '\n', 'utf8')
+
   boot({ judgeReply: () => { throw new Error('judge down') } })
   const mk = (n) => makeReq({
     sessionId: 's-failcount-legacy',
@@ -365,7 +373,37 @@ function boot(opts) {
   console.log('  ✓ judgeFailureLimit 可配置回旧节奏（1/2 静默，第 3 次人工）')
 }
 
-// ================= 10c. 判定器不可用转人工、用户批准 → 沉淀带指纹的放行规则 =================
+// ================= 10c. 已满学习阈值 + 判定器不可用 → 不应继续要求人工审批 =================
+{
+  const learningPath = join(dataDir, 'learning.json')
+  writeFileSync(learningPath, JSON.stringify({
+    enabled: true,
+    stats: { 'pwsh|danger-full-access|neutral': 6 },
+    history: {
+      'pwsh|danger-full-access|neutral': [
+        { fp: null, ctx: '查询 CI 构建运行状态', ts: new Date().toISOString() },
+        { fp: null, ctx: '读取 CI 构建失败日志定位具体错误', ts: new Date().toISOString() },
+        { fp: null, ctx: '等待并检查 CI 构建运行状态', ts: new Date().toISOString() },
+      ],
+    },
+  }, null, 2) + '\n', 'utf8')
+
+  const { state } = boot({ judgeReply: () => { throw new Error('judge down') } })
+  const req = makeReq({
+    sessionId: 's-threshold-judge-down',
+    toolName: 'pwsh',
+    justification: '读取 CI 失败日志定位具体错误行',
+    args: { command: 'gh run view 123 --log-failed' },
+    callId: 'threshold-failed-1',
+  })
+  const result = await decide(null, req, 'allowed-once')
+  assert.strictEqual(result.outcome, 'allowed-once', 'learned neutral operation must auto-approve when the judge is unavailable')
+  assert.strictEqual(result.nextCalls, 0, 'learning threshold must prevent another human prompt')
+  assert.ok(state.streamAttempts >= 2, 'the unavailable judge path is exercised before learned fallback')
+  console.log('  ✓ 学习已满阈值且判定器不可用 → 自动放行，不再重复人工审批')
+}
+
+// ================= 10d. 判定器不可用转人工、用户批准 → 沉淀带指纹的放行规则 =================
 // 事故根因之一：flash-failed 分支只记学习样本、不写规则，下一次同目标调用仍要过坏判定器。
 {
   const cfgPath = join(dataDir, 'allowlist.json')
@@ -415,6 +453,10 @@ function boot(opts) {
 
 // ================= 10d. 失败原因进入事件与审计（排障依据） =================
 {
+  // 隔离上一用例已达到阈值的 pwsh 学习状态，确保本用例验证未学习操作的人工回退事件。
+  const learningPath = join(dataDir, 'learning.json')
+  writeFileSync(learningPath, JSON.stringify({ enabled: true, stats: {}, history: {} }, null, 2) + '\n', 'utf8')
+
   const { state } = boot({ judgeReply: () => { throw new Error('upstream 502 runaway') } })
   const req = makeReq({
     sessionId: 's-failreason',

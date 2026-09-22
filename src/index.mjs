@@ -2168,6 +2168,19 @@ export default {
         // 由用户裁决；并在事件里带上失败原因，UI 显示为「判定器不可用」而不是「有害」。
         // judgeFailureLimit 保留为配置项：值 >1 时仍可回到旧的"先静默拒绝"节奏。
         if (failed) {
+          // 判定器不可用时仍应兑现已经完成的学习。此前此分支先于学习阈值检查返回人工审批，
+          // 导致 learning.json 已达到 6/3、8/3 仍反复弹窗。硬事实、危险词和确定性规则已在
+          // 判定器之前处理，因此这里只对已达到阈值的 neutral 工具/模式键执行学习兜底。
+          const learnedKey = learnKey(toolName, mode, 'neutral')
+          const learnedThreshold = config.riskyThreshold || 3
+          const learnedCount = learning.stats[learnedKey] || 0
+          if (learning.enabled && learnedCount >= learnedThreshold) {
+            judgeFailures.delete(sessionId)
+            audit(`ALLOW   ${toolName} mode=${mode || 'none'} (judge-unavailable learned=${learnedCount}/${learnedThreshold}) | ${reason.slice(0, 100)}`)
+            recordAutoAllow(sessionId, toolName, mode, reason, justification, 'learned-judge-unavailable', filesOpt)
+            return 'allowed-once'
+          }
+
           const limit = Math.max(1, config.judgeFailureLimit || 3)
           const seen = (judgeFailures.get(sessionId) || 0) + 1
           const why = failureReason || '未知原因'
