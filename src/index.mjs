@@ -328,6 +328,35 @@ function extractFiles(text) {
 }
 
 /**
+ * 读取会话事件列表。
+ *
+ * 生产事实（2026-09-24 反查 DSH 源码与 `$DSH_HOME/auto-approve/events.jsonl`）：
+ * `req.agent.session` 是 DSH 的 `Session` 实例，它的公开事件入口是 `snapshotEvents()` /
+ * `ownEvents()` —— **没有 `events` 字段**（`Session.prototype` 只有 id / seq / header /
+ * eventAt / snapshotEvents / ownEvents / append 等）。原实现一律读 `session.events`，
+ * 于是 `Array.isArray(undefined) === false`，B 层结构化参数解析在生产上从未命中：
+ * 485 条审批事件的 `command` 字段为 0 条，硬拒层的路径判定也一直拿到空参数。
+ * @param {object|null|undefined} session - DSH Session 实例（或测试用的等价对象）
+ * @returns {Array} 会话事件数组（取不到时为空数组）
+ */
+export function sessionEvents(session) {
+  if (!session || typeof session !== 'object') return []
+  if (typeof session.snapshotEvents === 'function') {
+    try {
+      const snapshot = session.snapshotEvents()
+      if (Array.isArray(snapshot)) return snapshot
+    } catch { /* 回退到 events 字段 */ }
+  }
+  if (typeof session.ownEvents === 'function') {
+    try {
+      const own = session.ownEvents()
+      if (Array.isArray(own)) return own
+    } catch { /* 回退到 events 字段 */ }
+  }
+  return Array.isArray(session.events) ? session.events : []
+}
+
+/**
  * 从 approval/request 的 callId 回溯会话日志中的 tool/call 事件，取结构化参数里的真实路径。
  * B 层：edit/write/select 等带 file_path 字段的工具 → 解析 arguments JSON 拿确凿路径；
  * bash/exec 等带 command 字段的工具 → 从命令文本提取路径。
@@ -589,7 +618,7 @@ const AUTO_APPROVE_GUIDANCE = [
  * skill/插件/子代理文本一律不算。总预算 4000 字符，最多 4 条，逐条脱敏截断。
  */
 export function trustedUserMessages(session, maxMessages = 4) {
-  const events = session && Array.isArray(session.events) ? session.events : []
+  const events = sessionEvents(session)
   const messages = []
   let remaining = 4000
   for (let i = events.length - 1; i >= 0; i--) {
@@ -2025,7 +2054,7 @@ export default {
           preset = permissionPresets.current(session)
         } catch (error) {
           try {
-            preset = permissionPresets.current(session.events)
+            preset = permissionPresets.current(sessionEvents(session))
           } catch {
             console.error(`[${NAME}] permissionPresets.current failed`, error)
             return next()
@@ -2046,10 +2075,12 @@ export default {
         })()
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
-        const toolFiles = resolveToolCallFiles(req.callId, session.events)
-        const toolCmd = resolveToolCallCommand(req.callId, session.events)
+        // 事件列表必须走 snapshotEvents()：Session 没有 events 字段（见 sessionEvents 注释）
+        const events = sessionEvents(session)
+        const toolFiles = resolveToolCallFiles(req.callId, events)
+        const toolCmd = resolveToolCallCommand(req.callId, events)
         // 说明用命令：严格命中落空时回溯最近同名调用（只影响给人看的说明，不影响安全裁决）
-        const displayCmd = resolveDisplayCommand(req.callId, toolName, session.events)
+        const displayCmd = resolveDisplayCommand(req.callId, toolName, events)
         // command 一并落进事件：命令类工具没有 file_path，追认/沉淀规则的指纹需要它
         const filesOpt = Object.assign(
           toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
@@ -2134,7 +2165,7 @@ export default {
         // ---- 0. 确定性硬拒层（吸收自 dsh-auto-mode：分类器无权推翻） ----
         // 事实来源：工具参数的真实路径 + 凭据材料正则，而非 justification 关键词。
         const roots = rootsForSession(session)
-        const callArgs = resolveToolCallArgs(req.callId, session.events) || {}
+        const callArgs = resolveToolCallArgs(req.callId, events) || {}
         const hardFacts = hardDenyFacts(toolName, callArgs, roots)
         if (hardFacts) {
           if (hardFacts.tier === 'reject') {

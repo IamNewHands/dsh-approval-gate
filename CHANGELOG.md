@@ -4,6 +4,36 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.8.4] — 2026-09-24
+
+根因修复：插件一直读 `session.events`，而 DSH 的 `Session` 根本没有这个字段 —— 结构化参数、确定性硬拒层、用户授权来源三处因此长期失效。
+
+### 问题
+
+- **读错了 API**：`req.agent.session` 是 DSH 的 `Session` 实例，公开事件入口是 `snapshotEvents()` / `ownEvents()`。`Session.prototype` 只有 `id` / `seq` / `header` / `eventAt` / `snapshotEvents` / `ownEvents` / `append`，**没有 `events`**（已用 `Object.getOwnPropertyDescriptors` 实测确认）。于是 `Array.isArray(undefined) === false`
+- **三处连带失效**：
+  1. B 层结构化参数解析（`tool/call` 的 `file_path` / `command`）从未命中 —— 生产 `events.jsonl` 485 条审批事件的 `command` 字段为 0 条，v0.8.3 的「回溯最近同名调用」兜底正是在给这个错误打补丁
+  2. `hardDenyFacts` 拿到的永远是 `{}` —— 确定性硬拒层「写入/删除类工具的目标落在受保护位置」这条分支在生产上从未触发（凭据外发的 args 分支同样）
+  3. `trustedUserMessages(session, 4)` 恒为空 —— 送给判定模型的「唯一用户授权来源」一直是空的
+- **为什么测试没抓到**：测试夹具把 session 造成 `{ events: [...] }`，正好喂了插件以为存在、生产上并不存在的字段
+
+### 修复
+
+- **`src/index.mjs` 新增 `sessionEvents(session)`**：依次尝试 `snapshotEvents()` → `ownEvents()` → `events` 字段（后者保留兼容旧宿主与既有测试），任何访问器抛错都降级而不影响审批
+- **审批处理器改用该入口**：`toolFiles` / `toolCmd` / 硬拒层 `callArgs` 全部取真实事件；`trustedUserMessages` 内部同样改用
+- **测试夹具改为生产形态**：`makeReq` 默认构造 `{ id, header, snapshotEvents() }`（**不带** `events` 字段），「只认 events 字段」的回归会让整套用例立刻变红；另留 `legacyEventsField` 选项验证兼容分支
+
+### 行为变化（重启后可见）
+
+- 写入 `C:\Windows\...`、`~/.ssh`、文件系统根等受保护位置：**直接硬拒且不弹窗**（此前会走到判定/人工）
+- 危险词层现在能看到真实命令（`looksDeny` 拼入 `toolCmd`），命中危险词的操作会更常转人工
+- 审批记录与提权提示里的「命令」「目标路径」开始出现真实值，而不是回退到从模型说明里抠出来的碎片
+
+### 测试
+
+- `test/pipeline.test.mjs` 新增用例 17（a–e）：生产形态下系统路径写入被硬拒（`kind: 'hard-reject'`，零人工）、无事件入口时同样调用**不会**被硬拒（负向对照，证明缺口真实存在）、legacy `events` 字段仍生效、真实命令进入事件与中文说明、`sessionEvents` 的优先级与异常降级
+- `npm test` 全套通过（zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke）
+
 ## [0.8.3] — 2026-09-24
 
 审批提示永远写清「命令 / 目标路径」，缺失就写明 host 未提供；同时修掉让这两行永远是空的根因。

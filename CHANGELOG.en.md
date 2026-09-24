@@ -4,6 +4,36 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.4] — 2026-09-24
+
+Root-cause fix: the plugin always read `session.events`, a field DSH's `Session` does not have — so structured arguments, the deterministic hard-deny layer, and the user-authorization source were all long dead.
+
+### Problem
+
+- **Wrong API**: `req.agent.session` is DSH's `Session` instance, whose public event accessors are `snapshotEvents()` / `ownEvents()`. `Session.prototype` carries only `id` / `seq` / `header` / `eventAt` / `snapshotEvents` / `ownEvents` / `append` — **no `events`** (confirmed empirically with `Object.getOwnPropertyDescriptors`). Hence `Array.isArray(undefined) === false`
+- **Three casualties**:
+  1. B-layer structured argument resolution (the `tool/call` `file_path` / `command`) never matched — across 485 production approval events, the `command` field was populated 0 times; v0.8.3's "backfill the newest same-name call" was patching this error
+  2. `hardDenyFacts` always received `{}` — the deterministic hard-deny layer's "target of a write/delete lands in a protected location" branch never fired in production (nor did the credential-material branch for outbound arguments)
+  3. `trustedUserMessages(session, 4)` was always empty — the "sole user-authorization source" handed to the judge was blank
+- **Why the tests missed it**: the fixture built a session as `{ events: [...] }`, feeding the plugin exactly the field it believed in and production does not have
+
+### Fixed
+
+- **`src/index.mjs` gains `sessionEvents(session)`**: tries `snapshotEvents()` → `ownEvents()` → an `events` field (kept for other hosts and existing tests); a throwing accessor degrades instead of breaking the approval
+- **The approval handler now uses it**: `toolFiles` / `toolCmd` / hard-deny `callArgs` all read real events, and `trustedUserMessages` was switched internally as well
+- **The test fixture now mirrors production**: `makeReq` defaults to `{ id, header, snapshotEvents() }` (**without** an `events` field), so an "events-field-only" regression turns the whole suite red; a `legacyEventsField` option covers the compatibility branch
+
+### Behaviour changes (visible after a restart)
+
+- Writes into `C:\Windows\...`, `~/.ssh`, a filesystem root and similar protected locations are now **hard-rejected with no dialog** (previously they reached the judge or a human)
+- The dangerous-keyword layer can now see the real command (`looksDeny` is fed `toolCmd`), so keyword hits escalate to a human more often
+- Approval records and escalation prompts start showing real commands and target paths instead of fragments scraped from the model's prose
+
+### Tests
+
+- `test/pipeline.test.mjs` gains case 17 (a–e): under the production session shape a system-path write is hard-rejected (`kind: 'hard-reject'`, zero prompts); with no event source the same call is **not** hard-rejected (negative control proving the gap was real); the legacy `events` field still works; the real command lands in the event and the Chinese explanation; `sessionEvents` priority and error degradation
+- Full `npm test` suite passes (zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke)
+
 ## [0.8.3] — 2026-09-24
 
 Escalation prompts now always state the command and target path — and say so explicitly when the host did not provide them. This also fixes the root cause that kept both lines empty.

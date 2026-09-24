@@ -96,22 +96,24 @@ function makeCtx(opts = {}) {
 }
 
 /** 构造一次 approval/request 请求 */
-function makeReq({ sessionId, toolName, mode = 'danger-full-access', justification, args = {}, callId = 'c1', cwd = WORKSPACE }) {
+function makeReq({ sessionId, toolName, mode = 'danger-full-access', justification, args = {}, callId = 'c1', cwd = WORKSPACE, extraEvents = [], legacyEventsField = false }) {
+  const events = [
+    { type: 'tool/call', data: { callId, name: toolName, arguments: JSON.stringify(args) } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '请完成这个任务' }] } },
+    ...extraEvents,
+  ]
+  // 生产形态：req.agent.session 是 DSH 的 Session 实例 —— 公开入口是 snapshotEvents()，
+  // 没有 `events` 字段（见 src/index.mjs 的 sessionEvents 注释）。默认就按真实形态构造，
+  // 这样“只认 events 字段”的回归会立刻让整套用例变红。
+  const session = legacyEventsField
+    ? { id: sessionId, header: { cwd }, events }
+    : { id: sessionId, header: { cwd }, snapshotEvents: () => events }
   return {
     callId,
     toolName,
     reason: `escalate sandbox to ${mode}: ${justification}`,
     signal: undefined,
-    agent: {
-      session: {
-        id: sessionId,
-        header: { cwd },
-        events: [
-          { type: 'tool/call', data: { callId, arguments: JSON.stringify(args) } },
-          { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '请完成这个任务' }] } },
-        ],
-      },
-    },
+    agent: { session },
   }
 }
 
@@ -671,6 +673,110 @@ function boot(opts) {
     'unparseable arguments are skipped, never thrown')
 
   console.log('  ✓ 说明用命令解析：callId 命中优先，缺失则回溯最近同名调用并标注来源')
+}
+
+// ================= 17. 会话事件来源：Session 只有 snapshotEvents()，没有 events 字段 =================
+// 事故（2026-09-24 反查 DSH 源码 + 生产 events.jsonl）：req.agent.session 是 DSH 的 Session 实例，
+// 公开事件入口是 snapshotEvents()/ownEvents()，**没有 events 字段**（Session.prototype 只有
+// id / seq / header / eventAt / snapshotEvents / ownEvents / append）。插件原实现一律读
+// session.events → Array.isArray(undefined) === false，于是 B 层结构化参数解析在生产上从未命中：
+// 485 条审批事件的 command 字段为 0 条，确定性硬拒层的路径判定也一直拿到空参数。
+// 这里用「生产形态的 session」（只有 snapshotEvents）跑真实裁决，并断言硬拒确实生效。
+{
+  const eventsPath = join(dataDir, 'events.jsonl')
+  const lastEvent = () => {
+    const lines = readFileSync(eventsPath, 'utf8').trim().split('\n')
+    return JSON.parse(lines[lines.length - 1])
+  }
+  const windowsTarget = 'C:\\Windows\\System32\\drivers\\etc\\hosts'
+
+  // 17a. 生产形态（只有 snapshotEvents）→ 参数解析命中 → 系统路径写入被确定性硬拒、不弹窗
+  {
+    boot({ judgeReply: () => { throw new Error('hard deny must not reach the judge') } })
+    const req = makeReq({
+      sessionId: 's-snap-hardreject',
+      toolName: 'write',
+      mode: 'danger-full-access',
+      justification: 'Update the hosts file for local testing.',
+      args: { file_path: windowsTarget },
+      callId: 'snap1',
+    })
+    const { outcome, nextCalls } = await decide(null, req)
+    assert.strictEqual(outcome, 'rejected', 'a resolved system-path write must be hard-rejected')
+    assert.strictEqual(nextCalls, 0, 'hard reject never prompts the human')
+    assert.strictEqual(lastEvent().kind, 'hard-reject', 'the recorded event names the hard-reject path')
+    console.log('  ✓ snapshotEvents 形态：系统路径写入 → 确定性硬拒（不弹窗）')
+  }
+
+  // 17b. 负向控制：两个事件入口都没有 → 参数解析落空 → 同样的调用不再硬拒（证明 17a 是修复带来的）
+  {
+    boot({})
+    const req = makeReq({
+      sessionId: 's-no-events',
+      toolName: 'write',
+      mode: 'danger-full-access',
+      justification: 'Update the hosts file for local testing.',
+      args: { file_path: windowsTarget },
+      callId: 'none1',
+    })
+    req.agent.session = { id: 's-no-events', header: { cwd: WORKSPACE } }
+    const { outcome } = await decide(null, req)
+    assert.strictEqual(outcome, 'allowed-once', 'without any event source the hard-deny layer cannot see the target')
+    assert.notStrictEqual(lastEvent().kind, 'hard-reject', 'and nothing claims a hard-reject happened')
+    console.log('  ✓ 无事件入口（旧行为）：同样的系统路径写入不会被硬拒 —— 正是被修复的缺口')
+  }
+
+  // 17c. 兼容旧形态：仅提供 events 数组仍然生效
+  {
+    boot({ judgeReply: () => { throw new Error('hard deny must not reach the judge') } })
+    const req = makeReq({
+      sessionId: 's-legacy-events',
+      toolName: 'write',
+      mode: 'danger-full-access',
+      justification: 'Update the hosts file for local testing.',
+      args: { file_path: windowsTarget },
+      callId: 'legacy1',
+      legacyEventsField: true,
+    })
+    const { outcome, nextCalls } = await decide(null, req)
+    assert.strictEqual(outcome, 'rejected', 'the legacy events field keeps working')
+    assert.strictEqual(nextCalls, 0, 'still no prompt')
+    console.log('  ✓ legacy events 数组形态仍生效')
+  }
+
+  // 17d. 真实命令进入审批记录与中文说明
+  {
+    boot({})
+    const req = makeReq({
+      sessionId: 's-command',
+      toolName: 'pwsh',
+      mode: 'danger-full-access',
+      justification: 'Check the working tree before committing.',
+      args: { command: 'git status --short' },
+      callId: 'cmd1',
+    })
+    const { outcome } = await decide(null, req)
+    assert.strictEqual(outcome, 'allowed-once', 'a benign command is auto-approved')
+    const ev = lastEvent()
+    assert.strictEqual(ev.command, 'git status --short', 'the real command is recorded on the event')
+    assert.ok(/命令：git status --short/.test(ev.zh || ''), 'and it shows up in the Chinese explanation')
+    console.log('  ✓ 真实命令进入审批记录与中文说明')
+  }
+
+  // 17e. sessionEvents 纯函数：snapshotEvents 优先，ownEvents / events 依次兜底
+  {
+    const { sessionEvents } = mod
+    const evs = [{ type: 'tool/call', data: { callId: 'x' } }]
+    assert.deepStrictEqual(sessionEvents({ snapshotEvents: () => evs, events: [{ type: 'nope' }] }), evs,
+      'snapshotEvents wins over a stray events field')
+    assert.deepStrictEqual(sessionEvents({ ownEvents: () => evs }), evs, 'ownEvents is the second source')
+    assert.deepStrictEqual(sessionEvents({ events: evs }), evs, 'the events field remains the last resort')
+    assert.deepStrictEqual(sessionEvents({ snapshotEvents: () => { throw new Error('boom') }, events: evs }), evs,
+      'a throwing accessor falls through instead of crashing the approval')
+    assert.deepStrictEqual(sessionEvents(null), [], 'no session yields no events')
+    assert.deepStrictEqual(sessionEvents({}), [], 'an event-less session yields no events')
+    console.log('  ✓ sessionEvents：snapshotEvents → ownEvents → events，异常不抛')
+  }
 }
 
 console.log('All pipeline tests passed successfully!')
