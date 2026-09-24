@@ -31,6 +31,32 @@ function effectText(mode, cwd) {
   return known
 }
 
+/** 缺失事实的占位文案：宁可写「未提供」，也不留空让人猜授权范围。 */
+const NOT_PROVIDED = 'host未提供'
+
+/**
+ * 「做什么」行：命令与目标路径永远显式出现（提权请求必须让人看见授权范围与真实目标）。
+ * 缺失时写明 host 未提供；danger-full-access 额外说明它不限定路径，避免被误读成「只授权这条路径」。
+ * @param {object} o - { mode, command, files }
+ * @returns {string[]} 形如 ['命令：…', '目标路径：…']，永不为空
+ */
+function whatLines(o) {
+  const lines = []
+  const cmd = String(o.command == null ? '' : o.command).trim()
+  const cmdLabel = o.commandLabel ? `命令（${o.commandLabel}）` : '命令'
+  lines.push(cmd ? `${cmdLabel}：${clip(cmd, 300)}` : `命令：${NOT_PROVIDED}`)
+  const files = (Array.isArray(o.files) ? o.files : []).filter(Boolean).map(String)
+  if (files.length > 0) {
+    const shown = files.slice(0, 5).join('、')
+    lines.push(`目标路径：${shown}${files.length > 5 ? ` 等 ${files.length} 处` : ''}`)
+  } else if (o.mode === 'danger-full-access') {
+    lines.push(`目标路径：${NOT_PROVIDED}（danger-full-access 不限定路径，本次授权覆盖整机，而非某一条路径）`)
+  } else {
+    lines.push(`目标路径：${NOT_PROVIDED}`)
+  }
+  return lines
+}
+
 /** 截断过长文本，保留可读性。 */
 function clip(text, max) {
   const s = String(text == null ? '' : text).trim()
@@ -51,6 +77,7 @@ function clip(text, max) {
  * @param {string} [input.command] - 本次调用真实命令文本。
  * @param {string[]} [input.files] - 本次调用真实目标路径。
  * @param {string} [input.cwd] - 会话工作区。
+ * @param {string} [input.commandSource] - 命令来源：'lastSameTool' 时标注「回溯最近同名调用」。
  * @returns {string|null} 中文说明，或 null（无需改写）。
  */
 export function buildChineseReason(input) {
@@ -60,23 +87,29 @@ export function buildChineseReason(input) {
   const cmd = o.command == null ? '' : String(o.command).trim()
   const files = (Array.isArray(o.files) ? o.files : []).filter(Boolean).map(String)
   const zhOk = hasCJK(raw)
+  // 命令来自「回溯最近同名调用」时标注来源，避免被当成这次调用的确切参数
+  const commandLabel = o.commandSource === 'lastSameTool' ? '回溯最近同名调用' : ''
 
-  // 原文已是中文：只在需要去掉宿主英文前缀时改写
-  if (zhOk) return mode ? `沙箱提权到 ${mode}：${raw}` : null
+  // 原文已是中文：去掉宿主英文前缀，并把「做什么」行同样补上（命令/目标路径缺失时写明 host 未提供）
+  if (zhOk) {
+    if (!mode) return null
+    return [`沙箱提权到 ${mode}：${raw}`, `做什么：${whatLines({ mode, command: cmd, files, commandLabel }).join('；')}`].join('\n')
+  }
 
   const lines = []
   if (mode) {
     lines.push(`沙箱提权到 ${mode}：${effectText(mode, o.cwd)}`)
+    lines.push(`做什么：${whatLines({ mode, command: cmd, files, commandLabel }).join('；')}`)
   } else {
     lines.push(`工具 ${String(o.toolName || 'unknown')} 的本次调用超出自动放行范围，需要人工判断。`)
+    const what = []
+    if (cmd) what.push(`命令：${clip(cmd, 300)}`)
+    if (files.length > 0) {
+      const shown = files.slice(0, 5).join('、')
+      what.push(`目标路径：${shown}${files.length > 5 ? ` 等 ${files.length} 处` : ''}`)
+    }
+    if (what.length > 0) lines.push(`做什么：${what.join('；')}`)
   }
-  const what = []
-  if (cmd) what.push(`命令：${clip(cmd, 300)}`)
-  if (files.length > 0) {
-    const shown = files.slice(0, 5).join('、')
-    what.push(`目标路径：${shown}${files.length > 5 ? ` 等 ${files.length} 处` : ''}`)
-  }
-  if (what.length > 0) lines.push(`做什么：${what.join('；')}`)
   if (raw) lines.push(`模型说明原文（未翻译）：${raw}`)
   return lines.join('\n')
 }

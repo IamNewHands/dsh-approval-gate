@@ -360,6 +360,37 @@ function resolveToolCallCommand(callId, events) {
   return String(args.command || args.cmd || args.script || args.CommandLine || '').trim()
 }
 
+/**
+ * 审批「说明」用的命令文本：先按 callId 严格命中 tool/call 参数；
+ * 未命中时回溯会话中最近一次同名工具的 tool/call（提权重试的调用记录可能尚未进入
+ * 审批处理器看到的会话事件视图 —— 生产 events.jsonl 里 485 条审批事件中 command 字段为 0，
+ * 说明严格命中在实际调用路径上一直落空）。
+ * 只喂给人看的说明，不参与硬拒 / 规则指纹 / 快照判定，避免错认参数影响安全裁决。
+ * @param {string|null|undefined} callId approval 请求关联的工具调用 ID
+ * @param {string} toolName 工具名（回溯时据此匹配同名调用）
+ * @param {Array} events 会话事件列表（session.events）
+ * @returns {{command: string, source: 'callId'|'lastSameTool'|'none'}}
+ */
+export function resolveDisplayCommand(callId, toolName, events) {
+  const strict = resolveToolCallCommand(callId, events)
+  if (strict) return { command: strict, source: 'callId' }
+  if (!Array.isArray(events) || events.length === 0) return { command: '', source: 'none' }
+  const name = String(toolName || '')
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (!ev || ev.type !== 'tool/call' || !ev.data) continue
+    if (name && String(ev.data.name || '') !== name) continue
+    let parsed = null
+    try {
+      parsed = typeof ev.data.arguments === 'string' ? JSON.parse(ev.data.arguments) : ev.data.arguments
+    } catch { parsed = null }
+    if (!parsed || typeof parsed !== 'object') continue
+    const cmd = String(parsed.command || parsed.cmd || parsed.script || parsed.CommandLine || '').trim()
+    if (cmd) return { command: cmd, source: 'lastSameTool' }
+  }
+  return { command: '', source: 'none' }
+}
+
 function resolveToolCallFiles(callId, events) {
   const args = resolveToolCallArgs(callId, events)
   if (!args || typeof args !== 'object') return null
@@ -2017,6 +2048,8 @@ export default {
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, session.events)
         const toolCmd = resolveToolCallCommand(req.callId, session.events)
+        // 说明用命令：严格命中落空时回溯最近同名调用（只影响给人看的说明，不影响安全裁决）
+        const displayCmd = resolveDisplayCommand(req.callId, toolName, session.events)
         // command 一并落进事件：命令类工具没有 file_path，追认/沉淀规则的指纹需要它
         const filesOpt = Object.assign(
           toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
@@ -2028,7 +2061,8 @@ export default {
           toolName,
           mode,
           justification,
-          command: toolCmd,
+          command: toolCmd || displayCmd.command,
+          commandSource: toolCmd ? 'callId' : displayCmd.source,
           files: toolFiles,
           cwd: sessionCwd
         })

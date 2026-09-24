@@ -630,4 +630,47 @@ function boot(opts) {
   console.log('  ✓ 候选链纯函数：去重 / 丢空值 / 保序')
 }
 
+// ================= 16. 说明用命令解析：严格命中失败时回溯最近同名调用 =================
+// 生产事实（2026-09-24 核对 $DSH_HOME/auto-approve/events.jsonl）：485 条审批事件中
+// command 字段为 0 条，说明按 callId 严格命中在真实调用路径上一直落空 —— 审批提示因此
+// 从来没显示过真实命令。这里验证兜底回溯只影响「给人看的说明」，且来源被标注。
+{
+  const { resolveDisplayCommand } = mod
+  const callA = { type: 'tool/call', data: { callId: 'cA', name: 'pwsh', arguments: JSON.stringify({ command: 'git status' }) } }
+  const callB = { type: 'tool/call', data: { callId: 'cB', name: 'pwsh', arguments: JSON.stringify({ command: 'git push origin main' }) } }
+  const callEdit = { type: 'tool/call', data: { callId: 'cE', name: 'edit', arguments: JSON.stringify({ file_path: 'D:\\ws\\a.md' }) } }
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand('cB', 'pwsh', [callA, callB]),
+    { command: 'git push origin main', source: 'callId' },
+    'a matching callId wins')
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand('missing', 'pwsh', [callA, callB, callEdit]),
+    { command: 'git push origin main', source: 'lastSameTool' },
+    'a miss falls back to the newest same-name call, ignoring other tools')
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand('missing', 'edit', [callA, callB, callEdit]),
+    { command: '', source: 'none' },
+    'edit carries no command — the fallback must not invent one')
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand(undefined, 'pwsh', [callA, callB]),
+    { command: 'git push origin main', source: 'lastSameTool' },
+    'no callId at all still resolves through the backfill')
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand('missing', 'pwsh', []),
+    { command: '', source: 'none' },
+    'empty event list yields no command')
+
+  assert.deepStrictEqual(
+    resolveDisplayCommand('missing', 'pwsh', [{ type: 'tool/call', data: { callId: 'x', name: 'pwsh', arguments: '{bad json' } }]),
+    { command: '', source: 'none' },
+    'unparseable arguments are skipped, never thrown')
+
+  console.log('  ✓ 说明用命令解析：callId 命中优先，缺失则回溯最近同名调用并标注来源')
+}
+
 console.log('All pipeline tests passed successfully!')

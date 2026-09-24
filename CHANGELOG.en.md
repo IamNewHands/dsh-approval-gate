@@ -4,6 +4,29 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.3] — 2026-09-24
+
+Escalation prompts now always state the command and target path — and say so explicitly when the host did not provide them. This also fixes the root cause that kept both lines empty.
+
+### Problem
+
+- **The escalation prompt carried no command and no target path**: the approver saw only the sandbox-mode consequences plus the model's raw justification, with no way to tell what the escalation would run or touch. User's words: "这会话中的提权为什么没写具体路径 是全电脑的路径吗"
+- **Root cause: the structured arguments never resolved**: the displayed command came from a strict `callId` match against the session's `tool/call` event, yet in production `$DSH_HOME/auto-approve/events.jsonl` **all 485 approval events had an empty `command` field** — that lookup has never matched on the real call path (session logs show `tool/call` and `approval/asked` adjacent with identical callIds, so the event view the approval handler sees disagrees with the persisted order)
+- **The Chinese-justification branch was worse**: when `justification` was already Chinese, the explanation only localized the `沙箱提权到 <mode>：` prefix and dropped command and target path entirely
+
+### Fixed
+
+- **`src/zh.mjs`: escalation explanations now always emit a "what it does" line**, writing `host未提供` when the command or target path is missing; `danger-full-access` adds "does not restrict paths — this grant covers the whole machine, not one path" so it is not misread as a scoped grant; `workspace-write` makes no machine-wide claim
+- **The Chinese branch carries the same line** instead of only localizing the prefix
+- **`src/index.mjs`: new `resolveDisplayCommand`** — when the strict match misses, it falls back to the most recent same-name `tool/call` in the session for the real command and labels it "命令（回溯最近同名调用）", never pretending it is this call's exact argument
+- **The fallback affects display only**: hard denies, hard facts, the allowlist, rule fingerprints and diff snapshots still use strictly matched arguments, so a misattributed argument cannot sway a safety decision
+
+### Tests
+
+- `test/zh.test.mjs` gains four assertions: both lines must be present when facts are missing (plus the machine-wide note), `workspace-write` must not claim machine-wide access, a backfilled command must be labelled, and the Chinese branch must list command and target path
+- `test/pipeline.test.mjs` gains case 16: `callId` hit wins, a miss backfills from the newest same-name call (ignoring other tools), `edit` never invents a command, a missing `callId` still backfills, and empty event lists or malformed JSON never throw
+- Full `npm test` suite passes (zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke)
+
 ## [0.8.2] — 2026-09-22
 
 Fixes "auto-learning has no effect": the confirmation counter was long past the threshold, yet every escalation still prompted a human.
