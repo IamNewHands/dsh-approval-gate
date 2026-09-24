@@ -35,16 +35,32 @@ function effectText(mode, cwd) {
 const NOT_PROVIDED = 'host未提供'
 
 /**
- * 「做什么」行：命令与目标路径永远显式出现（提权请求必须让人看见授权范围与真实目标）。
+ * 带命令语义的工具：只有这些工具缺命令时才写「命令：host未提供」。
+ * write / edit 这类工具根本没有命令字段，硬写一行「host未提供」只是噪音。
+ */
+const COMMAND_TOOLS = new Set([
+  'pwsh', 'powershell', 'cmd', 'bash', 'sh', 'zsh', 'exec', 'run', 'shell',
+  'terminal', 'python', 'python3', 'node', 'deno', 'bun', 'curl', 'wget', 'ssh', 'scp'
+])
+
+function isCommandTool(toolName) {
+  const name = String(toolName || '').trim().toLowerCase()
+  return COMMAND_TOOLS.has(name) || /(?:^|[-_])(?:bash|sh|shell|exec|run|cmd|terminal)$/.test(name)
+}
+
+/**
+ * 「做什么」行：目标路径永远显式出现；命令在有命令语义或确有命令时出现。
  * 缺失时写明 host 未提供；danger-full-access 额外说明它不限定路径，避免被误读成「只授权这条路径」。
- * @param {object} o - { mode, command, files }
- * @returns {string[]} 形如 ['命令：…', '目标路径：…']，永不为空
+ * @param {object} o - { mode, command, files, commandLabel, toolName }
+ * @returns {string[]} 形如 ['命令：…', '目标路径：…']，至少一行
  */
 function whatLines(o) {
   const lines = []
   const cmd = String(o.command == null ? '' : o.command).trim()
   const cmdLabel = o.commandLabel ? `命令（${o.commandLabel}）` : '命令'
-  lines.push(cmd ? `${cmdLabel}：${clip(cmd, 300)}` : `命令：${NOT_PROVIDED}`)
+  // 命令行为空且工具没有命令语义（write/edit 等）→ 整行略去，只留目标路径
+  if (cmd) lines.push(`${cmdLabel}：${clip(cmd, 300)}`)
+  else if (isCommandTool(o.toolName)) lines.push(`命令：${NOT_PROVIDED}`)
   const files = (Array.isArray(o.files) ? o.files : []).filter(Boolean).map(String)
   if (files.length > 0) {
     const shown = files.slice(0, 5).join('、')
@@ -93,13 +109,13 @@ export function buildChineseReason(input) {
   // 原文已是中文：去掉宿主英文前缀，并把「做什么」行同样补上（命令/目标路径缺失时写明 host 未提供）
   if (zhOk) {
     if (!mode) return null
-    return [`沙箱提权到 ${mode}：${raw}`, `做什么：${whatLines({ mode, command: cmd, files, commandLabel }).join('；')}`].join('\n')
+    return [`沙箱提权到 ${mode}：${raw}`, `做什么：${whatLines({ mode, command: cmd, files, commandLabel, toolName: o.toolName }).join('；')}`].join('\n')
   }
 
   const lines = []
   if (mode) {
     lines.push(`沙箱提权到 ${mode}：${effectText(mode, o.cwd)}`)
-    lines.push(`做什么：${whatLines({ mode, command: cmd, files, commandLabel }).join('；')}`)
+    lines.push(`做什么：${whatLines({ mode, command: cmd, files, commandLabel, toolName: o.toolName }).join('；')}`)
   } else {
     lines.push(`工具 ${String(o.toolName || 'unknown')} 的本次调用超出自动放行范围，需要人工判断。`)
     const what = []

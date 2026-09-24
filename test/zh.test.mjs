@@ -57,6 +57,31 @@ const backfilled = buildChineseReason({
 assert.match(backfilled, /命令（回溯最近同名调用）：git -C D:\\repo push origin main/)
 ok('回溯命令 → 标注来源')
 
+// 2e. 无命令语义的工具（write/edit）：不写「命令：host未提供」这行噪音，只留目标路径
+const writeZh = buildChineseReason({
+  toolName: 'write',
+  mode: 'danger-full-access',
+  justification: 'Write the probe file outside the workspace.',
+  files: ['C:\\Users\\mashi\\Documents\\probe.txt']
+})
+assert.ok(!/命令/.test(writeZh), 'a write tool must not carry a command line at all')
+assert.match(writeZh, /做什么：目标路径：C:\\Users\\mashi\\Documents\\probe\.txt/)
+ok('write 提权 → 无命令行，仅目标路径')
+
+// 2f. 无命令语义的工具也没有路径：目标路径仍须写明，并做整机授权声明
+const writeNoPath = buildChineseReason({ toolName: 'edit', mode: 'danger-full-access', justification: 'Edit something.' })
+assert.ok(!/命令/.test(writeNoPath), 'edit carries no command line either')
+assert.match(writeNoPath, /目标路径：host未提供（danger-full-access 不限定路径/)
+ok('edit 提权缺路径 → 只有目标路径行')
+
+// 2g. 命令类工具名识别：带命名空间的变体算命令类，write/edit 类不算
+assert.match(
+  buildChineseReason({ toolName: 'terminal-bash', mode: 'danger-full-access', justification: 'Run it.' }),
+  /命令：host未提供/)
+assert.ok(!/命令/.test(buildChineseReason({ toolName: 'write_file', mode: 'danger-full-access', justification: 'Run it.' })),
+  'a write-flavoured tool name must not be mistaken for a command tool')
+ok('命令类工具名识别：terminal-bash 算，write_file 不算')
+
 // 3. 已是中文 + 提权模式：去掉宿主英文前缀，并补上「做什么」行
 const zh = buildChineseReason({ toolName: 'pwsh', mode: 'workspace-write', justification: '读取工作区内的报告文件。', cwd: 'D:\\GitHub_Clone' })
 assert.equal(zh, '沙箱提权到 workspace-write：读取工作区内的报告文件。\n做什么：命令：host未提供；目标路径：host未提供')

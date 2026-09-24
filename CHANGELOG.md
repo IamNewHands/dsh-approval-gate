@@ -4,6 +4,24 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.8.5] — 2026-09-24
+
+提权说明去掉噪音：`write` / `edit` 这类没有命令字段的工具不再写「命令：host未提供」这一行。
+
+### 问题
+
+- v0.8.3 让「命令」行无条件出现，于是文件类工具的审批卡上多出一行永远为 `host未提供` 的噪音 —— 0.8.4 重启后的实测（写入 `C:\Users\shiro\Documents\dsh-approval-gate-probe.txt`）看到的就是 `做什么：命令：host未提供；目标路径：<真实路径>`，命令那半句纯属干扰
+
+### 修复
+
+- **`src/zh.mjs`：命令类工具才输出命令行**。`COMMAND_TOOLS` 覆盖 `pwsh` / `powershell` / `cmd` / `bash` / `sh` / `zsh` / `exec` / `run` / `shell` / `terminal` / `python` / `node` / `deno` / `bun` / `curl` / `wget` / `ssh` / `scp`，并识别 `terminal-bash` 这类带前后缀的变体；`write` / `edit` / `write_file` 等文件类工具即使没有命令也不再出现命令行
+- **目标路径行不变**：有真实路径就列出（最多 5 条），没有就写明 `host未提供`，`danger-full-access` 仍追加「不限定路径，本次授权覆盖整机」
+
+### 测试
+
+- `test/zh.test.mjs` 新增 3 组断言：`write` 提权全文不含「命令」只留目标路径、`edit` 缺路径时只有目标路径行且带整机声明、`terminal-bash` 算命令类而 `write_file` 不算
+- `npm test` 全套通过（zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke）
+
 ## [0.8.4] — 2026-09-24
 
 根因修复：插件一直读 `session.events`，而 DSH 的 `Session` 根本没有这个字段 —— 结构化参数、确定性硬拒层、用户授权来源三处因此长期失效。

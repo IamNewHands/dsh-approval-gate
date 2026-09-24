@@ -4,6 +4,24 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.8.5] — 2026-09-24
+
+Escalation explanations lose the noise: `write` / `edit` and other tools with no command field no longer print a "command: host未提供" line.
+
+### Problem
+
+- v0.8.3 emitted the command line unconditionally, so file-tool approval cards carried a line that could only ever read `host未提供` — the post-0.8.4 restart check (writing `C:\Users\shiro\Documents\dsh-approval-gate-probe.txt`) showed `做什么：命令：host未提供；目标路径：<real path>`, where the command half was pure noise
+
+### Fixed
+
+- **`src/zh.mjs`: only command-flavoured tools emit a command line.** `COMMAND_TOOLS` covers `pwsh` / `powershell` / `cmd` / `bash` / `sh` / `zsh` / `exec` / `run` / `shell` / `terminal` / `python` / `node` / `deno` / `bun` / `curl` / `wget` / `ssh` / `scp`, and recognises prefixed/suffixed variants such as `terminal-bash`; `write` / `edit` / `write_file` never show a command line, even when none was supplied
+- **The target-path line is unchanged**: real paths are listed (up to five), otherwise it reads `host未提供`, and `danger-full-access` still adds "does not restrict paths — this grant covers the whole machine"
+
+### Tests
+
+- `test/zh.test.mjs` gains three assertions: a `write` escalation contains no "命令" text at all and only the target-path line, an `edit` escalation missing its path still shows the target-path line with the machine-wide note, and `terminal-bash` counts as a command tool while `write_file` does not
+- Full `npm test` suite passes (zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke)
+
 ## [0.8.4] — 2026-09-24
 
 Root-cause fix: the plugin always read `session.events`, a field DSH's `Session` does not have — so structured arguments, the deterministic hard-deny layer, and the user-authorization source were all long dead.
