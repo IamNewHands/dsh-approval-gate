@@ -4,6 +4,42 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.0] — 2026-09-24
+
+审批说明从「一段散文」改成**结构化字段表**：操作类型 / 操作路径 / 影响范围 / 执行命令 / 模型说明。
+
+### 问题
+
+- 说明是一整段散文（`沙箱提权到 danger-full-access：…。做什么：命令：…；目标路径：…`），审批人要读完才知道「这是删除还是新增、动的是哪个路径、影响多大」——用户原话：写得啰嗦、不够精炼、显示样式不直观
+- 更根本的是：事件里只有 `zh` 一段文本，前端没有任何可结构化渲染的字段，想在界面上做成表格也无从下手
+
+### 变更
+
+- **`src/zh.mjs` 新增 `describeFacts()`**：把工具名 + 真实命令 + 真实目标路径 + 沙箱模式归成可直接展示的字段。操作类型做命令级判定：`rm` / `Remove-Item` / `format` / `git reset --hard` / `drop table` → **删除**；`git … push`（含 `git -c key=value push`）/ `gh release` / `npm publish` / `scp` / `curl` → **推送/发布**；`write` → **新增/写入**；`edit` → **修改**；`read` → **读取**；其余按工具语义归为执行命令/检索/调用。删除与发布同现时以删除为准（不可逆优先）
+- **`describeFacts()` 同时给出影响范围**：`danger-full-access` → 整机（工作区外任意路径可读写，含系统位置；改动不可自动回滚）、`workspace-write` → 工作区（仅工作区内可写，工作区外仍被拒绝）、`read-only` → 只读、未提权 → 沙箱模式不变
+- **`buildChineseReason()` 改为按字段分行**：`操作：…` / `路径：…` / `影响：…` / `命令：…` / `原因：…`。删掉「沙箱提权到 X：…」前缀（模式已在「影响」行交代）与「做什么：…」散句；回溯命令仍标注「命令（回溯最近同名调用）：…」；命令类工具缺命令仍写 `命令：host未提供`
+- **`src/index.mjs`：事件落 `facts` 字段**（`compactFacts()` 白名单 + 逐项截断 + 路径上限 8 条），自动放行与人工审批事件都带，供前端表格渲染
+- **`client.js`：审批记录行内渲染字段表格**（真正的 `<table>`，字段列 72px + 值列；删除红、新增绿、修改蓝、推送发布琥珀；路径与命令等宽字体、可换行）；顶部提示条用一行摘要（`删除 · a.txt 等 3 处 · 整机`），facts 摘要 → `zh` → 原文依次回退
+- **`client.js`：顶部「审批」tab 显示本会话记录条数**（`审批 (12)`）。宿主把 `conversation.view` 的 `label` 经 `resolveSlotLabel()` 的结果**当字符串**渲染，且只在「slot 变更 / locale 发布」时重算 tab 列表（`label` thunk 的既有语义就是「跟着 locale 走」），因此实现为：一个读模块级计数的 label thunk + 条数真变化时发布一次 locale（注册一次性 namespace，用完即撤）触发重算。口径 = 视图真正列出的行数（`manual-pending` 只活在提示条里，不计入），避免「tab 说 5 条、列表只有 4 行」；没有 locale 服务时自动退回静态「审批」，条数照旧在视图内展示
+- **事件 API 给老事件补 `facts`**：盘上缺 `facts` 的事件（v0.9.0 之前落的盘）在响应里按**已记录的事实**（tool / mode / files / command / justification）现算一份，让整段历史也能渲染字段表格。**不回写文件**——事件日志保留当初写下的事实
+
+### 未做（有意）
+
+- **宿主审批卡不做 HTML 表格**：宿主 `dsh-client-ui-approval` 把 `reason` 当**纯文本**塞进一个 `<div>`（既非 Markdown 也不解析 HTML，且无 `white-space:pre-wrap`），插件只能改那段字符串本身。靠注入 CSS 去改写宿主 DOM 能做到伪表格，但依赖宿主内部类名/属性，DSH 升级即失效 —— 因此宿主卡保持纯文本（但已是字段分行），表格落在本插件自己的审查视图里
+
+### 兼容
+
+- 老事件没有 `facts` → 前端继续按 `zh` / `justification` 文本渲染，不会空白
+- `zh` 字段保留（宿主卡正文与提示条仍需纯文本），`facts` 是新增字段，旧客户端忽略它即可
+
+### 测试
+
+- `test/zh.test.mjs` 重写为 16 组断言：操作类型六分（含 `git -c … push` 与删除优先）、影响范围五档、回溯命令标注、`compactFacts` 白名单/路径上限/未知键丢弃、宿主卡五字段行序、真实事故样本（整机 + 无路径 + 长命令 → `操作：推送/发布`）
+- `test/client-render-smoke.test.mjs`：`inspect()` 支持展开函数组件，新增「结构化事实 → 字段表格」用例（五个字段名、真实路径、整机、原样命令、`ag-facts-v-del` 配色）、「无 `facts` 的老事件仍回退文本」、以及「顶部 tab 条数」（label 是 thunk、提示条一挂载就把条数推上去、`manual-pending` 不计入）
+- `test/pipeline.test.mjs`：17d 断言事件同时落 `command`、`zh` 与 `facts.action`/`facts.scopeShort`
+- `test/reconsider.test.mjs`：事件 API 断言老事件（盘上无 `facts`）在响应里补出 `facts`（操作类型/影响范围/路径），且**文件里不写回**
+- `npm test` 全套通过（zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke）
+
 ## [0.8.5] — 2026-09-24
 
 提权说明去掉噪音：`write` / `edit` 这类没有命令字段的工具不再写「命令：host未提供」这一行。

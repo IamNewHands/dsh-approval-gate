@@ -232,12 +232,12 @@ async function renderSettled(booted, Component, props) {
   return renderSlot(booted, Component, props)
 }
 
-/** 递归收集元素树里的文本、class 与按钮 */
-function inspect(node, out) {
+/** 递归收集元素树里的文本、class 与按钮；传 renderer 时继续展开函数组件（如字段表格）。 */
+function inspect(node, out, renderer) {
   out = out || { text: '', classes: [], buttons: [] }
   if (node === null || node === undefined || node === false) return out
   if (typeof node === 'string' || typeof node === 'number') { out.text += String(node) + ' '; return out }
-  if (Array.isArray(node)) { for (const n of node) inspect(n, out); return out }
+  if (Array.isArray(node)) { for (const n of node) inspect(n, out, renderer); return out }
   const cls = node.props && node.props.className
   if (typeof cls === 'string' && cls) out.classes.push(cls)
   if (node.type === 'button') {
@@ -248,7 +248,8 @@ function inspect(node, out) {
       onClick: node.props.onClick,
     })
   }
-  if (node.props && node.props.children !== undefined) inspect(node.props.children, out)
+  if (node.props && node.props.children !== undefined) inspect(node.props.children, out, renderer)
+  if (renderer && typeof node.type === 'function') inspect(renderer(node.type, node.props), out, renderer)
   return out
 }
 
@@ -470,6 +471,64 @@ function inspect(node, out) {
   assert.ok(info.text.indexOf('编辑 Merge.yaml') >= 0,
     'a recorded event without zh still falls back to the original justification (old records must not go blank)')
   console.log('  ✓ 审批记录行：zh 优先，缺 zh 时回退 justification 原文')
+}
+
+// ================= 7c. 结构化事实 → 字段表格（一眼看清改什么、动哪里、影响多大） =================
+{
+  // 一段散文里看不出「这是删除还是新增、动的是哪里、影响多大」。host 侧把结构化事实落进
+  // 事件的 facts 字段，行内渲染成字段表格：操作类型 / 操作路径 / 影响范围 / 执行命令 / 模型说明。
+  const env = createEnv([
+    {
+      id: 84, kind: 'auto', tool: 'pwsh', mode: 'danger-full-access', ts: '2026-09-24T14:01:03.000Z',
+      verdict: 'rule', justification: '清理临时文件', files: ['C:\\temp\\a.txt'], category: 'deletion',
+      facts: {
+        tool: 'pwsh', action: '删除', actionKey: 'delete', mode: 'danger-full-access',
+        scopeShort: '整机', scopeDetail: '工作区外任意路径可读写，含系统位置；改动不可自动回滚',
+        paths: ['C:\\temp\\a.txt'], command: 'Remove-Item C:\\temp\\a.txt', reason: '清理临时文件',
+      },
+    },
+    // 老事件（无 facts）：必须继续走文本回退，不能整行空白
+    { id: 85, kind: 'auto', tool: 'pwsh', ts: '2026-09-24T14:02:00.000Z', verdict: 'rule', justification: 'git status', files: [] },
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's12' })
+  const info = inspect(tree, null, booted.React.render.bind(booted.React))
+  for (const label of ['操作类型', '操作路径', '影响范围', '执行命令', '模型说明']) {
+    assert.ok(info.text.includes(label), 'the facts table renders the 「' + label + '」 field')
+  }
+  assert.ok(info.text.includes('删除'), 'the operation type is the deletion, not a generic "call"')
+  assert.ok(info.text.includes('C:\\temp\\a.txt'), 'the concrete target path is shown')
+  assert.ok(info.text.includes('整机'), 'the blast radius is shown')
+  assert.ok(info.text.includes('Remove-Item C:\\temp\\a.txt'), 'the real command is shown verbatim')
+  assert.ok(info.classes.some((c) => c.indexOf('ag-facts') >= 0), 'the field table is actually rendered as a table')
+  assert.ok(info.classes.some((c) => c.indexOf('ag-facts-v-del') >= 0), 'a deletion is colour-coded as a deletion')
+  assert.ok(info.text.includes('git status'), 'an event without facts still falls back to plain text')
+  console.log('  ✓ 结构化事实 → 字段表格（操作类型/路径/影响范围/命令/说明），无 facts 的老事件仍回退文本')
+}
+
+// ================= 7d. 顶部「审批」tab 的条数 =================
+{
+  // 宿主把 conversation.view 的 label 当字符串渲染，因此条数只能靠 label thunk +
+  // locale 发布通道刷新。这里断言：提示条一挂载（用户还没打开 tab）就把条数推上去了，
+  // 且 manual-pending（只活在提示条里）不计入——tab 数字必须等于打开后看到的行数。
+  const env = createEnv([
+    { id: 91, kind: 'auto', tool: 'pwsh', ts: '2026-09-24T15:00:00.000Z', verdict: 'rule', justification: 'git status', files: [] },
+    { id: 92, kind: 'manual-approved', tool: 'write', ts: '2026-09-24T15:01:00.000Z', verdict: 'manual-approved', justification: '写入报告', files: [] },
+    { id: 93, kind: 'manual-pending', tool: 'pwsh', ts: '2026-09-24T15:02:00.000Z', verdict: 'manual-pending', justification: '等待人工', files: [] },
+  ])
+  const booted = boot(env)
+  const historyEntry = booted.registrations.find((r) => r.options.id === 'dsh-approval-gate.history')
+  assert.ok(historyEntry, 'the approval view tab is registered')
+  assert.strictEqual(typeof historyEntry.options.label, 'function',
+    'the tab label is a thunk so the count can change without re-registering')
+  assert.strictEqual(historyEntry.options.label(), '审批', 'no records counted yet → the plain label')
+
+  const Notice = booted.component('dsh-approval-gate.notice')
+  await renderSettled(booted, Notice, { sessionId: 's13' })
+  assert.strictEqual(historyEntry.options.label(), '审批 (2)',
+    'the notice strip alone publishes the count (2 recorded rows, the pending one only lives in the strip)')
+  console.log('  ✓ 顶部「审批」tab：label thunk 带本会话记录条数（pending 不计入）')
 }
 
 console.log('All client render smoke tests passed successfully!')

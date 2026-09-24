@@ -760,7 +760,10 @@ function boot(opts) {
     const ev = lastEvent()
     assert.strictEqual(ev.command, 'git status --short', 'the real command is recorded on the event')
     assert.ok(/命令：git status --short/.test(ev.zh || ''), 'and it shows up in the Chinese explanation')
-    console.log('  ✓ 真实命令进入审批记录与中文说明')
+    assert.ok(ev.facts && ev.facts.action === '执行命令',
+      'structured facts ride along for the field table (操作类型/路径/影响范围/命令)')
+    assert.strictEqual(ev.facts.scopeShort, '整机', 'the blast radius is part of the recorded facts')
+    console.log('  ✓ 真实命令进入审批记录与中文说明（并落结构化 facts）')
   }
 
   // 17e. sessionEvents 纯函数：snapshotEvents 优先，ownEvents / events 依次兜底

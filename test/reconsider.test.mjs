@@ -200,7 +200,17 @@ const ruleCount = () => JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).allowRules
   // 生效硬类别必须随事件一起下发：前端据此决定追认按钮显隐，硬编码会与服务端围栏不一致
   assert.deepStrictEqual(res.payload.hardCategories, ['deletion', 'credential', 'remote', 'system', 'bulk'],
     'the events API ships the effective hardCategories so the UI cannot disagree with the server fence')
-  console.log('  ✓ 事件 API：原事件标注 reconsidered，追认记录被过滤，并下发生效 hardCategories')
+  // 老事件（盘上没有 facts）由 API 按已记录事实**现算**一份，让整段历史也能渲染字段表格；
+  // 文件不回写：事件日志必须保留当初写下的事实。
+  const derived = events.find((e) => e.id === 1)
+  assert.ok(derived.facts, 'an event recorded before facts existed still gets them from the API')
+  assert.strictEqual(derived.facts.action, '修改', 'the derived operation type follows the recorded tool')
+  assert.strictEqual(derived.facts.scopeShort, '整机', 'the derived blast radius follows the recorded mode')
+  assert.deepStrictEqual(derived.facts.paths, ['Merge.yaml'], 'the derived paths follow the recorded files')
+  const onDisk = readFileSync(EVENTS_PATH, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.strictEqual(onDisk.find((e) => e.id === 1).facts, undefined,
+    'the derivation is response-only — the event log keeps exactly what was recorded')
+  console.log('  ✓ 事件 API：原事件标注 reconsidered，追认记录被过滤，并下发生效 hardCategories + 老事件补 facts')
 }
 
 // ================= 6. 重复追认幂等（不重复写规则） =================

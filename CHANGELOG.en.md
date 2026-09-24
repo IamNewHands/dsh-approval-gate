@@ -4,6 +4,42 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.0] — 2026-09-24
+
+Approval explanations turn from one prose blob into a **structured field table**: operation type / target path / blast radius / command / model note.
+
+### Problem
+
+- The explanation was a single paragraph (`沙箱提权到 danger-full-access：…。做什么：命令：…；目标路径：…`), so the approver had to read the whole thing to learn whether this was a deletion or a write, which path it touched, and how far it reached — in the user's words: verbose, not concise, hard to scan
+- More fundamentally, an event carried only the `zh` string; the client had no structured fields to render as a table even if it wanted to
+
+### Changed
+
+- **`src/zh.mjs` gains `describeFacts()`**: tool name + real command + real target paths + sandbox mode become display-ready fields. The operation type is decided at command level: `rm` / `Remove-Item` / `format` / `git reset --hard` / `drop table` → **删除 (deletion)**; `git … push` (including `git -c key=value push`) / `gh release` / `npm publish` / `scp` / `curl` → **推送/发布 (remote push/publish)**; `write` → **新增/写入**; `edit` → **修改**; `read` → **读取**; otherwise execution/search/call by tool semantics. A deletion outranks a remote write in the same command (irreversible first)
+- **The same function states the blast radius**: `danger-full-access` → the whole machine (any path outside the workspace is writable, including system locations; changes cannot be auto-reverted), `workspace-write` → the workspace (writes outside it are still refused), `read-only` → read-only, no escalation → sandbox mode unchanged
+- **`buildChineseReason()` now emits one field per line**: `操作：…` / `路径：…` / `影响：…` / `命令：…` / `原因：…`. The `沙箱提权到 X：…` prefix is gone (the mode is stated in the impact line) along with the `做什么：…` run-on sentence; a backfilled command still reads `命令（回溯最近同名调用）：…`, and a command tool with no command still prints `命令：host未提供`
+- **`src/index.mjs` records a `facts` field on events** (`compactFacts()`: whitelisted keys, per-field clipping, at most eight paths) for both auto-allowed and manual-approval events, so the client can render the table
+- **`client.js` renders a real field `<table>` inside each approval record** (72px label column; deletion red, write green, edit blue, remote amber; paths and commands in the code font and wrapping), and the top notice strip shows a one-line summary (`删除 · a.txt 等 3 处 · 整机`) with facts summary → `zh` → original text as fallbacks
+- **`client.js` shows the session's record count on the top "审批" tab** (`审批 (12)`). The host renders the `conversation.view` `label` through `resolveSlotLabel()` as a **string** and only recomputes the tab list on slot mutations or locale publishes (a `label` thunk is by design resolved "following the active locale"), so the count rides a thunk reading a module-level counter plus one locale publish whenever the count actually changes (a throwaway namespace, disposed right after). The count equals the rows the view actually lists (`manual-pending` lives only in the notice strip and is excluded), so the tab can never say 5 while the list shows 4. Without a locale service the label falls back to a plain "审批" and the count stays in the view
+- **The events API backfills `facts` for older events**: an event with no `facts` on disk (recorded before v0.9.0) gets them derived in the response from what was recorded (tool / mode / files / command / justification), so the whole history renders as a field table. **Nothing is written back** — the event log keeps exactly what was recorded
+
+### Deliberately not done
+
+- **No HTML table in the host approval card**: the host package `dsh-client-ui-approval` renders `reason` as **plain text** inside a `<div>` (no Markdown, no HTML, and no `white-space:pre-wrap`), so a plugin can only change that string. Injecting CSS to restyle the host DOM would produce a pseudo-table, but it depends on host internal class names and attributes and breaks on any DSH upgrade — so the host card stays plain text (now field-per-line) and the table lives in this plugin's own review view
+
+### Compatibility
+
+- Events without `facts` keep rendering from `zh` / `justification` text, never blank
+- `zh` is retained (the host card and notice strip still need plain text); `facts` is additive, and older clients simply ignore it
+
+### Tests
+
+- `test/zh.test.mjs` rewritten to 16 assertions: six-way operation typing (including `git -c … push` and deletion precedence), five blast-radius tiers, backfilled-command labelling, `compactFacts` whitelist/path cap/unknown-key dropping, the host card's five-line field order, and a real incident sample (whole machine + no path + long command → `操作：推送/发布`)
+- `test/client-render-smoke.test.mjs`: `inspect()` can now expand function components; a new "structured facts → field table" case asserts the five field names, the real path, the machine-wide scope, the verbatim command and the `ag-facts-v-del` colouring, plus text fallback for old events without `facts`, and a "tab count" case (the label is a thunk, mounting the notice strip alone publishes the count, `manual-pending` is excluded)
+- `test/pipeline.test.mjs`: case 17d now asserts the event carries `command`, `zh` and `facts.action`/`facts.scopeShort`
+- `test/reconsider.test.mjs`: the events API test asserts an older event (no `facts` on disk) receives derived `facts` (operation type / blast radius / paths) in the response and that **nothing is written back to the file**
+- Full `npm test` suite passes (zh / unit / seed-sync / absorbed / pipeline / reconsider / reconsider-match / client-render-smoke)
+
 ## [0.8.5] — 2026-09-24
 
 Escalation explanations lose the noise: `write` / `edit` and other tools with no command field no longer print a "command: host未提供" line.

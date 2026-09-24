@@ -39,7 +39,7 @@ import { sanitizeClassifierText, sanitizeClassifierArguments } from './sanitize.
 import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential } from './paths.mjs'
 import { parseClassifierText, buildClassifierPayload, CLASSIFIER_SYSTEM_PROMPT } from './classifier.mjs'
 // 审批说明中文化：面向审批人的说明一律中文（命令/路径原样保留）
-import { buildChineseReason } from './zh.mjs'
+import { buildChineseReason, describeFacts, compactFacts } from './zh.mjs'
 
 const NAME = 'dsh-approval-gate'
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -487,6 +487,10 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   // zh：给人看的中文说明（原文是英文时由 zh.mjs 生成）。审查界面优先渲染它，
   // justification/reason 仍保留原文，审计记录不失真。
   if (o.zh) ev.zh = String(o.zh).slice(0, 800)
+  // facts：结构化审批事实（操作类型 / 路径 / 影响范围 / 命令 / 模型原文）。
+  // 审查界面据此渲染字段表格——一段散文里看不出「这是删除还是新增、动的是哪里」。
+  const facts = compactFacts(o.facts)
+  if (facts) ev.facts = facts
   if (o.kind) ev.kind = o.kind
   if (o.learningCount !== undefined) ev.learningCount = o.learningCount
   if (o.threshold !== undefined) ev.threshold = o.threshold
@@ -1410,6 +1414,18 @@ export default {
                 const copy = Object.assign({}, ev)
                 // reconsidered：本事件是否已被用户追认（前端据此撤销待处理角标）
                 if (reconsidered.has(ev.id)) copy.reconsidered = true
+                // 老事件没有 facts（v0.9.0 之前落的盘）：按已记录的事实现算一份，
+                // 让整段历史也能渲染字段表格。**不回写文件**——事件日志保留当初写下的事实。
+                if (!copy.facts) {
+                  const derived = compactFacts(describeFacts({
+                    toolName: ev.tool,
+                    mode: ev.mode,
+                    justification: ev.justification,
+                    command: ev.command,
+                    files: ev.files
+                  }))
+                  if (derived) copy.facts = derived
+                }
                 events.push(copy)
               }
             } catch { /* events 文件不存在：返回空 */ }
@@ -2081,14 +2097,9 @@ export default {
         const toolCmd = resolveToolCallCommand(req.callId, events)
         // 说明用命令：严格命中落空时回溯最近同名调用（只影响给人看的说明，不影响安全裁决）
         const displayCmd = resolveDisplayCommand(req.callId, toolName, events)
-        // command 一并落进事件：命令类工具没有 file_path，追认/沉淀规则的指纹需要它
-        const filesOpt = Object.assign(
-          toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
-          toolCmd ? { command: toolCmd } : {}
-        )
-        // 面向审批人的中文说明：模型 justification 是英文 / 含宿主英文前缀时，
-        // 用结构化事实（目标模式、命令、目标路径）拼一条中文说明，命令与路径原样保留。
-        const zhReason = buildChineseReason({
+        // 结构化审批事实：中文说明（zh）与审查界面字段表格（facts）同源，
+        // 命令与路径原样保留，只为「一眼看清改什么、动哪里、影响多大」。
+        const factInput = {
           toolName,
           mode,
           justification,
@@ -2096,7 +2107,15 @@ export default {
           commandSource: toolCmd ? 'callId' : displayCmd.source,
           files: toolFiles,
           cwd: sessionCwd
-        })
+        }
+        const zhReason = buildChineseReason(factInput)
+        const facts = describeFacts(factInput)
+        // command 一并落进事件：命令类工具没有 file_path，追认/沉淀规则的指纹需要它
+        const filesOpt = Object.assign(
+          toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
+          toolCmd ? { command: toolCmd } : {},
+          facts ? { facts } : {}
+        )
         // 记录用 opts：filesOpt 语义不变，仅追加 zh（审查界面渲染用）
         const displayOpts = zhReason ? Object.assign({}, filesOpt, { zh: zhReason }) : filesOpt
         // 卡正文来自 req.reason（宿主 approval/asked 已按原文落库，这里只改给人看的那一份）。

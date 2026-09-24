@@ -140,6 +140,15 @@ window.__ModuleLoader__.load({
 .ag-snap-bar{flex:none;display:flex;align-items:center;gap:8px;padding:6px 14px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;flex-wrap:wrap}
 .ag-snap-bar b{color:var(--dsw-alias-label-secondary);font-weight:500}
 .ag-snap-bar-spacer{flex:1 1 auto}
+.ag-facts{box-sizing:border-box;width:100%;margin-top:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;border-collapse:separate;border-spacing:0;table-layout:fixed;overflow:hidden;font-size:12px;line-height:18px}
+.ag-facts tr+tr .ag-facts-k,.ag-facts tr+tr .ag-facts-v{border-top:1px solid var(--dsw-alias-border-l1)}
+.ag-facts-k{box-sizing:border-box;width:72px;color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-2);text-align:left;vertical-align:top;font-weight:400;padding:4px 8px;white-space:nowrap}
+.ag-facts-v{box-sizing:border-box;color:var(--dsw-alias-label-secondary);vertical-align:top;padding:4px 8px;word-break:break-all;white-space:pre-wrap}
+.ag-facts-v-mono{color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code)}
+.ag-facts-v-del{color:var(--dsw-alias-state-error-primary)}
+.ag-facts-v-write{color:var(--dsw-alias-state-success-primary)}
+.ag-facts-v-edit{color:var(--dsw-alias-state-business-primary)}
+.ag-facts-v-remote{color:var(--dsw-alias-state-warn-label)}
 `
 
     const VERDICT_LABELS = {
@@ -190,6 +199,130 @@ window.__ModuleLoader__.load({
       if (p === 'judge-unavailable') return '已追认放行 · 判定器不可用（曾直接拒绝）'
       if (p === 'classifier-deny') return '已追认放行 · 判定为有害或越权（曾直接拒绝）'
       return '已追认放行 · 曾直接拒绝'
+    }
+
+    // ================= 顶部「审批」tab 的条数 =================
+    /**
+     * 宿主把 `conversation.view` 的 `label` 经 resolveSlotLabel() 的结果**当字符串**
+     * 直接渲染成 tab 文案，并在「slot 变更」与「locale 发布」时重算 tab 列表
+     * （ui-conversation 的 refreshViews 同时订阅 slots.subscribe 与 locale.subscribe，
+     * label thunk 的既有意义就是「跟着 locale 走」）。所以条数只能这么上 tab：
+     * 一个读本模块变量的 label thunk + 条数真变化时发布一次 locale（每次注册一个
+     * 一次性 namespace，用完即撤，不留垃圾）触发重算。
+     * 没有 locale 服务时自动退回静态「审批」，条数照旧在视图内展示，不影响审批本身。
+     */
+    const TAB_REFRESH_NS = 'dsh-approval-gate.tab-refresh'
+    let tabCount = 0
+    let tabCountSession = null
+    /** apply() 接上 locale 发布通道；未接上时 label thunk 仍能读到最新条数 */
+    let tabCountReporter = null
+
+    /** tab 文案：有条数时 `审批 (N)`，没有就是 `审批` */
+    function approvalTabLabel() {
+      return tabCount > 0 ? '审批 (' + tabCount + ')' : '审批'
+    }
+
+    /** 用绝对条数刷新 tab（同一会话同一条数不重复触发刷新） */
+    function publishTabCount(sessionId, count) {
+      const sid = String(sessionId || '')
+      const n = Math.max(0, Math.floor(Number(count) || 0))
+      if (sid === tabCountSession && n === tabCount) return
+      tabCountSession = sid
+      tabCount = n
+      if (typeof tabCountReporter === 'function') {
+        try { tabCountReporter() } catch (e) { /* 刷新失败：标签停在旧值，不影响审批本身 */ }
+      }
+    }
+
+    /** 增量刷新（提示条按 since 轮询，拿到的是新事件） */
+    function addTabCount(sessionId, delta) {
+      const sid = String(sessionId || '')
+      const base = sid === tabCountSession ? tabCount : 0
+      publishTabCount(sid, base + Math.max(0, Math.floor(Number(delta) || 0)))
+    }
+
+    /**
+     * 只数「审批」视图真正列出的记录（manual-pending 只活在提示条里，不计入）。
+     * 口径与用户打开 tab 后看到的行数一致，避免「tab 说 5 条、列表只有 4 行」。
+     */
+    function countRecorded(evs) {
+      if (!Array.isArray(evs)) return 0
+      return evs.filter(function (ev) { return ev && (ev.kind || 'auto') !== 'manual-pending' }).length
+    }
+
+    // ================= 结构化审批事实 → 字段表格 =================
+    /**
+     * 一段散文里看不出「这是删除还是新增、动的是哪里、影响多大」。host 侧把结构化事实
+     * 落进事件的 facts 字段，这里摊成字段表格：一眼扫完再决定批不批。
+     * 老事件没有 facts → 调用方回退渲染 zh/justification 原文。
+     */
+    const FACTS_ACTION_CLASS = {
+      delete: 'ag-facts-v-del',
+      write: 'ag-facts-v-write',
+      edit: 'ag-facts-v-edit',
+      remote: 'ag-facts-v-remote',
+    }
+
+    /** 审批事实 → [字段名, 值, 值样式类] 行；值缺失的行不占位。 */
+    function factsRows(ev) {
+      const f = ev && ev.facts
+      if (!f || typeof f !== 'object') return null
+      const rows = []
+      if (f.action) {
+        rows.push(['操作类型', String(f.action) + (f.tool ? ' · ' + String(f.tool) : ''), FACTS_ACTION_CLASS[String(f.actionKey || '')] || ''])
+      }
+      const paths = Array.isArray(f.paths) ? f.paths.filter(Boolean) : []
+      if (paths.length > 0) rows.push(['操作路径', paths.map(String).join('\n'), 'ag-facts-v-mono'])
+      else if (f.pathsMissing) rows.push(['操作路径', 'host未提供', ''])
+      const scope = [f.scopeShort, f.scopeDetail]
+        .map(function (s) { return s ? String(s) : '' })
+        .filter(Boolean)
+        .join(' · ')
+      if (scope) rows.push(['影响范围', scope, ''])
+      if (f.command) {
+        rows.push(['执行命令', (f.commandLabel ? '（' + String(f.commandLabel) + '）' : '') + String(f.command), 'ag-facts-v-mono'])
+      }
+      if (f.reason) rows.push(['模型说明', String(f.reason), ''])
+      if (ev.category && ev.category !== 'neutral') rows.push(['风险类别', String(ev.category), ''])
+      return rows.length > 0 ? rows : null
+    }
+
+    function FactsTable(props) {
+      const rows = factsRows(props.ev)
+      if (rows === null) return null
+      return React.createElement('table', { className: 'ag-facts' },
+        React.createElement('tbody', null,
+          rows.map(function (r, i) {
+            return React.createElement('tr', { key: i },
+              React.createElement('th', { className: 'ag-facts-k' }, r[0]),
+              React.createElement('td', { className: 'ag-facts-v ' + (r[2] || '') }, r[1]),
+            )
+          }),
+        ),
+      )
+    }
+
+    /** 提示条用的一行摘要（提示条只有一行高度）：删除 · a.txt 等 3 处 · 整机 */
+    function factsSummary(ev) {
+      const f = ev && ev.facts
+      if (!f || typeof f !== 'object') return ''
+      const parts = []
+      if (f.action) parts.push(String(f.action))
+      const paths = Array.isArray(f.paths) ? f.paths.filter(Boolean) : []
+      if (paths.length > 0) {
+        const last = String(paths[0]).split(/[\\/]/).filter(Boolean).pop() || String(paths[0])
+        parts.push(paths.length > 1 ? last + ' 等 ' + paths.length + ' 处' : last)
+      } else if (f.command) {
+        parts.push(String(f.command).slice(0, 60))
+      }
+      if (f.scopeShort) parts.push(String(f.scopeShort))
+      return parts.join(' · ')
+    }
+
+    /** 审批理由一行文本：facts 摘要优先，其次 zh，最后模型原文。 */
+    function reasonLine(ev) {
+      if (!ev) return ''
+      return factsSummary(ev) || ev.zh || ev.justification || ev.reason || ''
     }
 
     function fmtTime(iso) {
@@ -400,6 +533,7 @@ window.__ModuleLoader__.load({
               if (!last || last.id <= lastShownIdRef.current) return
               lastShownIdRef.current = last.id
               sinceRef.current = last.id
+              addTabCount(sessionId, countRecorded(evs))
               const kind = last.kind || 'auto'
               setNotice(last)
               if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
@@ -417,6 +551,7 @@ window.__ModuleLoader__.load({
         fetchAllEvents(sessionId).then(function (evs) {
           if (!alive) return
           if (evs.length > 0) sinceRef.current = evs[evs.length - 1].id
+          publishTabCount(sessionId, countRecorded(evs))
           restorePending(evs)
           startPolling()
         }).catch(function () {
@@ -455,30 +590,30 @@ window.__ModuleLoader__.load({
       let tagText = ''
       let glyph = null
       if (isPending) {
-        title = '等待人工审批：' + (notice.zh || notice.justification || notice.reason || '')
+        title = '等待人工审批：' + reasonLine(notice)
         tagText = '人工审批中'
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '◔')
       } else if (isSilentReject) {
         // 已被追认（可能在另一个窗口点的）：状态已翻转为「已放行」，不该再吓人
         const done = Boolean(notice.reconsidered)
-        title = (done ? '已追认放行：' : '已直接拒绝：') + (notice.zh || notice.justification || notice.reason || '')
+        title = (done ? '已追认放行：' : '已直接拒绝：') + reasonLine(notice)
         tagText = done ? reconsideredLabel(notice) : silentRejectLabel(notice)
         glyph = React.createElement('span', { className: done ? 'ag-notice-glyph' : 'ag-notice-glyph-err' }, done ? '✓' : '✕')
       } else if (kind === 'manual-approved') {
         const lc = notice.learningCount !== undefined ? notice.learningCount : null
         const th = notice.threshold || 3
         const viaJudge = notice.path === 'flash-failed'
-        title = (viaJudge ? '人工审批通过（判定器不可用）：' : '人工审批通过：') + (notice.zh || notice.justification || notice.reason || '')
+        title = (viaJudge ? '人工审批通过（判定器不可用）：' : '人工审批通过：') + reasonLine(notice)
         tagText = viaJudge
           ? ('判定器不可用，人工放行' + (lc !== null ? ' · 学习 ' + lc + '/' + th : ''))
           : (lc !== null ? ('学习 ' + lc + '/' + th + '，满 ' + th + ' 次后自动放行') : '人工审批通过')
         glyph = React.createElement('span', { className: 'ag-notice-glyph-warn' }, '✓')
       } else if (kind === 'manual-rejected') {
-        title = '已拒绝：' + (notice.zh || notice.justification || notice.reason || '')
+        title = '已拒绝：' + reasonLine(notice)
         tagText = rejectLabel(notice).replace('人工拒绝', '已拒绝')
         glyph = React.createElement('span', { className: 'ag-notice-glyph-err' }, '✕')
       } else {
-        title = (notice.zh || notice.justification || notice.reason || '')
+        title = reasonLine(notice)
         const label = VERDICT_LABELS[notice.verdict] || notice.verdict || '自动放行'
         tagText = '自动放行 · ' + label
         glyph = React.createElement(GlyphCheck, null)
@@ -682,6 +817,7 @@ window.__ModuleLoader__.load({
           evs.sort(function (a, b) { return b.id - a.id }) // 时间倒序：最新在最上面
           setEvents(evs)
           setError(null)
+          publishTabCount(sessionId, countRecorded(evs))
           // 打开「审批」tab = 用户看过这些拒绝：标记已读，提示条与待处理角标据此收起
           if (markRejectsSeen(evs)) broadcastSeen()
         }).catch(function (e) {
@@ -886,7 +1022,10 @@ window.__ModuleLoader__.load({
                         React.createElement('span', { className: tagCls }, tagText),
                         React.createElement('span', { className: 'ag-time' }, fmtTime(ev.ts)),
                       ),
-                      React.createElement('div', { className: 'ag-row-reason' }, ev.zh || ev.justification || ev.reason || '(无说明)'),
+                      // 结构化事实存在 → 字段表格；老事件没有 facts → 回退中文说明/原文
+                      ev.facts
+                        ? React.createElement(FactsTable, { ev: ev })
+                        : React.createElement('div', { className: 'ag-row-reason' }, ev.zh || ev.justification || ev.reason || '(无说明)'),
                       files.length > 0
                         ? React.createElement('div', { className: 'ag-row-files' },
                             files.map(function (f, i) {
@@ -1288,7 +1427,9 @@ window.__ModuleLoader__.load({
     }
 
     const plugin = {
-      inject: ['timer'],
+      // locale：顶部 tab 条数靠 locale 发布通道刷新（label thunk 的既有语义）。
+      // 声明依赖保证 apply 时 locale 已在场；万一缺失，下面仍会退回静态「审批」。
+      inject: ['timer', 'locale'],
       async apply(ctx) {
         const slots = ctx.get('slots')
         if (slots === undefined) return
@@ -1310,6 +1451,28 @@ window.__ModuleLoader__.load({
           }
         })
 
+        // 顶部「审批」tab 的条数刷新通道：locale 发布会让 ui-conversation 重算 tab 文案
+        // （label thunk 本就是「跟着 locale 走」的）。没有 locale 服务就退回静态标签。
+        const locale = ctx.get('locale')
+        let tabRefreshDispose = null
+        if (locale !== undefined && typeof locale.register === 'function') {
+          tabCountReporter = function () {
+            try {
+              // 同一 namespace + locale 不能重复 register（会抛「already has locale」）：
+              // 先撤销上一次注册（publish 一次），再注册新的（再 publish 一次）。
+              if (tabRefreshDispose) { const dispose = tabRefreshDispose; tabRefreshDispose = null; dispose() }
+              tabRefreshDispose = locale.register(TAB_REFRESH_NS, { en: { tick: String(Date.now()) } })
+            } catch (e) { /* 标签停在旧值，不影响审批本身 */ }
+          }
+          ctx.effect(() => () => {
+            tabCountReporter = null
+            if (tabRefreshDispose) {
+              try { tabRefreshDispose() } catch (e) {}
+              tabRefreshDispose = null
+            }
+          })
+        }
+
         // ✅ 自动放行提示条：输入框上方独立行（order=30，排在 todo/goal/queue 之下，天然不重叠）
         slots.inject('conversation.input.dock', function () {
           return slots.register(
@@ -1325,7 +1488,7 @@ window.__ModuleLoader__.load({
               name: 'conversation.view',
               id: 'dsh-approval-gate.history',
               order: 20,
-              label: '审批',
+              label: approvalTabLabel,
               inject: (sessionId) => ({ sessionId }),
             },
             function (props) { return React.createElement(HistoryView, { slotsProps: props }) },
