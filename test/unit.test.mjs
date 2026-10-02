@@ -10,7 +10,10 @@ const tempHome = mkdtempSync(join(tmpdir(), 'ag-unittest-'))
 mkdirSync(join(tempHome, 'auto-approve'), { recursive: true })
 process.env.DSH_HOME = tempHome
 
-const plugin = (await import(pathToFileURL(new URL('../src/index.mjs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')).href)).default
+const mod = await import(pathToFileURL(new URL('../src/index.mjs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')).href)
+const plugin = mod.default
+// looksDeny 断言必须打在生产实现上：此前这里复制了一份同名函数，生产改坏测试也不会红。
+const { looksDeny } = mod
 process.on('exit', () => { try { rmSync(tempHome, { recursive: true, force: true }) } catch { /* ignore */ } })
 
 // We will test exported plugin or functions by loading index.mjs or testing its logic
@@ -91,29 +94,8 @@ assert.strictEqual(extractedCmd, 'git -c http.sslBackend=openssl push origin mai
 const matchWithCmd = matchRule(allowRules, 'pwsh', 'danger-full-access', null, `推送代码到远程仓库 ${extractedCmd}`)
 assert.ok(matchWithCmd, 'Match context including resolved tool command MUST match git rule')
 
-// 2. looksDeny test
-const DEFAULT_DENY_KEYWORDS = [
-  'rm -rf', 'rm -fr', 'rm -r -f', 'rm --recursive --force',
-  'push --force', 'force-push', 'force push', 'drop table', 'drop database',
-  'mkfs', 'mkfs.ext', 'format', 'shutdown', 'reboot', 'dd of=',
-  'delete from', 'truncate table', 'truncate ', 'terraform destroy', 'revoke',
-  '清空数据库', '删除数据库', '格式化', 'sudo rm', 'chmod 777 /',
-  'git reset --hard', 'git clean -fd', 'docker rm', 'docker system prune'
-]
-
-function looksDeny(text) {
-  const lower = String(text || '').toLowerCase()
-  const keywords = DEFAULT_DENY_KEYWORDS
-  return keywords.some((keyword) => {
-    const kw = String(keyword || '').trim().toLowerCase()
-    if (!kw) return false
-    if (/^[a-z0-9_]+$/.test(kw)) {
-      const regex = new RegExp(`(^|[^a-z0-9_-])${kw}([^a-z0-9_-]|$)`, 'i')
-      return regex.test(lower)
-    }
-    return lower.includes(kw)
-  })
-}
+// 2. looksDeny test（直接调用 src/index.mjs 的导出实现，不在测试内重复逻辑）
+assert.strictEqual(typeof looksDeny, 'function', 'index.mjs must export looksDeny for this regression to be real')
 
 // False positives reported in Issue 13 should NOT be blocked
 assert.strictEqual(looksDeny('pwsh Get-Process | Format-Table -AutoSize'), false, 'Format-Table should NOT be blocked')
@@ -136,6 +118,21 @@ assert.strictEqual(looksDeny('pwsh git clone https://github.com/repo'), false, '
 assert.strictEqual(looksDeny('pwsh git commit -m "update code"'), false, 'git commit should not be blocked')
 assert.strictEqual(looksDeny('truncate table users'), true, 'truncate table must be blocked')
 assert.strictEqual(looksDeny('清空数据库'), true, '清空数据库 must be blocked')
+
+// 标志被延长 = 另一个（安全）标志，不得当成危险词（2026-10-01 实测误报）
+assert.strictEqual(looksDeny('git -c http.sslBackend=openssl push --force-with-lease origin main'), false,
+  '--force-with-lease must NOT be read as --force')
+assert.strictEqual(looksDeny('git push --force-if-includes origin main'), false,
+  '--force-if-includes must NOT be read as --force')
+assert.strictEqual(looksDeny('docker rmi old-image'), false,
+  'docker rmi must NOT be read as docker rm')
+// 同一条文本里越界命中之后仍有真危险词时必须命中
+assert.strictEqual(looksDeny('git push --force-with-lease origin main && git push --force origin main'), true,
+  'a real --force later in the same text must still be caught after a boundary miss')
+// 真正的危险词在标志边界上仍必须命中
+assert.strictEqual(looksDeny('git push --force origin main'), true, 'bare --force at a boundary still blocks')
+assert.strictEqual(looksDeny('git push --force;'), true, 'punctuation after --force still blocks')
+assert.strictEqual(looksDeny('docker rm -f container'), true, 'docker rm at a boundary still blocks')
 
 // 3. extractOperationFingerprint test
 const GENERIC_EN_WORDS = new Set([

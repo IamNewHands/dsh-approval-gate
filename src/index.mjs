@@ -1130,19 +1130,38 @@ for (const k of Object.keys(learning.history)) {
     .slice(-10)
 }
 
+/**
+ * 危险词在文本中的**边界**命中判定（不做裸子串包含）。
+ *
+ * 关键词首/尾是单词字符时，相邻字符不得落在 `[a-z0-9_-]` 内。这条统一规则同时挡住
+ * 两类误报：
+ *   - 前缀误伤：`format` 命中 `Format-Table` / `--format`
+ *   - **标志延长**：`push --force` 命中 `push --force-with-lease`（带租约的安全强制
+ *     推送，2026-10-01 实测 4 次无谓转人工）、`docker rm` 命中 `docker rmi`
+ * 关键词以 `=`/`:` 结尾（`dd of=`、`cipher /w:`）时该侧不设边界，与原行为一致。
+ * 命中失败时继续向后找下一次出现，避免一次越界命中就漏掉同一文本里真正的危险词。
+ */
+function matchDenyKeyword(lower, kw) {
+  const leftBoundary = /^[a-z0-9_]/.test(kw)
+  const rightBoundary = /[a-z0-9_]$/.test(kw)
+  let from = 0
+  for (;;) {
+    const at = lower.indexOf(kw, from)
+    if (at === -1) return false
+    const leftOk = !leftBoundary || !/[a-z0-9_-]/.test(lower[at - 1] ?? '')
+    const rightOk = !rightBoundary || !/[a-z0-9_-]/.test(lower[at + kw.length] ?? '')
+    if (leftOk && rightOk) return true
+    from = at + 1
+  }
+}
+
 function looksDeny(text) {
   const lower = String(text || '').toLowerCase()
   const keywords = config.denyKeywords || DEFAULT_DENY_KEYWORDS
   return keywords.some((keyword) => {
     const kw = String(keyword || '').trim().toLowerCase()
     if (!kw) return false
-    // 单个独立英文/数字标识符（如 format、shutdown、reboot）采用词边界判定，
-    // 避免误伤 Format-Table、Format-List、Get-Date -Format、--format 等正常命令
-    if (/^[a-z0-9_]+$/.test(kw)) {
-      const regex = new RegExp(`(^|[^a-z0-9_-])${kw}([^a-z0-9_-]|$)`, 'i')
-      return regex.test(lower)
-    }
-    return lower.includes(kw)
+    return matchDenyKeyword(lower, kw)
   })
 }
 

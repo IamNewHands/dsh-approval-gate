@@ -4,6 +4,29 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.1] — 2026-10-02
+
+Dangerous keywords now match on **boundaries** (fixing one real false positive), and the existing "writes under `$DSH_HOME` always require a human" semantics is written down.
+
+### Problem
+
+- **Keyword false positive**: `looksDeny` used plain substring containment for multi-word keywords, so `git push --force-with-lease` (the **safe**, lease-guarded force push) contains `push --force` and was treated as a force push. The 2026-10-01 approval log shows 4 such escalations (events 816 / 830 / 842 / 847), each costing a manual click for no reason. The same class hit `docker rmi` against the `docker rm` keyword
+- **Semantics mistaken for a bug**: the user reported "approval self-learning is not working". The scene: the same target `C:\Users\shiro\.dsh\profiles\desktop\cordis.patch.yml` was approved 13 times, yet every record showed a plain "human approved" with **no `learning N/3` progress**. The cause is that `hardDenyFacts()` classifies `$DSH_HOME` targets as the human tier and returns at **gate 0**; the allowlist (gate 2) and the learning counter (gate 6) both sit after it — so those operations are never counted, never learned, cannot be whitelisted, and have no reconsider button. This is **pre-existing and deliberate** safety semantics (the README / GUIDE said only "escalates to a human", never "and never learns"), and the documentation gap made the investigation expensive
+
+### Changes
+
+- **`src/index.mjs`: `looksDeny` now matches on boundaries** (new internal helper `matchDenyKeyword`). When a keyword starts or ends with a word character, the adjacent character must not be in `[a-z0-9_-]`. One rule blocks both false-positive classes: prefix damage (`format` matching `Format-Table` / `--format`) and **flag extension** (`push --force` matching `push --force-with-lease`, `docker rm` matching `docker rmi`). Keywords ending in `=` / `:` (`dd of=`, `cipher /w:`) keep no boundary on that side, as before. On a boundary miss the scan continues to the next occurrence, so a real dangerous keyword later in the same text is still caught (`git push --force-with-lease … && git push --force …` still matches)
+- **`test/unit.test.mjs`: the `looksDeny` assertions now hit the production implementation.** The file used to carry a copy of the same function, so breaking production would not turn the test red (verified: with the source reverted, the new cases fail immediately). Eight boundary cases added (`--force-with-lease` / `--force-if-includes` / `docker rmi` must not match; `--force` at a flag boundary, after a semicolon, and `docker rm -f` must still match; a real dangerous keyword after a boundary miss must still match)
+- **`test/pipeline.test.mjs`: new case 3b** locking "the hard-fact gate runs before the allowlist and before learning" so it cannot later be "fixed" as a bug. Four assertions: ① a matching `allowRules` entry pointing exactly at that `$DSH_HOME` file still escalates to a human (and the test first asserts the rule *does* match, so it cannot pass vacuously); ② zero judge-model calls; ③ no learning counter appears in `learning.json` for that target; ④ the event has `path === 'hard-deny'` and no `learningCount` (i.e. the UI shows no `learning N/3`). RED check: deleting the human-tier branch from the source makes case 3b fail immediately with `a DSH_HOME target must still go to a human even with a matching allowlist rule`
+- **README (zh/en)**: two new feature bullets — the full semantics of "writes under `DSH_HOME` always require a human" (never counted / never learned / cannot be whitelisted / no reconsider button / no learning progress shown) and "dangerous keywords match on boundaries"
+- **docs/GUIDE (zh/en)**: the ⓪ hard-deny layer's "human tier" now carries a warning that it runs before the allowlist and before learning, what that implies, and the typical scene
+
+### Compatibility
+
+- Keyword behaviour **only narrows false positives; it does not open up real dangers**: every existing true-positive case for the built-in keywords still passes
+- The `$DSH_HOME` / home-root approval behaviour is **unchanged** (still the human tier); this release only adds documentation and regression tests
+- No config change and no migration; `allowlist.json` needs no edit
+
 ## [0.9.0] — 2026-09-24
 
 Approval explanations turn from one prose blob into a **structured field table**: operation type / target path / blast radius / command / model note.

@@ -2,7 +2,7 @@
 
 > 首页：[简体中文](../README.md) · [English](../README.en.md) · 指南：[中文](GUIDE.md) · [English](GUIDE.en.md)
 
-DeepSeek Harness 自动审批门控插件 v0.7.1：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
+DeepSeek Harness 自动审批门控插件 v0.9.1：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
 
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
@@ -18,6 +18,7 @@ DeepSeek Harness 自动审批门控插件 v0.7.1：**最小人工介入，只把
     - **破坏性目标**：文件系统根（`/`、`C:\`）；操作系统或凭据关键路径（`/etc`、`/bin`、`/sbin`、`/usr`、`/system`、`/library`、`/boot`、`C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.azure`、`~/.kube`、`~/.config/gcloud`）；Windows 设备/NT 命名空间（`\\.\`、`\Device\`、`\\?\`、`\??\`）；Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1-9`、`LPT1-9`）；含义不明的盘符相对路径
   - **人工档**（保留手动放行能力）：目标为 `$DSH_HOME` 或用户 home 根本身
   - 常规工作区操作不受影响，绝不被硬拒
+  - **⚠️ 人工档排在白名单与学习之前**：命中人工档即 `return`，因此这类操作**不计数、不学习、白名单规则盖不过、也没有追认按钮**。审批记录里只显示「人工通过」，**不会**出现「学习 N/3」——批准再多次也不会自动放行。这是有意语义（`$DSH_HOME` 下的 profile / 插件配置 / 凭据目录不由自动审批改写），不是学习失效。典型现场：反复修改 profile 的 `cordis.patch.yml`（2026-10-02 排查确认）
 - **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词命中 → 转人工（fail-safe）
 - **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains` 组合规则（含学习沉淀的规则）
 - **③ denyRules 层**：此前用户**裁决拒绝**过的「工具+模式+类别」→ 永久转人工（不会自动放行用户明确拒绝过的操作）
@@ -276,11 +277,12 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 | 文件 | 覆盖内容 |
 |------|----------|
 | `test/absorbed.test.mjs` | 五项吸收能力的回归测试，断言针对 `src/` 下的**真实导出实现**（不在测试内重复逻辑）：结构化 JSON 裁决协议、判定输入脱敏、按会话的判定失败计数、确定性硬拒两档、动态系统提示上下文（仅预设激活时注入）。用临时 `DSH_HOME` 隔离，绝不触碰真实 `~/.dsh/auto-approve` |
-| `test/pipeline.test.mjs` | 判定管道端到端测试，用**模拟宿主**真正执行注册的 `approval/request` 处理器：硬拒直接拒绝（不弹窗）→ 硬事实转人工 → 危险词 → 白名单 → 脱敏 → 结构化判定 → 硬类别（优先于 allow/deny）→ `deny`/`allow`/`ask` → 连续失败计数 → 确认制学习。断言处理器返回的裁决、是否调用了 `next()`（即是否弹窗），以及真正发给判定模型的消息内容。含 `deny + neutral` 静默拒绝与 `deny + 硬类别` 转人工的对照用例 |
+| `test/unit.test.mjs` | 规则匹配、配置迁移、多机规则共享，以及 `looksDeny` 的**边界匹配**回归（直接打生产导出实现，不在测试内复制逻辑）：`Format-Table` / `--format` 前缀误伤、`--force-with-lease` / `--force-if-includes` / `docker rmi` 标志延长误报、真危险词在边界上仍必须命中 |
+| `test/pipeline.test.mjs` | 判定管道端到端测试，用**模拟宿主**真正执行注册的 `approval/request` 处理器：硬拒直接拒绝（不弹窗）→ 硬事实转人工 → 危险词 → 白名单 → 脱敏 → 结构化判定 → 硬类别（优先于 allow/deny）→ `deny`/`allow`/`ask` → 连续失败计数 → 确认制学习。断言处理器返回的裁决、是否调用了 `next()`（即是否弹窗），以及真正发给判定模型的消息内容。含 `deny + neutral` 静默拒绝与 `deny + 硬类别` 转人工的对照用例，以及用例 3b：**硬事实闸门排在白名单与学习之前**（`$DSH_HOME` 目标即使有白名单规则也转人工、不计数、事件不带 `learningCount`） |
 | `test/reconsider.test.mjs` | 追认端点（`POST /api/auto-approve/reconsider`）的契约：硬拒档与硬风险类别一律 400 且不写规则、neutral 静默拒绝可追认（写带指纹规则 + 投递重试 + 记录 `reconsiderOf`）、事件 API 标注 `reconsidered` 并过滤追认记录、重复追认幂等、未知事件 404 |
 | `test/client-render-smoke.test.mjs` | 客户端 bundle 的**真实渲染**冒烟测试（最小 React hooks 垫片 + DOM/fetch 桩）：拒绝提示条常驻且带「重新审批通过」/「查看审批记录」、硬拒档不给追认按钮、审批视图仅可追认行有按钮、打开审批 tab 标记已读、已读记录刷新后不再弹 |
 
-`test/unit.test.mjs` 与 `test/seed-sync.test.mjs` 覆盖既有的规则匹配、配置迁移与多机规则共享。
+`test/unit.test.mjs` 与 `test/seed-sync.test.mjs` 覆盖既有的规则匹配、配置迁移与多机规则共享；前者另含 `looksDeny` 的**边界匹配**回归（见上表）。
 
 ## 上游署名
 

@@ -4,6 +4,29 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.1] — 2026-10-02
+
+危险词按**边界**匹配（修一个真实误报），并把「`$DSH_HOME` 写入永远人工」的既有语义写成文档。
+
+### 问题
+
+- **危险词误报**：`looksDeny` 对多词关键词用裸子串包含，`git push --force-with-lease`（带租约的**安全**强制推送）含子串 `push --force`，因此被当成强制推送转人工。2026-10-01 的审批记录里实测 4 次（事件 816 / 830 / 842 / 847），每次都要人工点一次，纯噪音。同类问题还有 `docker rmi` 命中 `docker rm`
+- **语义被误读成 bug**：用户报告「审批自学习没生效」。现场是同一目标 `C:\Users\shiro\.dsh\profiles\desktop\cordis.patch.yml` 被人工批准 13 次，审批记录始终只显示「人工通过」、**没有**「学习 N/3」。根因是 `hardDenyFacts()` 把 `$DSH_HOME` 目标判为人工档并在管道**第 0 步** `return`，白名单（第 2 步）与学习计数（第 6 步）都在它之后——不计数、不学习、白名单盖不过、也没有追认按钮。这是**既有且有意**的安全语义（README / GUIDE 只写了「转人工」，没写「且永不学习」），文档缺失导致排查成本高
+
+### 变更
+
+- **`src/index.mjs`：`looksDeny` 改为边界匹配**（新增内部函数 `matchDenyKeyword`）。关键词首/尾是单词字符时，相邻字符不得落在 `[a-z0-9_-]` 内。一条统一规则同时挡住两类误报：前缀误伤（`format` 命中 `Format-Table` / `--format`）与**标志延长**（`push --force` 命中 `push --force-with-lease`、`docker rm` 命中 `docker rmi`）。关键词以 `=` / `:` 结尾（`dd of=`、`cipher /w:`）时该侧不设边界，与原行为一致；命中失败时继续向后找下一次出现，避免一次越界命中就漏掉同一文本里真正的危险词（`git push --force-with-lease … && git push --force …` 仍命中）
+- **`test/unit.test.mjs`：`looksDeny` 断言改打生产实现**。此前该文件复制了一份同名函数，生产改坏测试也不会红（本次 RED 校验：还原源码后新用例立刻失败）。新增 8 条边界用例（`--force-with-lease` / `--force-if-includes` / `docker rmi` 不得命中；`--force` 在标志边界、分号后、`docker rm -f` 仍必须命中；越界命中之后的真危险词仍必须命中）
+- **`test/pipeline.test.mjs`：新增用例 3b**，把「硬事实闸门排在白名单与学习之前」锁死，避免以后被当成 bug"修好"。断言四件事：① 即使 `allowRules` 里有一条精确指向该 `$DSH_HOME` 文件的规则也仍转人工（并**先断言这条规则确实能匹配**，防止用例空转）；② 判定模型零调用；③ `learning.json` 不产生该目标的计数；④ 事件 `path === 'hard-deny'` 且不带 `learningCount`（即界面上不会出现「学习 N/3」）。RED 校验：把人工档分支从源码删掉后，用例 3b 立即以 `a DSH_HOME target must still go to a human even with a matching allowlist rule` 失败
+- **README（中/英）**：新增两条特性说明——「DSH_HOME 写入永远人工」的完整语义（不计数 / 不学习 / 白名单盖不过 / 无追认按钮 / 不显示学习进度）与「危险词按边界匹配」
+- **docs/GUIDE（中/英）**：⓪ 硬拒层的「人工档」下补一段警示，写明它排在白名单与学习之前及其后果，并给出典型现场
+
+### 兼容
+
+- 危险词行为**只收窄误报，不放开真危险**：所有预置危险词的原有真阳性用例全部保持通过
+- `$DSH_HOME` / home 根的审批行为**完全不变**（仍是人工档），本次只补文档与回归测试
+- 无配置变更，无需迁移；`allowlist.json` 无需改动
+
 ## [0.9.0] — 2026-09-24
 
 审批说明从「一段散文」改成**结构化字段表**：操作类型 / 操作路径 / 影响范围 / 执行命令 / 模型说明。

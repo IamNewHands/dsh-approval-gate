@@ -182,6 +182,58 @@ function boot(opts) {
   console.log('  ✓ 硬事实：DSH_HOME → 转人工，用户可放行')
 }
 
+// ========== 3b. 硬事实闸门排在白名单与学习之前（2026-10-02 语义锁定） ==========
+// 现场：同一目标（profile 的 cordis.patch.yml）被人工批准 13 次，审批记录始终没有
+// 「学习 N/3」——因为硬事实档在管道第 0 步就 return，白名单与学习计数都不可达。
+// 这是**有意**的安全语义（DSH_HOME 写入永远人工），此处锁死，避免被当成 bug"修好"：
+//   ① 即使 allowRules 里有一条精确指向该文件的规则，也不得放行
+//   ② 该目标的确认计数不得写进 learning.json
+{
+  const cfgPath = join(dataDir, 'allowlist.json')
+  const learningPath = join(dataDir, 'learning.json')
+  const target = join(DSH_HOME, 'profiles', 'desktop', 'cordis.patch.yml')
+
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+  cfg.allowRules = [{ tool: 'edit', mode: 'danger-full-access', contains: target, description: '本用例专用：指向 DSH_HOME 文件的白名单' }]
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+  writeFileSync(learningPath, JSON.stringify({ enabled: true, stats: {}, history: {} }, null, 2) + '\n', 'utf8')
+
+  const { state } = boot({ judgeReply: () => { throw new Error('must not be called') } })
+  const req = makeReq({
+    sessionId: 's-dshhome-order',
+    toolName: 'edit',
+    justification: '在 profile patch 中加入 undo 插件的 profileName 覆盖行',
+    args: { file_path: target },
+    callId: 'dshhome-order-1',
+  })
+  const first = await decide(null, req, 'allowed-once')
+  assert.strictEqual(first.nextCalls, 1,
+    'a DSH_HOME target must still go to a human even with a matching allowlist rule (gate 0 precedes gate 2)')
+  assert.strictEqual(state.streamAttempts, 0, 'the hard-fact gate must short-circuit before the judge too')
+
+  // 非空断言：证明上面那条白名单规则**确实能匹配**这个目标 —— 否则本用例是空转，
+  // 把闸门顺序反过来也不会红。
+  const ruleMatchContext = `escalate sandbox to danger-full-access: 在 profile patch 中加入 undo 插件的 profileName 覆盖行 ${target}`
+  assert.ok(mod.matchRule(cfg.allowRules, 'edit', 'danger-full-access', null, ruleMatchContext),
+    'the injected allowlist rule must actually match this target, so the ordering assertion is not vacuous')
+
+  const learning = JSON.parse(readFileSync(learningPath, 'utf8'))
+  const keys = Object.keys(learning.stats)
+  assert.deepStrictEqual(keys, [],
+    'approving a DSH_HOME target must NOT create a learning counter (learning is unreachable behind gate 0)')
+
+  const eventsPath = join(dataDir, 'events.jsonl')
+  const rows = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const mine = rows.filter((e) => e.sessionId === 's-dshhome-order')
+  assert.strictEqual(mine[0].path, 'hard-deny', 'the record must be labelled with the hard-fact path')
+  assert.ok(mine.every((e) => e.learningCount === undefined),
+    'a hard-fact approval must not carry a learning count (no 「学习 N/3」 is shown)')
+
+  cfg.allowRules = []
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+  console.log('  ✓ 硬事实排在白名单/学习之前：DSH_HOME 目标即使有白名单规则也转人工，且不计数')
+}
+
 // ================= 4. 危险词 → 转人工 =================
 {
   boot({ judgeReply: () => { throw new Error('must not be called') } })
