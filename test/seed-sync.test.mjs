@@ -67,6 +67,20 @@ try {
     `seed denyKeywords must all be merged in; missing: ${JSON.stringify(missingDeny)}`)
   console.log(`  ✓ 共享规则已并入 (allow=${written.allowRules.length}, deny=${written.denyKeywords.length})`)
 
+  // ---- 1b. 种子里的危险词必须是「形态化」的，不能有裸 format ----
+  // 事故（2026-10-05）：种子文件里留着裸 `"format"`，于是启动顺序
+  // normalizeConfig(迁移删掉裸 format) → mergeSharedRules(种子又把它加回来)
+  // 让 0.9.10 的迁移失效（线上实测：裸 format 仍在，只是多了两条形态化条目）。
+  // 裸 format 会命中「独立成词的 format」——`npm run format`、回显字符串都会转人工。
+  const bareFormat = seed.denyKeywords.filter((x) => String(x).trim().toLowerCase() === 'format')
+  assert.strictEqual(bareFormat.length, 0,
+    'the bundled seed must not carry a bare `format` deny keyword (it re-adds itself after the migration)')
+  for (const shape of ['format c:', 'format /']) {
+    assert.ok(seed.denyKeywords.some((x) => String(x).trim().toLowerCase() === shape),
+      `the bundled seed must carry the shaped keyword ${JSON.stringify(shape)}`)
+  }
+  console.log('  ✓ 种子危险词已形态化（无裸 format，含 format c: / format /）')
+
   // ---- 2. 本机自定义规则不被覆盖 ----
   assert.ok(written.denyKeywords.includes('本机自定义危险词'), 'machine-local denyKeyword must survive')
   assert.ok(written.allowRules.some((r) => r.contains === '本机专属工具'), 'machine-local allowRule must survive')

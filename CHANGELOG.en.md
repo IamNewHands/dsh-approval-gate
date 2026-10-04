@@ -4,6 +4,26 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.11] — 2026-10-05
+
+**The 0.9.10 migration was neutralised by the seed rules — fix the seed file.** Caught during restart verification.
+
+Startup runs `normalizeConfig(config)` → `mergeSharedRules(config, bundledSeed)`, and `mergeSharedRules` is a **grow-only** union. The repository seed `allowlist.json` still carried a bare `"format"`, so:
+
+```
+normalizeConfig   → the migration removes the bare format, adds format c: / format /
+mergeSharedRules  → the seed's bare format is merged straight back in
+```
+
+Measured live: `denyKeywords` went 105 → 107, all three shaped entries present, and the **bare `format` still there** — the migration effectively did nothing.
+
+- Fix `allowlist.json` (the seed file, shipped with the package into the profile): bare `"format"` → `"format c:"` + `"format /"` (`format-volume` was already there)
+- The migration code stays (the live config's bare `format` still needs clearing); once the seed is clean the two stop fighting
+- `seed-sync.test.mjs` gains an assertion: **the seed's deny keywords must not contain a bare `format`**, and must contain `format c:` / `format /` — that assertion is this incident's guard rail
+- Rehearsed with the **real live config plus the fixed seed** in the real startup order: no bare `format` after the migration, all three shaped entries kept, no other keyword lost, and `looksDeny` correct on all four scenarios
+
+**Lesson (for next time)**: `mergeSharedRules` runs after `normalizeConfig`, so any migration that *removes* something from the config must also change the seed file, or the grow-only union silently restores it. The guard rail for removal/rewrite migrations belongs in `seed-sync.test.mjs`.
+
 ## [0.9.10] — 2026-10-05
 
 **The other half of the same `format` bug: the bare `format` keyword in the dangerous-keyword list caused spurious escalations.** 0.9.9 fixed the audit label (display layer); this one fixes an actual extra human prompt.

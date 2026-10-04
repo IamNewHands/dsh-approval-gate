@@ -4,6 +4,26 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.11] — 2026-10-05
+
+**0.9.10 的迁移被种子规则架空了 —— 修种子文件。** 重启验证时抓到的。
+
+启动顺序是 `normalizeConfig(config)` → `mergeSharedRules(config, bundledSeed)`，而 `mergeSharedRules` 是**只增不减**的并集。仓库种子 `allowlist.json` 里还留着裸 `"format"`，于是：
+
+```
+normalizeConfig   → 迁移删掉裸 format，补上 format c: / format /
+mergeSharedRules  → 种子里的裸 format 又被并回来
+```
+
+线上实测结果：`denyKeywords` 105 → 107 条，形态化三条都在，**裸 `format` 也还在** —— 迁移等于没做。
+
+- 修 `allowlist.json`（种子文件，会随包安装到 profile）：裸 `"format"` → `"format c:"` + `"format /"`（`format-volume` 原本就有）
+- 迁移代码保留（线上配置里那条裸 `format` 还得靠它清掉），种子干净之后两者不再打架
+- `seed-sync.test.mjs` 新增断言：**种子危险词里不得出现裸 `format`**，且必须含 `format c:` / `format /` —— 这条断言就是这次事故的护栏
+- 用**线上真实配置 + 修好的种子**按真实启动顺序预演过：迁移后无裸 `format`、形态化三条保留、其他危险词一个没丢、`looksDeny` 四个场景全部符合预期
+
+**教训（写给以后）**：`mergeSharedRules` 在 `normalizeConfig` 之后跑，所以任何「从配置里删东西」的迁移都必须同步改种子文件，否则会被并集悄悄还原。删/改类迁移的护栏应当放在 `seed-sync.test.mjs`。
+
 ## [0.9.10] — 2026-10-05
 
 **修同一个 `format` 的另一半：危险词表里的裸 `format` 会误转人工。** 0.9.9 修的是审计表的标签（展示层），这一版修的是**真的多弹一次人工**。
