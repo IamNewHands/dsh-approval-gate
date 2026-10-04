@@ -2,14 +2,16 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.9.7: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.9.8: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
 ```
 hard-deny (credential / system-path) → hard-fact human escalation (home root / gate exceptions)
 → dangerous keywords → danger fence (v0.9.7: fetch / dynamic exec / package install / persistence / recursive delete / executable artefacts)
-→ DSH-config auto-approval (v0.9.5) → allowlist (deterministic rules) → scope auto-allow (v0.9.7: all targets inside)
+→ sensitive paths always ask (v0.9.8) → DSH-config auto-approval (v0.9.5, extended to command targets in v0.9.8)
+→ allowlist (command-anchored, v0.9.8) → scope auto-allow (v0.9.7: all targets inside)
+→ always ask outside the workspace (v0.9.8)
 → denyRules (rejected upgrades)
 → structured JSON judge (hard categories → human, ahead of allow / deny; neutral confirmation; failure limit)
 → verdict learning
@@ -279,6 +281,24 @@ Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.js
 > **Honest caveat**: the fence is **textual** matching and can be obfuscated around (base64, variable concatenation, a second-stage download, writing a script and running it later). It stops non-adversarial failures — a model being talked into a download — not a targeted attack. The real boundary remains the sandbox and the human.
 >
 > **Behaviour change**: the judge sees narrower traffic — in-workspace calls no longer reach the judge layer (the old "in-workspace call → judge → allow" path is now handled by deterministic rules).
+
+> **Rule anchoring / always ask outside the workspace / sensitive paths always ask** (v0.9.8+, user decision 2026-10-05): three changes landed together, all so that a model cannot obtain permission through prose or an incidental path.
+>
+> **① Rules match real facts only (anchored to the command).** A rule's `contains`/`keywords` used to match `justification + command + files`, so writing "git push needs the credential manager" in the justification let `contains:"git"` allow any command. The anchor `ruleAnchorText(command, files, targets)` now carries **real facts only**, and the allowlist layer matches against it. Measured: of 897 auto-approvals over 30 days, **30** rule-based approvals with a real command stop matching (`gh run view` by `contains:"github"`, `npm test` by `contains:"vitest"`, `pwsh -File verify-branches.ps1` by `contains:"git"` — in every case the word was not in the command). A further **212** had **no recorded command**, so the anchor is empty, a `contains` rule cannot match (fail-closed), and the judge decides instead.
+>
+> Fingerprint sources are anchored to match: re-approval / judge-unavailable sediment / neutral-confirmation learning all take their fingerprint from the anchor so the rule can match the anchored allowlist layer; when the real operation is invisible they fall back to the prose (otherwise "approved but nothing gets sedimented" and the retry is refused again). A re-approval's `contains` is now **directory-level** (`extractRuleFingerprint`: for an absolute path, its immediate parent) — otherwise a new filename in the same directory needs a fresh approval and rules proliferate; that is exactly the shape of the user's hand-written Rime rules. `extractFingerprintCandidates` gains an immediate-parent candidate too.
+>
+> **Two deliberate exceptions**: the once-only permit (re-approval "this once", the user's explicit permit for one retry) and `denyRules` (a rejection that fails to match lets an operation that should be blocked reach the judge — a safety regression). Both use `looseMatchContext` (the loose, prose-including context).
+>
+> **② Always ask outside the workspace**: a target outside the workspace (`outside` / `mixed`) escalates to a human. It is ordered **after** the allowlist — "always" constrains the default posture, not rules you wrote; rules for `%APPDATA%\Rime`, `weaseldeployer.exe` and friends, which are themselves outside, still apply. Deliberately **not extended to `unknown`**: being unable to extract an absolute path is not "outside" (368 auto-approvals over 30 days land in unknown), and blocking those would push every command-flavoured call back to a human.
+>
+> **DSH-config gap closed**: command tools have no `file_path`, so the dsh-config tier of `hardDenyFacts` never fired for them. New: "all command targets under `$DSH_HOME` → auto-approve" keeps **54** outside-maintenance events automatic (`pnpm --dir … install`, pin updates, `cordis.patch.yml` backups); the exceptions remain the gate's own data directory and credential-named files. A new settings toggle exposes "always ask outside the workspace".
+>
+> **③ Sensitive path shapes always ask**: `sensitiveTargetHit(paths)` escalates on a hit, ordered **before** DSH-config auto-approval and the allowlist — a credential file is not allowed just because it lives under the profile or a rule matches. The shape is **directory segment / basename**, never a whole-path substring: `.ssh` `.aws` `.gnupg` `.kube` `.docker` `gcloud` `auto-approve` / `id_rsa` `credentials*` `.env*` `.npmrc` `.netrc` `.git-credentials` `*.pem` `*.key` `*.pfx` `*.p12` `*.kdbx` `Cookies` `Login Data` `Web Data` `Local State`. A `.env` inside the workspace is caught; source files like `src/credential/transport.ts` and `scripts/secure-secret-hydration.test.ts` are not false positives (the broad variant produced 2 measured false positives, the tightened one 0).
+>
+> **Measured** (30 days, 1210 events / 897 auto-approvals / 147 human prompts): step ④ turns **31** auto-approvals into human prompts (2 sensitive path + 29 outside) ⇒ human prompts **147 → 178 (+21%)**; the DSH-config closure keeps **54** automatic; anchoring fixes **30** genuine over-permissions and sends **212** to the judge. Of the 39 rules, **9** never match a real command (`worker process` / `child process` / `subprocess` / `凭据` / `typescript` / `eslint` / `weaseldeployer.exe` / `workspace-write` / …) — rewrite them around a word that really appears in the command, or delete them. Note that "0 hits" can also just mean no command was recorded in that window; it is not a verdict.
+>
+> **Behaviour changes**: the judge sees wider traffic (212 requests now go to it, and escalate to a human when it is unavailable); **no rule is sedimented for outside targets** — `forwardToHuman(..., 'outside')` records the event only, because "always ask" means the user looks every time.
 
 > `facts` is the **structured approval fact** set (v0.9.0+, extended with target localisation in v0.9.6): `tool` / `action` / `actionKey` / `mode` / `scopeShort` / `scopeDetail` / `paths[]` (max 8, absolute targets first, write targets after) / `pathsMissing` / **`targetScope`** / **`targetScopeText`** / **`targetTraversal`** / **`fenceText`** (v0.9.7: fence interception reason, present only when the fence fires) / `command` / `commandLabel` / `reason`. It passes through `compactFacts()` (whitelist + per-field truncation) before being written, so `events.jsonl` cannot grow without bound; **older events on disk are given `facts` on the fly by the events API from what was recorded (tool / mode / files / command / justification), with nothing written back**. The browser renders the field table first (operation type / target path / **target location** / blast radius / command / model note, plus an **interception reason** row when the fence fires), falling back to `zh` / `justification` text for events without `facts`.
 

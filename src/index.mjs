@@ -557,7 +557,10 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   if (o.learningCount !== undefined) ev.learningCount = o.learningCount
   if (o.threshold !== undefined) ev.threshold = o.threshold
   if (o.category) ev.category = o.category
-  // path：判定路径标识（hard-category / unknown-category / deny-rule / deny / flash-failed / neutral-reject / neutral-confirm）
+  // path：判定路径标识（hard-category / unknown-category / deny-rule / deny / flash-failed /
+  //       neutral-reject / neutral-confirm / fence / sensitive-path / outside / redacted-target / dsh-config）
+  //       verdict 另有 'rule'（白名单命中）/ 'once'（一次性凭条）/ 'scope'（定域放行）/
+  //       'dsh-config'（DSH 配置档）/ 'flash-*'（判定器放行）
   if (o.path) ev.path = o.path
   // failureReason：判定器失败的真实原因（超时/上游报错/正文为空/JSON 不合规），排障用
   if (o.failureReason) ev.failureReason = String(o.failureReason).slice(0, 300)
@@ -638,6 +641,36 @@ const DSH_CONFIG_EXCLUDE_RE = /(?:^|[\\/])auto-approve(?:[\\/]|$)|api[-_]?key|ap
 /** 该目标是否属于「DSH 配置里仍必须人工」的例外 */
 function isDshConfigExcluded(target) {
   return DSH_CONFIG_EXCLUDE_RE.test(String(target || ''))
+}
+
+/**
+ * 敏感路径形态（v0.9.8，用户 2026-10-05 决策：**永远人工**）。
+ *
+ * 与 `DSH_CONFIG_EXCLUDE_RE` 的区别：那条只作用于 `$DSH_HOME` 下的目标，而用户要防的
+ * 是「模型多读一个敏感文件导致泄密」—— 私钥、云凭据、浏览器 Cookie 大多在工作区**之外**，
+ * 也有不少（`.env`）就在工作区里。因此这一层对**所有**目标生效，且排在 DSH 配置自动放行
+ * 与白名单**之前**：凭据文件不因为「路径在 profile 下」或「规则命中」而被放行。
+ *
+ * 口径刻意按「**目录段** 或 **文件名**」匹配，不做全路径子串匹配 ——
+ * 后者会把 `src/credential/transport.ts`、`scripts/secure-secret-hydration.test.ts`
+ * 这类**源码文件**判成敏感（实测 2 次误报）。fail-safe 的方向不变：认不出来按不敏感处理，
+ * 但真正的凭据形态一律命中。
+ */
+const SENSITIVE_SEGMENT_RE = /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|\.kube|\.docker|gcloud|auto-approve)(?:[\\/]|$)/i
+const SENSITIVE_BASENAME_RE = /(?:^|[\\/])(?:id_rsa|id_dsa|id_ecdsa|id_ed25519|credentials(?:\.\w+)?|\.env(?:\.\w+)*|\.npmrc|\.netrc|\.git-credentials|\.pgpass|\.my\.cnf|login data|cookies|web data|local state|[\w@.-]+\.(?:pem|key|pfx|p12|kdbx|jks|keystore))$/i
+
+/**
+ * 本次调用是否碰到敏感路径形态。
+ * @param {string[]} paths 已归一化的绝对路径（targetScope.inside ∪ targetScope.outside）
+ * @returns {string|undefined} 命中的路径（未命中返回 undefined）
+ */
+export function sensitiveTargetHit(paths) {
+  for (const p of paths || []) {
+    const s = String(p || '')
+    if (!s) continue
+    if (SENSITIVE_SEGMENT_RE.test(s) || SENSITIVE_BASENAME_RE.test(s)) return s
+  }
+  return undefined
 }
 
 /** 取参数中的首个路径类字段（与 dsh-auto-mode 的 pathArgument 对齐） */
@@ -995,6 +1028,7 @@ function getRulesSnapshot(permissionPresets) {
       judgeMaxTokens: config.judgeMaxTokens || 1024,
       sedimentScope: sedimentScope(),
       scopeAutoAllow: config.scopeAutoAllow !== false,
+      outsideNeedsHuman: config.outsideNeedsHuman !== false,
       learning: { enabled: learning.enabled !== false }
     },
     learning: {
@@ -1118,6 +1152,15 @@ function applyRuleOp(op, kind, value) {
     saveJson(ALLOWLIST_PATH, config)
     audit(`CONFIG  sedimentScope → ${v}`)
     return { ok: true, set: true, value: v }
+  }
+
+  // 工作区外一律人工开关（布尔，用户 2026-10-05 决策）
+  if (kind === 'outsideNeedsHuman') {
+    if (op !== 'set') return { ok: false, error: 'outsideNeedsHuman 使用 set 操作' }
+    config.outsideNeedsHuman = !(value === false || value === 'false')
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  outsideNeedsHuman → ${config.outsideNeedsHuman}`)
+    return { ok: true, set: true, value: config.outsideNeedsHuman }
   }
 
   // 定域放行开关（布尔）：目标全部在工作区内即自动放行（用户 2026-10-04 决策）
@@ -1361,6 +1404,9 @@ function normalizeConfig(raw) {
   // 定域放行：目标全部落在工作区内即放行（用户 2026-10-04 决策：工作区内的增删改查风险可控）。
   // 关闭后回到旧行为：工作区内的 danger-full-access 也要过判定器 / 人工。
   cfg.scopeAutoAllow = cfg.scopeAutoAllow !== false
+  // 工作区外一律人工（用户 2026-10-05 决策）：目标含工作区之外的路径即转人工。
+  // 用户手写的规则仍先生效（规则层在它之前），$DSH_HOME 的配置维护也在它之前自动放行。
+  cfg.outsideNeedsHuman = cfg.outsideNeedsHuman !== false
   cfg.learning = cfg.learning || { enabled: true }
   // 判定模型：先迁移旧字段（本机取值），再规范化
   migrateJudgeModel(cfg)
@@ -1507,8 +1553,7 @@ function matchContains(contextText, candidateText) {
   return c.length >= 4 && contextText.length >= 4 && c.includes(contextText)
 }
 
-// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）。
-// keywords 为可选的多候选指纹（追认规则会写入），任一候选命中即视为 contains 命中；
+// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）。// keywords 为可选的多候选指纹（追认规则会写入），任一候选命中即视为 contains 命中；
 // 仅当规则给出 contains 或 keywords 时才要求命中，二者皆无表示「工具+模式+类别」宽规则。
 function matchRule(rules, toolName, mode, category, justification) {
   const list = rules || []
@@ -1526,6 +1571,33 @@ function matchRule(rules, toolName, mode, category, justification) {
     return rule
   }
   return null
+}
+
+/**
+ * 规则锚定文本（v0.9.8）：`contains` / `keywords` 只按**真实事实**匹配 ——
+ * 本次调用的命令、真实目标路径 —— **绝不用模型的 justification 措辞**。
+ *
+ * 为什么必须锚定：规则原本的匹配上下文是 `justification + 命令 + files`，于是
+ * 「说明里提到 git」就能让 `contains:"git"` 放行任意命令。实测 30 天 840 条规则放行里
+ * **152 条的命令里根本没有规则词**：`npm run lint` 被 `contains:"github"` 放行、
+ * `npm run test:...` 被 `contains:"EPERM"` 放行 —— 都只因为说明里写了「GitHub」「沙箱会 EPERM」。
+ * 用措辞授予权限等于没有权限边界。
+ *
+ * 锚定为空（没记录到命令、也没有目标）时，含 `contains`/`keywords` 的规则**不匹配**
+ * （fail-closed）：看不见真实操作就不放行，交给判定器或人工。
+ *
+ * @param {string} command 本次调用解析到的真实命令（严格按 callId 命中，不含「回溯同名调用」）
+ * @param {string[]} files 写目标（write/edit 的 file_path 等）
+ * @param {string[]} targets 命令/参数里的绝对路径目标
+ * @returns {string} 锚定文本（可能为空串）
+ */
+function ruleAnchorText(command, files, targets) {
+  const parts = []
+  const push = (v) => { if (typeof v === 'string' && v.trim()) parts.push(v.trim()) }
+  push(command)
+  for (const f of files || []) push(String(f))
+  for (const t of targets || []) push(String(t))
+  return parts.join(' ')
 }
 
 /**
@@ -1763,7 +1835,15 @@ function extractFingerprintCandidates(text) {
     raw.push(seg)
   }
   for (const m of s.matchAll(/(?:[a-zA-Z]:[\\/]|(?:~[\\/]|[\\/]|\.[\\/]))[\w@.\-\\/]{2,}/g)) {
-    push(m[0].replace(/[，。；、,.;:：\s]+$/g, ''))
+    const seg = m[0].replace(/[，。；、,.;:：\s]+$/g, '')
+    push(seg)
+    // 同时产出**一级父目录**：那是「同一目录下的同类操作」的自然指纹 ——
+    // 用户手写的 Rime 规则就是这个形状（keywords 里带 `appdata/roaming/rime`）。
+    // v0.9.8 锚定后指纹只来自真实路径，若不产出父目录，规则会退化成「只认这一个文件」，
+    // 比升级前更窄（升级前的目录级候选来自 justification 措辞）。
+    // 只取一级，避免把 `C:\Users` 这种过宽候选写进规则。
+    const parent = seg.replace(/[\\/][^\\/]+$/, '')
+    if (parent && parent !== seg && /[\\/]/.test(parent)) push(parent)
   }
   for (const m of s.matchAll(/["'`“‘]([^"'`”’\r\n]{3,120})["'`”’]/g)) push(m[1])
   for (const m of s.matchAll(/[\w@.\-]+\.(?:md|js|json|ya?ml|env|txt|py|ts|css|html|log|mjs|cjs|dict)/gi)) push(m[0])
@@ -1779,6 +1859,33 @@ function extractFingerprintCandidates(text) {
     if (out.length >= 8) break
   }
   return out
+}
+
+/**
+ * 规则的**主指纹**（`contains`）：绝对路径优先取「一级父目录」，否则退回最长候选。
+ *
+ * 为什么取父目录：`contains` 决定「下一次什么操作能复用这条规则」。用完整文件路径做 `contains`，
+ * 同一目录下换个文件名就要重新审批一次，规则也会无限增殖。用户手写的 Rime 规则正是目录级
+ * （`contains: appdata/roaming/rime`），追认写下的规则也应当是这个粒度。
+ *
+ * 两条边界：
+ *   · 文本本身就是目录（末段没有扩展名）时按原样使用 —— 说明措辞里写的往往就是目录；
+ *   · **只对绝对路径**取父目录。相对路径（`scripts/verify.mjs`）的父目录只有 `scripts` 这么短，
+ *     拿它做 contains 会把规则放宽到「任何提到 scripts 的命令」。
+ */
+function extractRuleFingerprint(text) {
+  const s = String(text || '')
+  const m = s.match(/(?:[a-zA-Z]:[\\/]|\\\\|~[\\/]|\/)[\w@.\-\\/]{2,}/)
+  if (m) {
+    const seg = m[0].replace(/[，。；、,.;:：\s]+$/g, '')
+    const last = seg.split(/[\\/]/).pop() || ''
+    if (/\.[A-Za-z0-9]{1,8}$/.test(last)) {
+      const parent = seg.replace(/[\\/][^\\/]+$/, '')
+      if (parent && /[\\/]/.test(parent)) return parent.slice(0, 80)
+    }
+    return seg.slice(0, 80)
+  }
+  return extractOperationFingerprint(s)
 }
 
 // 具名导出：供单元测试直接验证真实实现（而非测试内重复一份逻辑）
@@ -1807,7 +1914,7 @@ export function judgeModelCandidates(judgeModel, selection) {
   return out
 }
 
-export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, SHARED_RULE_KEYS, normalizeMatchText, extractFingerprintCandidates }
+export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, ruleAnchorText, SHARED_RULE_KEYS, normalizeMatchText, extractFingerprintCandidates }
 
 export default {
   name: NAME,
@@ -2230,14 +2337,13 @@ export default {
 
               // 写入沉淀规则：带操作指纹，只放行同一指纹的操作（宽规则会误放行用户没确认过的其他操作）
               reloadConfig()
-              const fingerprintText = String(event.justification || event.reason || '')
-              const fingerprint = extractOperationFingerprint(fingerprintText)
-              const filesText = Array.isArray(event.files) ? event.files.join(' ') : ''
-              // 命令类工具（pwsh）没有 file_path：把记录下来的真实命令并入指纹文本，
-              // 否则 keywords 只能来自 justification 的偶然词（事故：contains:"job" 只匹配
-              // 含 "job" 的那一次，下一次同目标调用措辞一变就失效）。
               const commandText = String(event.command || '')
-              const candidates = extractFingerprintCandidates(fingerprintText + ' ' + filesText + ' ' + commandText)
+              // 锚定优先（v0.9.8）：指纹取真实命令 + 目标，规则才能在锚定后的白名单层命中。
+              // 看不见真实操作时退回说明措辞 —— 否则用户「追认了却写不出任何指纹」，重试仍被拒。
+              const anchorText = ruleAnchorText(commandText, Array.isArray(event.files) ? event.files : [], Array.isArray(event.targets) ? event.targets : [])
+              const fingerprintText = anchorText || String(event.justification || event.reason || '')
+              const fingerprint = extractRuleFingerprint(fingerprintText)
+              const candidates = extractFingerprintCandidates(fingerprintText)
               const rule = { tool: String(event.tool || 'unknown'), category: cat }
               if (event.mode) rule.mode = String(event.mode)
               if (fingerprint) rule.contains = fingerprint
@@ -2639,10 +2745,16 @@ export default {
       )
     }
 
-    const recordSample = (key, justification) => {
-      const fp = extractOperationFingerprint(justification)
+    /**
+     * 记一条学习样本。
+     * @param {string} key 学习 key（会话|工具|模式|类别）
+     * @param {string} anchorText 指纹来源：**锚定文本**（命令 + 真实目标），不用模型措辞
+     * @param {string} ctxText 给人看的上下文（保留模型原文，供同类语义验证的提示词）
+     */
+    const recordSample = (key, anchorText, ctxText) => {
+      const fp = extractOperationFingerprint(anchorText)
       const list = (learning.history[key] || []).slice()
-      list.push({ fp: fp || null, ctx: justification.slice(0, 120), ts: new Date().toISOString() })
+      list.push({ fp: fp || null, ctx: String(ctxText || anchorText || '').slice(0, 120), ts: new Date().toISOString() })
       learning.history[key] = list.slice(-10)
       return fp
     }
@@ -2744,11 +2856,22 @@ export default {
         // 只在真正落到人工面前的出口调用：自动放行路径不动 req.reason。
         const showChineseReason = () => { if (zhReason) req.reason = zhReason }
         const matchContext = toolCmd ? `${justification} ${toolCmd}` : justification
-        // 规则匹配上下文：justification + 命令 + 本次调用的真实目标文件（write/edit 的 file_path）。
-        // 追认/沉淀规则的路径指纹来自历史事件，若匹配时看不到本次调用的文件路径，规则会静默失效
-        // （2026-09-18：追认后重试同一次写入仍重新进入判定器的直接原因）。
-        // 判定器输入仍用 matchContext，不受影响。
-        const ruleMatchContext = [matchContext, ...(toolFiles || [])].filter(Boolean).join(' ')
+        // 规则匹配上下文（v0.9.8 锚定）：只装**真实事实** —— 命令 + 写目标 + 绝对路径目标。
+        // 不含 justification：模型的措辞不能授予权限（详见 ruleAnchorText 注释）。
+        // 追认/沉淀规则的指纹来自历史事件的同一份锚定文本，因此仍能互相匹配；
+        // 靠措辞写下的旧规则会失效 —— 这是修复本身，不是回归。
+        const ruleMatchContext = ruleAnchorText(toolCmd, toolFiles, (toolTargets || []).map((t) => t.raw))
+        // 「宽松上下文」（v0.9.8）：justification + 命令 + 写目标，**含模型措辞**。
+        // 只给两类用途，都是「宁可多放行一次 / 多拦一次也不能失配」的场景：
+        //   · 一次性凭条（追认时选「仅本次」）—— 用户对某一次重试的显式放行，匹配不到就等于
+        //     「批准了还继续弹」；只在本会话内生效、命中即消费。
+        //   · denyRules（用户拒绝过的操作）—— 拒绝侧失配会让本该拦下的操作落到判定器手里，
+        //     那是安全回归；宽松匹配只会多弹一次人工，不会放行任何东西。
+        const looseMatchContext = [matchContext, ...(toolFiles || [])].filter(Boolean).join(' ')
+        // 学习 / 沉淀的指纹来源：锚定文本优先；看不见真实操作（没记录到命令、也没目标）时
+        // 退回说明措辞，否则用户「确认了却什么都沉淀不下来」。退回产生的规则只在同样看不见
+        // 真实操作时才有机会命中 —— 与 looseMatchContext 是同一类兜底。
+        const learnAnchor = ruleMatchContext || justification
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
         const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why, failureReason) => {
@@ -2764,7 +2887,7 @@ export default {
               const k = learnKey(sid, tName, tMode, cat || 'neutral')
               const prev = learning.stats[k] || 0
               learning.stats[k] = prev + 1
-              recordSample(k, jst)
+              recordSample(k, learnAnchor, jst)
               saveLearning()
             }
             // 判定器不可用而转人工的操作，用户批准即等于「这个目标我已经确认过了」：
@@ -2773,7 +2896,7 @@ export default {
             // 只记学习样本、不写规则，下一次同目标调用仍要过坏判定器，于是被静默拒绝，
             // 用户只能反复追认。写入规则后，同类调用在管道第 2 层（白名单）直接放行。
             if (why === 'flash-failed' && learning.enabled) {
-              const fpText = String(jst || '') + ' ' + ((toolFiles || []).join(' '))
+              const fpText = learnAnchor
               const fingerprint = extractOperationFingerprint(fpText)
               const candidates = extractFingerprintCandidates(fpText)
               const scope = sedimentScope()
@@ -2844,7 +2967,31 @@ export default {
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'fence')
         }
 
-        // 1c. DSH 配置档：$DSH_HOME 下的 profile / 插件 / 依赖改动自动放行
+        // 1c. 敏感路径形态 → **永远人工**（v0.9.8，用户 2026-10-05 决策）。
+        //     用户要防的正是「模型多读一个敏感文件导致泄密」，所以这一层对**所有**目标生效、
+        //     且排在 DSH 配置自动放行与白名单之前：凭据文件不因为「路径在 profile 下」
+        //     或「规则命中」而被放行。工作区内的 `.env` / `*.pem` 同样命中。
+        const sensitiveHit = sensitiveTargetHit([...targetScope.inside, ...targetScope.outside])
+        if (sensitiveHit) {
+          audit(`SENSITIVE ${toolName} mode=${mode || 'none'} | ${sensitiveHit}`)
+          return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'sensitive-path')
+        }
+
+        // 1d. DSH 配置档补口：**命令类工具**（pwsh/bash）没有 file_path，
+        //     hardDenyFacts 的 dsh-config 档压根没生效 —— 实测 30 天 76 条「定域 outside」
+        //     的自动放行里 35 条是 `~/.dsh` 的 profile / 插件依赖维护
+        //     （`pnpm --dir … install`、改 pin、备份 cordis.patch.yml）。
+        //     用户 2026-10-05 决策里 DSH 自身配置改动仍自动放行，所以这里把同一档补到命令目标上。
+        //     例外与 hardDenyFacts 一致：审批门自身数据目录、凭据类文件名（`isDshConfigExcluded`）。
+        if (!dshConfigAllow && (targetScope.scope === 'outside' || targetScope.scope === 'mixed') && targetScope.outside.length > 0) {
+          const allUnderDshHome = targetScope.outside.every((p) => { try { return isWithin(roots.dshHome, p) } catch { return false } })
+          const excluded = targetScope.outside.find((p) => isDshConfigExcluded(p))
+          if (allUnderDshHome && !excluded) {
+            dshConfigAllow = `命令目标全在 $DSH_HOME 下（${targetScope.outside.length} 处）`
+          }
+        }
+
+        // 1e. DSH 配置档：$DSH_HOME 下的 profile / 插件 / 依赖改动自动放行
         //     （用户 2026-10-04 决策：这块风险可控；最近 7 天 36 次人工里 20 次是这类）
         //     例外（审批门自身数据目录、凭据类文件名）已在 hardDenyFacts 里转人工。
         if (dshConfigAllow) {
@@ -2856,7 +3003,7 @@ export default {
         // 2. 白名单层：确定性放行（不过 flash）。两个来源：一次性额度 + 规则命中。
         //    两者都排在硬拒/硬事实/危险词之后，因此不会绕过任何安全闸。
         //    2a. 「仅本次放行」一次性额度（追认时选「本次」）：不写规则，只放行匹配的这一次
-        const onceHit = consumeOnceGrant(sessionId, toolName, mode, null, ruleMatchContext)
+        const onceHit = consumeOnceGrant(sessionId, toolName, mode, null, looseMatchContext)
         if (onceHit) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (once: 追认时选的「仅本次放行」，额度已消费)`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'once', displayOpts)
@@ -2881,6 +3028,21 @@ export default {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (scope: 目标全部在工作区内 ${targetScope.inside.length} 处)`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'scope', displayOpts)
           return 'allowed-once'
+        }
+
+        // 2d. 工作区外一律人工（v0.9.8，用户 2026-10-05 决策）。
+        //     用户的原话是「工作区外一律人工」，动机是「确保模型不会多读我的一些敏感文件导致泄密」，
+        //     所以 `outside` 与 `mixed` 都在此转人工 —— 只要目标里有一个在工作区之外，就让用户过目。
+        //
+        //     位置很关键：排在**白名单之后**。用户手写的规则（如 `%APPDATA%\Rime` 输入法配置、
+        //     `weaseldeployer.exe`）本身就在工作区之外，那是用户的显式选择，「一律」约束的是默认姿态，
+        //     不是用户自己写下的规则。`$DSH_HOME` 的 profile / 插件依赖维护已在 1d/1e 放行。
+        //
+        //     刻意**不覆盖 `unknown`**：提不出绝对路径不等于「在工作区外」（30 天 368 条自动放行落在
+        //     unknown），把它一并拦下等于把所有命令类调用打回人工。
+        if (config.outsideNeedsHuman !== false && (targetScope.scope === 'outside' || targetScope.scope === 'mixed')) {
+          audit(`OUTSIDE ${toolName} mode=${mode || 'none'} | 目标含工作区外路径 ${targetScope.outside.length} 处`)
+          return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'outside')
         }
 
         // 3. 脱敏（吸收自 dsh-auto-mode classifier.ts）：
@@ -3002,7 +3164,7 @@ export default {
         // 4f. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
         //    拒绝侧**有意不过滤会话**（用户 2026-10-03 决策）：跨会话只会多弹一次人工，
         //    绝不会自动放行任何东西，保持全局是更安全的一侧。
-        if (matchRule(config.denyRules, toolName, mode, cat, ruleMatchContext)) {
+        if (matchRule(config.denyRules, toolName, mode, cat, looseMatchContext)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
@@ -3024,7 +3186,8 @@ export default {
         const confirmed = learning.stats[key] || 0
 
         if (confirmed >= threshold) {
-          const fingerprint = extractOperationFingerprint(justification)
+          // 指纹必须与 recordSample 写下的来源一致（锚定文本优先），否则「确认过」的样本永远命中不了
+          const fingerprint = extractOperationFingerprint(learnAnchor)
           const samples = learning.history[key] || []
           const fpHit = Boolean(fingerprint) && samples.some((s) => s.fp === fingerprint)
 
@@ -3092,7 +3255,7 @@ export default {
           audit(`OUTCOME ${key} outcome=${outcome} | ${reason.slice(0, 80)}`)
           if (outcome === 'allowed-once' && learning.enabled) {
             // 批准 → 记录本次操作样本（背景+指纹）；计数保持阈值位
-            recordSample(key, justification)
+            recordSample(key, learnAnchor, justification)
             saveLearning()
             recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
           } else if (outcome === 'rejected') {
@@ -3123,11 +3286,13 @@ export default {
         if (outcome === 'allowed-once' && learning.enabled) {
           // 批准 → 确认计数 +1，并记录本次操作样本（未达阈值，下次同类仍人工确认）
           learning.stats[key] = confirmed + 1
-          recordSample(key, justification)
+          recordSample(key, learnAnchor, justification)
           saveLearning()
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed + 1, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
         } else if (outcome === 'rejected') {
           // 拒绝 → 升级为永久人工规则（带操作指纹；提取不到则拦全部同类，拒绝从严）
+          // 指纹刻意取**说明措辞**而不是锚定文本：denyRules 用的是宽松上下文（looseMatchContext），
+          // 拒绝侧失配会让本该拦下的操作落到判定器手里 —— 那是安全回归。
           const fingerprint = extractOperationFingerprint(justification)
           const rule = { tool: toolName, category: cat }
           if (mode) rule.mode = mode
@@ -3151,6 +3316,6 @@ export default {
       }
     }, { prepend: true })
 
-    console.log(`[${NAME}] 已挂载：硬拒(凭据/系统路径)→硬事实人工→危险词→围栏(下载/可执行/持久化/递归删除)→DSH配置放行→白名单→定域放行(${config.scopeAutoAllow === false ? '关' : '开'})→denyRules→判定(JSON allow/ask/deny，硬类别人工，中立计数${config.riskyThreshold}，失败上限${config.judgeFailureLimit})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
+    console.log(`[${NAME}] 已挂载：硬拒(凭据/系统路径)→硬事实人工→危险词→围栏(下载/可执行/持久化/递归删除)→敏感路径永远人工→DSH配置放行→白名单(锚定:命令+真实目标)→定域放行(${config.scopeAutoAllow === false ? '关' : '开'})→工作区外人工(${config.outsideNeedsHuman === false ? '关' : '开'})→denyRules→判定(JSON allow/ask/deny，硬类别人工，中立计数${config.riskyThreshold}，失败上限${config.judgeFailureLimit})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
   },
 }

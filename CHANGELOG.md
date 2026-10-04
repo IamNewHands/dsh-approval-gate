@@ -4,6 +4,59 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.8] — 2026-10-05
+
+**第 ④ 步：git 按命令锚定 + 工作区外一律人工 + 敏感路径形态永远人工。** 用户 2026-10-05 决策。
+
+### ① 规则只按真实事实匹配（「按命令锚定」）
+
+规则的 `contains` / `keywords` 原本匹配的是 `justification + 命令 + files`，于是**模型的措辞能授予权限**：说明里写「git push 需要凭据管理器」，`contains:"git"` 就放行任意命令。
+
+- 新增 `ruleAnchorText(command, files, targets)`：锚定文本只装**真实事实**（本次调用的命令、写目标、绝对路径目标），白名单层改用它匹配
+- **实测（30 天 897 条自动放行，规则表 39 条真实规则）**：**30 条**有真实命令的规则放行在锚定后不再命中 —— 全是真误放行，例如 `gh run view` 被 `contains:"github"` 放行、`npm test` 被 `contains:"vitest"` 放行、`pwsh -File verify-branches.ps1` 被 `contains:"git"` 放行，共同点是**命令里根本没有那个词**
+- 另有 **212 条**规则放行的命令**根本没被记录**（提权重试时 `tool/call` 尚未进入审批处理器看到的会话视图）。锚定为空 ⇒ 含 `contains` 的规则不匹配（fail-closed），这些请求改由判定器裁决
+- 指纹来源同步锚定：追认 / 判定器不可用沉淀 / 中立确认学习的指纹都取自锚定文本，规则才能在锚定后的白名单层命中；**看不见真实操作时**退回说明措辞（否则「追认了却写不出指纹」，重试仍被拒）
+- 追认的 `contains` 改为**目录级**（`extractRuleFingerprint`：绝对路径取一级父目录）——否则同一目录换个文件名就要重新审批一次、规则无限增殖。用户手写的 Rime 规则正是这个形状
+- `extractFingerprintCandidates` 增加**一级父目录**候选，`keywords` 覆盖「同一目录下的同类操作」
+- **两处刻意不锚定**：一次性凭条（追认选「仅本次」，用户对某一次重试的显式放行）与 `denyRules`（拒绝侧失配会让本该拦下的操作落到判定器手里，是安全回归）。两者都用 `looseMatchContext`
+
+### ② 工作区外一律人工
+
+- 目标含工作区之外的路径（`outside` / `mixed`）→ 转人工。动机是用户原话「确保模型不会多读我的一些敏感文件导致泄密」
+- **位置排在白名单之后**：「一律」约束的是默认姿态，不是用户自己写下的规则。用户手写的 `%APPDATA%\Rime`、`weaseldeployer.exe` 等**本身就在工作区之外**的规则仍然生效
+- 刻意**不覆盖 `unknown`**：提不出绝对路径不等于在区外（30 天 368 条自动放行落在 unknown），一并拦下等于把所有命令类调用打回人工
+- **DSH 配置档补口**：命令类工具（`pwsh`/`bash`）没有 `file_path`，`hardDenyFacts` 的 dsh-config 档一直没生效。新增「命令目标全在 `$DSH_HOME` 下 → 自动放行」，实测把 **54 条**区外维护（`pnpm --dir … install`、改 pin、备份 `cordis.patch.yml`）留在自动档，例外仍是审批门自身数据目录与凭据类文件名
+- 新增设置页开关「工作区外一律人工」，关闭后退回判定器
+
+### ③ 敏感路径形态永远人工
+
+- 新增 `sensitiveTargetHit(paths)`：命中即人工，排在 DSH 配置自动放行与白名单**之前** —— 凭据文件不因为「路径在 profile 下」或「规则命中」而被放行
+- 口径是**目录段 / 文件名**，不做全路径子串匹配：`.ssh` `.aws` `.gnupg` `.kube` `.docker` `gcloud` `auto-approve` / `id_rsa` `credentials*` `.env*` `.npmrc` `.netrc` `.git-credentials` `*.pem` `*.key` `*.pfx` `*.p12` `*.kdbx` `Cookies` `Login Data` `Web Data` `Local State`
+- 工作区内的 `.env` / `*.pem` 同样命中；`src/credential/transport.ts`、`scripts/secure-secret-hydration.test.ts` 这类**源码文件不误报**（宽口径版本实测 2 次误报，收紧后为 0）
+
+### 实测（真实 `events.jsonl`，30 天 1210 事件 / 897 条自动放行 / 147 次人工提示）
+
+| 项 | 数值 |
+|---|---|
+| 因第 ④ 步变成人工的自动放行 | **31**（敏感路径 2 + 工作区外 29）⇒ 人工提示 147 → 178（**+21%**） |
+| DSH 配置档补口保住的自动放行 | **54**（补口前该档只有 2 条生效） |
+| 锚定后失去规则放行（有真实命令 = 真误放行） | **30** |
+| 锚定后失去规则放行（命令未记录 → 交给判定器） | **212** |
+| 规则表 39 条里「在真实命令上一次都没命中」的 | **9**（`worker process` / `child process` / `subprocess` / `凭据` / `typescript` / `eslint` / `weaseldeployer.exe` / `workspace-write` / …） |
+
+> 那 9 条（以及仍会因路径里的偶然词命中、例如 `contains:"main"` 命中 270 次的几条）建议按命令里的真实词重写或直接删掉。注意「0 命中」也可能只是那段时间没记录到命令，不是判决书。
+
+### 行为变化（需要知道）
+
+- **判定器流量变宽**：212 条原本靠措辞规则放行的请求改为判定器裁决；判定器不可用时它们会转人工
+- **工作区外不再沉淀规则**：`forwardToHuman(..., 'outside')` 只记事件不写规则 —— 「一律人工」意味着每次都过目（`flash-failed` 的沉淀路径仍然存在，只是区外目标根本走不到判定器）
+- 三个既有测试用例相应调整：`pipeline` 的 neutral-deny 与 flash-failed 沉淀改用**工作区内**目标（区外会被新层接管）、`fence-scope` 的区外断言改为「转人工」
+- 新增 `test/step4-anchor.test.mjs`（15 组断言）
+
+### 下一步（尚未实施）
+
+删掉那 9 条只在措辞上命中的规则；把 `contains:"main"` / `"job"` / `"desktop"` / `"iOS"` 这类靠路径偶然词命中的宽规则收窄。
+
 ## [0.9.7] — 2026-10-04
 
 **工作区内按定域放行，同时给「下载 / 可执行产物」加一道否决层。** 用户决策：工作区内的增删改查风险可控，不必每次人工；但模型被诱导下载恶意脚本、exe 时必须触发审批。

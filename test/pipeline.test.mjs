@@ -353,12 +353,14 @@ function boot(opts) {
   assert.strictEqual(outcome, 'allowed-once', 'the human can approve the hard-category operation')
 
   // 对照：同一工具、同一理由，但类别为 neutral 时仍走静默拒绝（不因上面放宽而全面放开）
+  // 目标刻意放在**工作区内**：v0.9.8 起「目标含工作区外路径 → 一律人工」会先接管，
+  // 用区外路径就测不到判定层的静默拒绝了（本文件已把定域放行关掉，区内会照常走判定器）。
   boot({ judgeReply: () => '{"decision":"deny","reason":"outside the workspace","category":"neutral"}' })
   const neutralReq = makeReq({
     sessionId: 's-deny-hardcat-neutral',
     toolName: 'edit',
-    justification: 'Merge.yaml 位于 %APPDATA%，在工作区之外',
-    args: { file_path: 'C:\\Users\\example\\AppData\\Roaming\\app\\Merge.yaml' },
+    justification: 'Merge.yaml 需要整体替换',
+    args: { file_path: join(WORKSPACE, 'app', 'Merge.yaml') },
   })
   const neutral = await decide(null, neutralReq)
   assert.strictEqual(neutral.outcome, 'rejected', 'neutral deny is still silently rejected')
@@ -507,7 +509,9 @@ function boot(opts) {
 // 事故根因之一：flash-failed 分支只记学习样本、不写规则，下一次同目标调用仍要过坏判定器。
 {
   const cfgPath = join(dataDir, 'allowlist.json')
-  const target = 'C:\\Users\\example\\AppData\\Roaming\\Rime\\my_phrase.dict.yaml'
+  // 目标刻意放在**工作区内**：v0.9.8 起「目标含工作区外路径 → 一律人工」会先接管，
+  // 而那一层是**不沉淀规则**的（用户要每次都过目），用区外路径就测不到 flash-failed 的沉淀路径了。
+  const target = join(WORKSPACE, 'AppData', 'Roaming', 'Rime', 'my_phrase.dict.yaml')
   boot({ judgeReply: () => { throw new Error('judge down') } })
   const req = makeReq({
     sessionId: 's-flash-failed-learn',
@@ -522,13 +526,19 @@ function boot(opts) {
   // 注意：磁盘上的 allowRules 会被 normalizeConfig 补齐默认规则，所以不能拿"磁盘前后差集"当基线；
   // 按指纹特征断言（同一指纹只能有一条规则）。
   const readRules = () => JSON.parse(readFileSync(cfgPath, 'utf8')).allowRules
+  // 指纹可能落在 contains（路径短时）或 keywords（路径超长、contains 退到文件名时）——两处都算
+  const hasName = (rule, name) => String(rule.contains || '').toLowerCase() === name
+    || (Array.isArray(rule.keywords) && rule.keywords.some((k) => String(k).toLowerCase() === name))
   const seeded = readRules().filter((rule) =>
-    rule.tool === 'write' && rule.mode === 'danger-full-access'
-    && Array.isArray(rule.keywords) && rule.keywords.some((k) => k.toLowerCase() === 'my_phrase.dict.yaml'))
+    rule.tool === 'write' && rule.mode === 'danger-full-access' && hasName(rule, 'my_phrase.dict.yaml'))
   assert.strictEqual(seeded.length, 1, 'approval writes exactly one rule carrying the real target fingerprint')
   const rule = seeded[0]
   assert.strictEqual(rule.category, 'neutral', 'rule keeps the neutral category')
-  assert.strictEqual(rule.contains, target, 'rule records the absolute target as its primary fingerprint')
+  // 指纹来自**真实目标路径**而不是说明措辞。路径超过 100 字符时 extractOperationFingerprint
+  // 会退到「带扩展名的文件名」这一档 —— 本用例的 workspace 是临时目录，路径本来就超长，
+  // 两种形态都证明指纹来自目标路径（说明措辞里根本没有这个文件名）。
+  assert.ok(rule.contains === target || rule.contains === 'my_phrase.dict.yaml',
+    'rule records a fingerprint derived from the real target path, not from the prose: ' + rule.contains)
 
   // 关键回归：下一次同目标调用走白名单层，不再调用判定器
   const { state: state2 } = boot({ judgeReply: () => { throw new Error('judge must not be called') } })

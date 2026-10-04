@@ -499,7 +499,10 @@ function attachScrollDom(env, tree) {
   const info = inspect(tree)
   assert.ok(/判定器失败即转人工/.test(info.text), 'settings expose the judge failure limit')
   assert.ok(/判定输出上限/.test(info.text), 'settings expose the judge max tokens')
-  console.log('  ✓ 设置页仍可渲染（含判定器失败上限 / 输出上限两个新配置项）')
+  // v0.9.7 / v0.9.8 的两个放行开关：用户必须能一键回退
+  assert.ok(/定域放行/.test(info.text), 'settings expose the scope auto-allow switch')
+  assert.ok(/工作区外一律人工/.test(info.text), 'settings expose the outside-needs-human switch')
+  console.log('  ✓ 设置页仍可渲染（含判定器失败上限 / 输出上限 / 定域放行 / 工作区外一律人工）')
 }
 
 // ================= 6b. 裁判模型卡片：目录可用走下拉，不可用退化手填 =================

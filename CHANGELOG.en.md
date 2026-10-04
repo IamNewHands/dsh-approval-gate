@@ -4,6 +4,59 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.8] — 2026-10-05
+
+**Step ④: anchor git rules to the command + always ask outside the workspace + sensitive path shapes always ask.** User decision, 2026-10-05.
+
+### ① Rules match real facts only ("anchored to the command")
+
+A rule's `contains` / `keywords` used to match `justification + command + files`, so **the model's prose could grant permission**: write "git push needs the credential manager" in the justification and `contains:"git"` allows any command.
+
+- New `ruleAnchorText(command, files, targets)`: the anchor carries **real facts only** (this call's command, write targets, absolute targets); the allowlist layer now matches against it
+- **Measured (30 days, 897 auto-approvals, the real 39-rule table)**: **30** rule-based approvals that had a real command stop matching — all genuine over-permissions, e.g. `gh run view` allowed by `contains:"github"`, `npm test` by `contains:"vitest"`, `pwsh -File verify-branches.ps1` by `contains:"git"` — in every case the word was **not in the command at all**
+- A further **212** rule-based approvals had **no recorded command** (during an escalation retry the `tool/call` event is not yet in the session view the approval handler sees). An empty anchor means a `contains` rule cannot match (fail-closed); those requests now go to the judge
+- Fingerprint sources are anchored too: re-approval / judge-unavailable sediment / neutral-confirmation learning all take their fingerprint from the anchor, so the rule can match the anchored allowlist layer. When the real operation is invisible they fall back to the prose — otherwise "approved but nothing gets sedimented" and the retry is refused again
+- A re-approval's `contains` is now **directory-level** (`extractRuleFingerprint`: for an absolute path, its immediate parent) — otherwise a new filename in the same directory needs a fresh approval and rules proliferate. That is exactly the shape of the user's hand-written Rime rules
+- `extractFingerprintCandidates` gains an **immediate-parent** candidate so `keywords` covers "same kind of operation in the same directory"
+- **Two deliberate exceptions**: the once-only permit (re-approval "this once", the user's explicit permit for one retry) and `denyRules` (a rejection that fails to match lets an operation that should be blocked reach the judge — a safety regression). Both use `looseMatchContext`
+
+### ② Always ask outside the workspace
+
+- A target outside the workspace (`outside` / `mixed`) escalates to a human. The motivation is the user's own words: "make sure the model does not read a few of my sensitive files and leak them"
+- **Ordered after the allowlist**: "always" constrains the default posture, not rules the user wrote. Rules the user wrote for `%APPDATA%\Rime`, `weaseldeployer.exe` and friends — which are themselves outside the workspace — still apply
+- Deliberately **not extended to `unknown`**: being unable to extract an absolute path is not "outside" (368 auto-approvals over 30 days land in unknown), and blocking those would push every command-flavoured call back to a human
+- **DSH-config gap closed**: command tools (`pwsh`/`bash`) have no `file_path`, so the dsh-config tier of `hardDenyFacts` never fired for them. New rule: "all command targets under `$DSH_HOME` → auto-approve" keeps **54** outside-maintenance events automatic (`pnpm --dir … install`, pin updates, `cordis.patch.yml` backups); the exceptions remain the gate's own data directory and credential-named files
+- New settings toggle "always ask outside the workspace"; switching it off restores judge-mediated decisions
+
+### ③ Sensitive path shapes always ask
+
+- New `sensitiveTargetHit(paths)`: a hit escalates to a human and is ordered **before** DSH-config auto-approval and the allowlist — a credential file is not allowed just because it lives under the profile or a rule matches
+- The shape is **directory segment / basename**, never a whole-path substring: `.ssh` `.aws` `.gnupg` `.kube` `.docker` `gcloud` `auto-approve` / `id_rsa` `credentials*` `.env*` `.npmrc` `.netrc` `.git-credentials` `*.pem` `*.key` `*.pfx` `*.p12` `*.kdbx` `Cookies` `Login Data` `Web Data` `Local State`
+- A `.env` / `*.pem` **inside** the workspace is caught too; source files such as `src/credential/transport.ts` and `scripts/secure-secret-hydration.test.ts` are **not** false positives (the broad variant produced 2 measured false positives, the tightened one 0)
+
+### Measured (real `events.jsonl`, 30 days, 1210 events / 897 auto-approvals / 147 human prompts)
+
+| Item | Value |
+|---|---|
+| Auto-approvals that become human because of step ④ | **31** (2 sensitive path + 29 outside) ⇒ human prompts 147 → 178 (**+21%**) |
+| Auto-approvals kept automatic by the DSH-config gap closure | **54** (before the closure that tier covered only 2) |
+| Rule approvals lost to anchoring, with a real command (genuine over-permissions) | **30** |
+| Rule approvals lost to anchoring, command never recorded (→ judge) | **212** |
+| Rules out of 39 that never match a real command | **9** (`worker process` / `child process` / `subprocess` / `凭据` / `typescript` / `eslint` / `weaseldeployer.exe` / `workspace-write` / …) |
+
+> Those 9 — plus the few that still fire on incidental words in paths, e.g. `contains:"main"` matching 270 times — should be rewritten around a word that really appears in the command, or deleted. Note that "0 hits" can also just mean no command was recorded in that window; it is not a verdict.
+
+### Behaviour changes worth knowing
+
+- **The judge sees wider traffic**: 212 requests previously allowed by prose rules now go to the judge, and when the judge is unavailable they escalate to a human
+- **No rule is sedimented for outside targets**: `forwardToHuman(..., 'outside')` records the event only — "always ask" means the user looks every time (the `flash-failed` sediment path still exists, but an outside target never reaches the judge)
+- Three existing test cases were adjusted: `pipeline`'s neutral-deny and flash-failed sediment now use **in-workspace** targets (an outside one would be taken over by the new layer), and `fence-scope`'s outside assertion now expects a human
+- New `test/step4-anchor.test.mjs` (15 assertion groups)
+
+### Next (not implemented)
+
+Delete the 9 prose-only rules; narrow the broad rules that still fire on incidental path words (`contains:"main"` / `"job"` / `"desktop"` / `"iOS"`).
+
 ## [0.9.7] — 2026-10-04
 
 **Allow by scope inside the workspace, with a veto layer for downloads and executable artefacts.** User decision: create/read/update/delete inside the workspace carries controllable risk and does not need a human every time, but when the model is induced to download a malicious script or an `.exe`, approval must fire.

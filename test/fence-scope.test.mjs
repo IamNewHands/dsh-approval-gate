@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 「危险动作围栏 + 定域放行」回归测试（用户 2026-10-04 决策）。
  *
  * 决策原文：工作区内的操作按定域放行，但模型被诱导下载恶意脚本 / exe 必须触发审批。
@@ -224,11 +224,13 @@ async function decide(state, sessionId, justification, toolName, args) {
 
 // ================= 4. fail-closed：工作区外 / 无法定域不放行 =================
 {
+  // v0.9.8 起「工作区外一律人工」会接管这一档（排在白名单之后、判定器之前），
+  // 所以这里断言的是「不放行」，由哪一层拦下由 test/step4-anchor.test.mjs 专门覆盖。
   const state = boot()
   const r = await decide(state, 's3', '跑外部脚本', 'pwsh', { command: `node ${OUTSIDE}\\tool.mjs` })
   assert.notStrictEqual(r.first.verdict, 'scope', 'an out-of-workspace target must not be scope-allowed')
-  assert.strictEqual(state.streamCalls, 1, 'it falls through to the judge instead')
-  console.log('  ✓ fail-closed：工作区外目标不走定域放行，继续交给判定器')
+  assert.strictEqual(r.first.kind, 'manual-pending', 'it goes to a human, not through silently')
+  console.log('  ✓ fail-closed：工作区外目标不走定域放行（v0.9.8 起由「工作区外一律人工」接管）')
 }
 
 // ================= 5. 围栏：区内下载仍然转人工 =================

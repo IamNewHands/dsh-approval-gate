@@ -1227,6 +1227,7 @@ window.__ModuleLoader__.load({
       const [judgeModel, setJudgeModel] = React.useState('')
       const [sedimentScope, setSedimentScope] = React.useState('session')
       const [scopeAutoAllow, setScopeAutoAllow] = React.useState(true)
+      const [outsideNeedsHuman, setOutsideNeedsHuman] = React.useState(true)
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -1243,6 +1244,7 @@ window.__ModuleLoader__.load({
               setJudgeModel(jm && jm.model ? String(jm.model) : '')
               setSedimentScope(data.config.sedimentScope === 'global' ? 'global' : 'session')
               setScopeAutoAllow(data.config.scopeAutoAllow !== false)
+              setOutsideNeedsHuman(data.config.outsideNeedsHuman !== false)
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -1454,6 +1456,24 @@ window.__ModuleLoader__.load({
             }, '保存'),
             React.createElement('span', { className: 'ag-set-item-meta' },
               '工作区外的读写、以及下载 / 可执行产物 / 持久化 / 递归删除仍转人工；关闭后工作区内的提权也走判定器'),
+          ),
+          // 工作区外一律人工（用户 2026-10-05 决策）：目标是防「模型多读一个工作区外的敏感文件」。
+          // 排在白名单**之后**：用户手写的规则（%APPDATA%\Rime、weaseldeployer.exe 等本身就在区外）
+          // 仍然生效；$DSH_HOME 的 profile / 插件依赖维护也已在更前面自动放行。
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('label', { className: 'ag-set-item-meta', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+              React.createElement('input', {
+                type: 'checkbox', checked: outsideNeedsHuman,
+                onChange: function (e) { setOutsideNeedsHuman(e.target.checked) },
+              }),
+              '工作区外一律人工：目标含工作区之外的路径 → 转人工',
+            ),
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn', disabled: busy,
+              onClick: function () { api({ op: 'set', kind: 'outsideNeedsHuman', value: outsideNeedsHuman }) },
+            }, '保存'),
+            React.createElement('span', { className: 'ag-set-item-meta' },
+              '白名单规则仍然先生效；敏感路径（.ssh / .aws / *.pem / .env / Cookies …）与「审批」视图的敏感目录永远人工'),
           ),
           React.createElement('div', { className: 'ag-set-row' },
             React.createElement('input', { className: 'ag-set-input', style: { width: 110 }, placeholder: 'tool', value: newRule.tool, onChange: function (e) { setNewRule(Object.assign({}, newRule, { tool: e.target.value })) } }),
