@@ -4,6 +4,28 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.2] — 2026-10-03
+
+The settings page now has a "judge model" entry: the judging model can be picked from the UI instead of hand-editing `allowlist.json` (the settings UI is ported from upstream PR #11, `@sunligh91`).
+
+### Problem
+
+- **Configurable but not reachable**: `judgeModel` (decoupling the judge from the main model) has been supported on the backend all along — `applyRuleOp` writes it, `judgeModelCandidates` uses it to order the candidate chain, `migrateJudgeModel` migrates the legacy field — yet the settings page had **no** such field at all (`client.js` contained zero occurrences of `judgeModel`), and the host exposed no model-catalog endpoint. The only ways to change the judge were hand-editing `allowlist.json` or curl. And the judge model is exactly the setting users need most: if the default model is a multi-step tool loop (e.g. `agy`), a single judgement cannot finish within `judgeTimeoutMs`, which shows up as "every approval goes to a human" with no actionable control in the UI
+- **Upstream PR #11 leaves a gap**: it ships both the dropdown and `/api/auto-approve/models`, but the dropdown only shows anything when the catalog loads — on failure it displays "loading available models…" forever, so the user can neither pick nor type a value
+
+### Changes
+
+- **`src/index.mjs`: new `GET /api/auto-approve/models`**. Same source as the model selector in the bottom-right of the conversation: the routes from `llm.listProviders()` plus `llm.listModels(id)` per route. Only routes with a registered adapter are listed (an unregistered/dormant route would fail at judgement time). A single provider's catalog failure is isolated into `failures` while other routes stay selectable (matching the host's `dsh-api-session-controller` catalog policy). An unavailable catalog always returns 200 + an empty list + `reason`, **never a 5xx**; the endpoint sits behind the same credential fence as the rest (issue #12)
+- **`client.js`: new "Judge model · decoupled from the main model" card** in the ④ Flash judgement area. With a catalog it renders two dropdowns (route + model, "follow the agent default model" first); **without** one it degrades to plain provider/model inputs rather than stalling on a loading state — a wrong judge model is precisely when the user must be able to change it, so the entry point must not disappear along with the catalog. The card footer shows the currently effective value; a pinned route/model that has left the catalog (provider switched, adapter removed) still appears as an option marked "current config, unregistered / not in catalog" — otherwise it would render as empty and one click on "save" would silently clear the pin
+- **`test/models-endpoint.test.mjs` (new)**: six assertions pin the endpoint contract — catalog forwarding and current-value echo, single-provider failure isolation, 200 on an unavailable catalog, 405, and no route/model metadata leaking past a 401 credential fence
+- **`test/client-render-smoke.test.mjs`: new case 6b** asserting the dropdown path (listing the selected route's models and no other route's) and the manual-entry fallback, which still shows the effective value
+- **docs/GUIDE (zh/en)**: the `judgeModel` bullet now documents the settings entry and its fallback behaviour
+
+### Compatibility
+
+- **No configuration change, no migration**: the storage format and parsing of `judgeModel` are untouched; the new endpoint is read-only
+- With an unavailable catalog (older DSH / missing llm service) behaviour is identical to 0.9.1; the settings page merely gains an extra card that can be filled in by hand
+
 ## [0.9.1] — 2026-10-02
 
 Dangerous keywords now match on **boundaries** (fixing one real false positive), and the existing "writes under `$DSH_HOME` always require a human" semantics is written down.

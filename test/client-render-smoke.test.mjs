@@ -137,6 +137,14 @@ function createEnv(events, opts) {
     if (target.indexOf('/api/auto-approve/snapshots-stats') >= 0) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, count: 0, bytes: 0, ids: [], files: {} }) })
     }
+    if (target.indexOf('/api/auto-approve/models') >= 0) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(options.models === undefined
+          ? { ok: true, providers: [], current: null, reason: '测试桩未提供目录' }
+          : { ok: true, providers: options.models, current: null }),
+      })
+    }
     if (target.indexOf('/api/auto-approve/rules') >= 0) {
       return Promise.resolve({
         ok: true,
@@ -431,6 +439,54 @@ function inspect(node, out, renderer) {
   assert.ok(/判定器失败即转人工/.test(info.text), 'settings expose the judge failure limit')
   assert.ok(/判定输出上限/.test(info.text), 'settings expose the judge max tokens')
   console.log('  ✓ 设置页仍可渲染（含判定器失败上限 / 输出上限两个新配置项）')
+}
+
+// ================= 6b. 裁判模型卡片：目录可用走下拉，不可用退化手填 =================
+{
+  // 目录不可用（桩返回 providers: []）→ 必须仍能手填：判定模型选错会让每次审批都转人工，
+  // 正是最需要用户自己改的时候，不能因为目录拉不到就把配置入口一起关掉。
+  const envNoCatalog = createEnv([])
+  const bootedNoCatalog = boot(envNoCatalog)
+  const treeNoCatalog = await renderSettled(bootedNoCatalog, bootedNoCatalog.component('dsh-approval-gate.settings'), {})
+  const infoNoCatalog = inspect(treeNoCatalog)
+  assert.ok(/裁判模型/.test(infoNoCatalog.text), 'settings expose the judge model card')
+  assert.ok(/模型目录不可用/.test(infoNoCatalog.text), 'a missing catalog degrades to manual entry')
+  assert.ok(/当前裁判模型：ai-gateway \/ sensenova\/deepseek-v4-flash/.test(infoNoCatalog.text),
+    'the configured judge model is displayed even without a catalog')
+
+  // 目录可用 → 下拉框列路由与模型；只列当前所选 provider 的模型
+  const envCatalog = createEnv([], {
+    models: [
+      { id: 'deepseek-official', name: 'DeepSeek 官方', models: [{ id: 'deepseek-v4-flash', name: 'V4 Flash' }] },
+      { id: 'ai-gateway', name: 'ai-gateway', models: [{ id: 'sensenova/deepseek-v4-flash', name: 'sensenova flash' }] },
+    ],
+  })
+  const bootedCatalog = boot(envCatalog)
+  const treeCatalog = await renderSettled(bootedCatalog, bootedCatalog.component('dsh-approval-gate.settings'), {})
+  const infoCatalog = inspect(treeCatalog)
+  assert.ok(envCatalog.fetchCalls.some((u) => u.indexOf('/api/auto-approve/models') >= 0),
+    'the settings page asks the host for the model catalog')
+  assert.ok(!/模型目录不可用/.test(infoCatalog.text), 'a working catalog does not fall back to manual entry')
+  assert.ok(/跟随 agent 默认模型/.test(infoCatalog.text), 'the dropdown offers "follow the agent default model"')
+  assert.ok(/deepseek-official/.test(infoCatalog.text), 'routes from the catalog are listed')
+  assert.ok(/sensenova flash/.test(infoCatalog.text), 'models of the currently selected route are listed')
+  assert.ok(!/V4 Flash/.test(infoCatalog.text), 'other routes\u2019 models stay out of the list')
+
+  // 目录里没有当前钉住的路由（换过 provider / adapter 被移除）→ 必须仍显示并保持选中：
+  // 显示成空值再按「保存」会把固定值静默清掉。
+  const envStale = createEnv([], {
+    models: [{ id: 'deepseek-official', name: 'DeepSeek 官方', models: [{ id: 'deepseek-v4-pro', name: 'V4 Pro' }] }],
+  })
+  const bootedStale = boot(envStale)
+  const treeStale = await renderSettled(bootedStale, bootedStale.component('dsh-approval-gate.settings'), {})
+  const infoStale = inspect(treeStale)
+  assert.ok(/ai-gateway（当前配置，未注册）/.test(infoStale.text),
+    'a pinned route missing from the catalog is still offered, marked as unregistered')
+  assert.ok(/sensenova\/deepseek-v4-flash（当前配置，不在目录中）/.test(infoStale.text),
+    'a pinned model missing from the catalog is still offered, marked as not-in-catalog')
+  assert.ok(/当前裁判模型：ai-gateway \/ sensenova\/deepseek-v4-flash/.test(infoStale.text),
+    'the effective judge model is still reported')
+  console.log('  ✓ 裁判模型卡片：目录可用走下拉框，目录不可用退化手填')
 }
 
 // ================= 7. 审批说明中文化：zh 字段优先渲染 =================

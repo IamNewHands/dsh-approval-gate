@@ -1534,6 +1534,71 @@ export default {
       console.error(`[${NAME}] 注册规则/初始化 API 失败`, error)
     }
 
+    // ---- 模型目录 API（设置页：裁判模型下拉框） ----
+    // 与 DSH 对话框右下角的模型选择器同源：直接向 llm 服务要各路由的模型目录。
+    // 只列 listProviders() 的路由（已注册 adapter 的、真的调得通的）；未注册/休眠路由
+    // 选了也会在判定时报错，故意不列。目录不可用时返回空列表而不是 5xx：设置页会退化成
+    // 「手填 provider / model」，绝不让配置能力随目录一起失效。
+    let offModelsRoute = null
+    try {
+      if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+        offModelsRoute = ctx.webServer.register({
+          kind: 'exact',
+          path: '/api/auto-approve/models',
+          handler: async (req, res) => {
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
+              return
+            }
+            const send = (code, obj) => {
+              res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
+              res.end(JSON.stringify(obj))
+            }
+            if (req.method !== 'GET' && req.method !== 'HEAD') return send(405, { ok: false, error: 'method not allowed' })
+            const current = config.judgeModel || null
+            try {
+              if (!llm || typeof llm.listProviders !== 'function') {
+                return send(200, { ok: true, providers: [], current, reason: 'llm.listProviders 不可用' })
+              }
+              const providers = []
+              const failures = []
+              // listProviders 在宿主内是同步返回数组（同 dsh-api-session-controller 的用法），
+              // 但它带 @Remote 装饰：远端代理下可能是 Promise。await 对两者都成立。
+              const rawProviders = await llm.listProviders()
+              for (const p of Array.isArray(rawProviders) ? rawProviders : []) {
+                const id = p && typeof p.id === 'string' ? p.id : ''
+                if (!id) continue
+                const name = p && typeof p.name === 'string' && p.name ? p.name : id
+                let models = []
+                try {
+                  const list = typeof llm.listModels === 'function' ? await llm.listModels(id) : []
+                  models = (Array.isArray(list) ? list : [])
+                    .map((m) => ({
+                      id: String((m && m.id) || ''),
+                      name: String((m && m.name) || (m && m.id) || ''),
+                    }))
+                    .filter((m) => m.id !== '')
+                } catch (error) {
+                  // 单个 provider 的目录失败只影响它自己，其余路由照常可选（与宿主
+                  // dsh-api-session-controller 的 catalog 隔离策略一致）
+                  failures.push({ id, error: String((error && error.message) || error).slice(0, 200) })
+                }
+                providers.push({ id, name, models })
+              }
+              return send(200, { ok: true, providers, failures, current })
+            } catch (error) {
+              return send(200, { ok: false, providers: [], current, reason: String((error && error.message) || error).slice(0, 200) })
+            }
+          },
+        })
+        console.log(`[${NAME}] 模型目录 API 已注册：/api/auto-approve/models`)
+      }
+    } catch (error) {
+      console.error(`[${NAME}] 注册模型目录 API 失败`, error)
+    }
+
     // ---- diff / 撤销 / 快照管理 API ----
     let offDiffRoute = null
     let offRevertRoute = null
@@ -1847,6 +1912,7 @@ export default {
       if (offEventsRoute) { try { offEventsRoute() } catch (e) {} }
       if (offRulesRoute) { try { offRulesRoute() } catch (e) {} }
       if (offSetupRoute) { try { offSetupRoute() } catch (e) {} }
+      if (offModelsRoute) { try { offModelsRoute() } catch (e) {} }
       if (offDiffRoute) { try { offDiffRoute() } catch (e) {} }
       if (offRevertRoute) { try { offRevertRoute() } catch (e) {} }
       if (offReconsiderRoute) { try { offReconsiderRoute() } catch (e) {} }

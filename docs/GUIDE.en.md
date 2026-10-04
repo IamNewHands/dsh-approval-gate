@@ -2,7 +2,7 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.9.1: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.9.2: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
@@ -176,7 +176,13 @@ The following are **machine-local** and are never synchronised (set them per mac
 
 - `riskyThreshold`, `judgeTimeoutMs`, `judgeFailureLimit`, `learning`
 - `judgeModel`: the judge model. Custom provider names differ between machines
-  (e.g. `my-provider`), so use this machine's actual value rather than copying another's
+  (e.g. `my-provider`), so use this machine's actual value rather than copying another's.
+  The settings page card **"Judge model · decoupled from the main model"** lets you pick
+  it from dropdowns (route + model, with "follow the agent default model" first) —
+  **no need to edit this file**. When the model catalog is unavailable the card degrades
+  to plain text inputs. Pin a model that answers in a single request: a multi-step
+  tool-loop model (e.g. `agy`) cannot finish within `judgeTimeoutMs`, which shows up as
+  "every approval goes to a human"
 
 > The legacy `model` field (upstream 0.5.0) was renamed to `judgeModel`. On load it is
 > migrated automatically: the machine-local value is carried over into `judgeModel` and

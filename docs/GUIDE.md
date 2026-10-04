@@ -2,7 +2,7 @@
 
 > 首页：[简体中文](../README.md) · [English](../README.en.md) · 指南：[中文](GUIDE.md) · [English](GUIDE.en.md)
 
-DeepSeek Harness 自动审批门控插件 v0.9.1：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
+DeepSeek Harness 自动审批门控插件 v0.9.2：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
 
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
@@ -151,7 +151,11 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 
 - `riskyThreshold`、`judgeTimeoutMs`、`judgeFailureLimit`、`learning`
 - `judgeModel`：判定模型。各机的自定义提供商名称可能不同（如 `my-provider`），
-  必须按本机实际配置填写，不要照搬另一台机器的值
+  必须按本机实际配置填写，不要照搬另一台机器的值。
+  设置页 **「裁判模型 · 与主力模型解耦」** 卡片可直接下拉选择（路由 + 模型，首项为
+  「跟随 agent 默认模型」），**无需手改本文件**；模型目录不可用时该卡片退化为手填输入框。
+  建议固定为一个「单次请求就能作答」的模型——多步工具循环型模型（如 `agy`）在
+  `judgeTimeoutMs` 内跑不完，表现为「每次审批都转人工」
 
 > 旧版本（上游 0.5.0）使用的 `model` 字段已更名为 `judgeModel`。加载时会自动迁移：
 > 保留本机原有取值写入 `judgeModel`，并移除旧的 `model` 键；若已显式配置

@@ -1102,6 +1102,13 @@ window.__ModuleLoader__.load({
       const [timeoutMs, setTimeoutMs] = React.useState('20000')
       const [failureLimit, setFailureLimit] = React.useState('1')
       const [judgeMaxTokens, setJudgeMaxTokens] = React.useState('1024')
+      // 裁判模型（与 agent 自身模型解耦）：provider='' 表示跟随 agent 默认模型。
+      // modelCatalog=null 表示目录不可用（端点未注册 / llm 服务缺失 / 拉取失败）→
+      // 卡片退化成「手填 provider / model」，不让目录故障连带废掉配置能力。
+      const [modelCatalog, setModelCatalog] = React.useState(null)
+      const [catalogNote, setCatalogNote] = React.useState(null)
+      const [judgeProvider, setJudgeProvider] = React.useState('')
+      const [judgeModel, setJudgeModel] = React.useState('')
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -1113,6 +1120,9 @@ window.__ModuleLoader__.load({
               setTimeoutMs(String(data.config.judgeTimeoutMs))
               setFailureLimit(String(data.config.judgeFailureLimit === undefined ? 1 : data.config.judgeFailureLimit))
               setJudgeMaxTokens(String(data.config.judgeMaxTokens === undefined ? 1024 : data.config.judgeMaxTokens))
+              const jm = data.config.judgeModel
+              setJudgeProvider(jm && jm.provider ? String(jm.provider) : '')
+              setJudgeModel(jm && jm.model ? String(jm.model) : '')
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -1121,6 +1131,29 @@ window.__ModuleLoader__.load({
           .catch(function (e) { setError('加载规则失败：' + String((e && e.message) || e)) })
       }
       React.useEffect(function () { load() }, [])
+
+      // 模型目录：与对话框右下角的模型选择器同源（host 侧问 llm 服务要各路由的模型表）。
+      // 拿不到就置 catalogNote，卡片退化为手填；catalog 保持 null。
+      React.useEffect(function () {
+        let alive = true
+        fetch('/api/auto-approve/models', { headers: { 'cache-control': 'no-cache' } })
+          .then(function (r) { return r.json() })
+          .then(function (data) {
+            if (!alive) return
+            const providers = (data && data.providers) || []
+            if (providers.length > 0) {
+              setModelCatalog(providers)
+              setCatalogNote(null)
+            } else {
+              setCatalogNote(String((data && data.reason) || '未获取到模型目录'))
+            }
+          })
+          .catch(function (e) {
+            if (!alive) return
+            setCatalogNote(String((e && e.message) || e))
+          })
+        return function () { alive = false }
+      }, [])
 
       const showFeedback = function (msg, ok) {
         setFeedback({ msg: String(msg), ok: ok !== false })
@@ -1174,6 +1207,13 @@ window.__ModuleLoader__.load({
       const learnHistory = snapshot.learning && snapshot.learning.history ? snapshot.learning.history : {}
       const statKeys = Object.keys(learnStats)
       const histKeys = Object.keys(learnHistory)
+      // 当前裁判模型若指向已不在目录里的路由/模型（换过 provider、adapter 被移除），
+      // 仍必须在下拉框里出现并保持选中——否则会显示成空值，用户一按「保存」就把固定值清掉。
+      const catalogIds = (modelCatalog || []).map(function (p) { return p.id })
+      const judgeProviderKnown = judgeProvider === '' || catalogIds.indexOf(judgeProvider) >= 0
+      const judgeRoute = (modelCatalog || []).filter(function (p) { return p.id === judgeProvider })[0]
+      const judgeRouteModels = judgeRoute ? judgeRoute.models : []
+      const judgeModelKnown = judgeModel === '' || judgeRouteModels.some(function (m) { return m.id === judgeModel })
 
       return React.createElement('div', { className: 'ag-set' },
         React.createElement('h3', { className: 'ag-set-title' }, '自动审批'),
@@ -1358,6 +1398,78 @@ window.__ModuleLoader__.load({
                   )
                 }),
               ),
+        ),
+
+        // ---- 裁判模型（④ Flash 判定用哪个模型） ----
+        React.createElement('div', { className: 'ag-set-card' },
+          React.createElement('div', { className: 'ag-set-card-head' },
+            React.createElement('div', { className: 'ag-set-card-title' },
+              React.createElement('span', { className: 'ag-set-stage' }, '④ Flash 判定'),
+              '裁判模型 · 与主力模型解耦'),
+            React.createElement('p', { className: 'ag-set-card-sub' },
+              '执行风险判定的模型。留空则跟随 agent 默认模型；建议固定为一个「单次请求就能作答」的模型——' +
+              '多步工具循环型模型（如 agy）在判定超时内跑不完，会让每次审批都转人工。修改即时生效，无需重启。')),
+          modelCatalog === null
+            ? React.createElement('div', null,
+                React.createElement('div', { className: 'ag-set-row' },
+                  React.createElement('span', { className: 'ag-set-item-meta' }, 'provider：'),
+                  React.createElement('input', {
+                    className: 'ag-set-input', value: judgeProvider, placeholder: '如 deepseek-official',
+                    onChange: function (e) { setJudgeProvider(e.target.value) },
+                  }),
+                  React.createElement('span', { className: 'ag-set-item-meta' }, 'model：'),
+                  React.createElement('input', {
+                    className: 'ag-set-input', value: judgeModel, placeholder: '如 deepseek-v4-flash',
+                    onChange: function (e) { setJudgeModel(e.target.value) },
+                  }),
+                  React.createElement('button', {
+                    type: 'button', className: 'ag-set-btn',
+                    disabled: busy || judgeProvider === '' || judgeModel === '',
+                    onClick: function () { api({ op: 'set', kind: 'judgeModel', value: { provider: judgeProvider, model: judgeModel } }) },
+                  }, '保存'),
+                  React.createElement('button', {
+                    type: 'button', className: 'ag-set-btn', disabled: busy,
+                    onClick: function () { api({ op: 'set', kind: 'judgeModel', value: {} }) },
+                  }, '跟随默认模型'),
+                ),
+                React.createElement('div', { className: 'ag-set-item-meta' },
+                  '模型目录不可用' + (catalogNote ? '（' + catalogNote + '）' : '') + '，可手填 provider / model'))
+            : React.createElement('div', { className: 'ag-set-row' },
+                React.createElement('select', {
+                  className: 'ag-set-input',
+                  value: judgeProvider,
+                  onChange: function (e) { setJudgeProvider(e.target.value); setJudgeModel('') },
+                },
+                  React.createElement('option', { value: '' }, '跟随 agent 默认模型'),
+                  modelCatalog.map(function (p) {
+                    return React.createElement('option', { key: p.id, value: p.id },
+                      p.name && p.name !== p.id ? p.id + '（' + p.name + '）' : p.id)
+                  }),
+                  judgeProviderKnown ? null : React.createElement('option', { value: judgeProvider },
+                    judgeProvider + '（当前配置，未注册）'),
+                ),
+                React.createElement('select', {
+                  className: 'ag-set-input',
+                  value: judgeModel,
+                  disabled: judgeProvider === '',
+                  onChange: function (e) { setJudgeModel(e.target.value) },
+                },
+                  React.createElement('option', { value: '' }, judgeProvider === '' ? '—' : '选择模型…'),
+                  judgeRouteModels
+                    .map(function (m) { return React.createElement('option', { key: m.id, value: m.id }, m.name || m.id) }),
+                  judgeModelKnown ? null : React.createElement('option', { value: judgeModel },
+                    judgeModel + '（当前配置，不在目录中）'),
+                ),
+                React.createElement('button', {
+                  type: 'button', className: 'ag-set-btn',
+                  disabled: busy || (judgeProvider !== '' && judgeModel === ''),
+                  onClick: function () { api({ op: 'set', kind: 'judgeModel', value: { provider: judgeProvider, model: judgeModel } }) },
+                }, '保存'),
+              ),
+          React.createElement('div', { className: 'ag-set-item-meta' },
+            (cfg.judgeModel && cfg.judgeModel.provider && cfg.judgeModel.model)
+              ? ('当前裁判模型：' + cfg.judgeModel.provider + ' / ' + cfg.judgeModel.model)
+              : '当前裁判模型：跟随 agent 默认模型'),
         ),
 
         // ---- 阈值 / 超时（④ Flash 判定参数） ----
