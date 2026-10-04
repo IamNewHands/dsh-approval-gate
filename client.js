@@ -159,9 +159,10 @@ window.__ModuleLoader__.load({
       fpHit: '已确认操作',
       'flash-same': 'Flash 同类验证',
       once: '追认 · 仅本次放行',
-      'learned-judge-unavailable': '已确认操作（判定器不可用）'
+      'learned-judge-unavailable': '已确认操作（判定器不可用）',
+      'dsh-config': 'DSH 配置（自动放行）'
     }
-    const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same', 'once', 'learned-judge-unavailable'])
+    const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same', 'once', 'learned-judge-unavailable', 'dsh-config'])
     /**
      * 生效的硬风险类别。默认值与 host 的 DEFAULT_HARD_CATEGORIES 一致，但 host 会通过
      * 事件 API 下发**实际配置**（hardCategories 是可在设置页改、且参与多机同步的键）。

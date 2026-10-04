@@ -4,6 +4,60 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.5] — 2026-10-04
+
+**DSH's own configuration changes no longer prompt a human**: profile / plugin / dependency edits under `$DSH_HOME` auto-approve (two exceptions still escalate). This **reverses** the 2026-09-18 "writes under `DSH_HOME` always require a human" decision, based on the user's 2026-10-04 policy and real-log measurements.
+
+### Background and policy
+
+The user's goal is **fewer human approvals**. The tiering they asked for:
+
+| Area | Treatment |
+|---|---|
+| Operations inside the workspace | no approval needed (low risk) |
+| git operations | no approval needed (low risk) |
+| **DSH's own configuration changes** | **no approval needed (low risk)** ← delivered here |
+| Anything else, anywhere else | keep the human, above all to stop the model reading extra sensitive files and leaking them |
+
+Measurements (`$DSH_HOME/auto-approve/{audit.log,events.jsonl}`, 30 days 2026-09-05 → 10-04):
+
+- Totals: 1178 events, 869 auto-approvals (73.8%), 145 human prompts (**100% approved, 0 rejected**), 11 silent rejections
+- **The last 7 days had only 36 human prompts, 20 of them (56%) DSH config edits** — `cordis.patch.yml`, profile `package.json`, `pnpm-workspace.yaml`, the profile directory
+- Of the auto-approvals, only 21 touched a real out-of-workspace path, all of them work the user explicitly asked for (Clash AppData 16 / DSH 4 / OpenViking 1); **zero** sensitive-file reads were auto-approved
+
+### Changes
+
+- **`src/index.mjs`: new `dsh-config` tier in the hard-fact layer** (`hardDenyFacts` returns `'dsh-config'`): a target under `$DSH_HOME` auto-approves. **The tier runs after the DENY layer**, so an irreversible keyword still escalates first (dangerous keywords always outrank it)
+- **Two exceptions still escalate** (`DSH_CONFIG_EXCLUDE_RE`):
+  1. **The gate's own data directory** `$DSH_HOME/auto-approve/` — rules / audit / learning / snapshots. Rewriting it means allowing itself; a safety component must not be rewritable by what it guards
+  2. **Credential-named files**: `api-key` / `apikey` / `token` / `secret` / `credential` / `password` / `keyring` / `.env` / `.npmrc` / `.netrc` / `.git-credentials` / `id_rsa` / `id_ed25519` / `*.pem` / `*.key` / `*.pfx` / `*.p12` / `login data` / `cookies` — this one answers the user's "stop the model reading sensitive files" concern
+- Auto-approvals are recorded as `verdict: 'dsh-config'` (audit `ALLOW … (dsh-config: DSH_HOME path …)`), shown in the UI as "DSH 配置（自动放行）"
+- **Agent guidance** gained one line: DSH's own configuration can be edited directly without asking first (credential files and the gate's own data excepted), so the model stops pre-asking pointlessly
+- The client's `VERDICT_NEUTRAL` set includes `dsh-config` (routine auto-approval colouring)
+
+### Replay verification (real log, not estimation)
+
+- The last 7 days' 20 DSH-config prompts → **all 20 now auto-approve**, with 0 exception hits
+- 12 distinct `$DSH_HOME` paths appear in the 30-day log: 10 auto-approve (`cordis.patch.yml` 52×, `package.json` 31×, profile dir 30×, `skills/` 9×, `pnpm-workspace.yaml` 8×, `pnpm-lock.yaml` 8×, `node_modules/dsh-approval-gate` 7×, the `.dsh` root 4×, `node_modules/dsh-win-notify` 2×) and 2 still escalate (`auto-approve/allowlist.json` 5×, `auto-approve` 1×)
+- **No** path covered by the new exceptions appears in the real log — both exceptions are a pure safety net, not part of today's benefit
+
+### Residual risk (deliberate, stated plainly)
+
+- `$DSH_HOME/skills/**` is auto-approved too. Skills are **instructions for future turns**, i.e. a self-modification surface; the user maintains skills themselves, so it rides along with "DSH config is low risk". To narrow it, add a segment to `DSH_CONFIG_EXCLUDE_RE`
+- `profiles/*/node_modules/**` holds plugin code (including this plugin). Writing it only takes effect **after a restart**, the user's workflow reinstalls from git, and `auto-approve/` stays human — so "rewrite the rules to allow myself" is not opened
+
+### Regression tests
+
+- `test/absorbed.test.mjs` case 4: tier assertions became "reject credentials/system paths → `dsh-config` profile config / package.json / skills → `human` the gate's own dir / `api-key.json` / `.env`"
+- `test/pipeline.test.mjs` case 3: its target is now the **gate's own data directory** (still human); case 3b was rewritten as **the three boundaries of the DSH-config tier**: ① a profile edit auto-approves with zero judge calls, recorded as `dsh-config` and never counted; ② the gate's own data directory still escalates; ③ with a dangerous keyword the DENY layer outranks the dsh-config tier (event `path === 'deny'`)
+- docs/GUIDE (zh/en): pipeline diagram, the three hard-fact tiers, security-design item 1 and the test table all updated
+
+### Compatibility
+
+- **Reverses the 2026-09-18 decision**: `$DSH_HOME` targets are no longer "always human". The home root, other out-of-workspace paths, dangerous keywords and credential exfiltration behave **exactly as before**
+- No config migration, no `allowlist.json` edit needed; `version` stays 4
+- No interaction with the 0.9.4 scope model: `dsh-config` is a deterministic allowance at pipeline step 1b — it writes no rule and counts nothing
+
 ## [0.9.4] — 2026-10-04
 
 **Scope becomes a choice**: a new approval can be specified as "this once / this session / global" (session by default), and **the legacy learned rules that 0.9.3 retired go back to being global** (user decision, 2026-10-04).

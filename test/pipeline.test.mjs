@@ -167,7 +167,9 @@ function boot(opts) {
   console.log('  ✓ 硬拒：系统关键路径 → rejected，无弹窗')
 }
 
-// ================= 3. 硬事实：DSH_HOME → 转人工（保留手动放行） =================
+// ================= 3. 硬事实：审批门自身数据目录 → 转人工（保留手动放行） =================
+// DSH 配置整体已改为自动放行（见 3b），但 auto-approve/ 是**审批门自己的**规则/审计/学习
+// 数据：改它等于放行自己，因此这一小块永远人工。
 {
   boot({ judgeReply: () => { throw new Error('must not be called') } })
   const req = makeReq({
@@ -177,61 +179,84 @@ function boot(opts) {
     args: { file_path: join(DSH_HOME, 'auto-approve', 'allowlist.json') },
   })
   const { outcome, nextCalls } = await decide(null, req, 'allowed-once')
-  assert.strictEqual(outcome, 'allowed-once', 'DSH_HOME target must be human-approved, not hard-rejected')
-  assert.strictEqual(nextCalls, 1, 'DSH_HOME target must prompt the human exactly once')
-  console.log('  ✓ 硬事实：DSH_HOME → 转人工，用户可放行')
+  assert.strictEqual(outcome, 'allowed-once', "the gate's own data dir must be human-approved, not hard-rejected")
+  assert.strictEqual(nextCalls, 1, "the gate's own data dir must prompt the human exactly once")
+  console.log('  ✓ 硬事实：审批门自身数据目录 → 转人工，用户可放行')
 }
 
-// ========== 3b. 硬事实闸门排在白名单与学习之前（2026-10-02 语义锁定） ==========
-// 现场：同一目标（profile 的 cordis.patch.yml）被人工批准 13 次，审批记录始终没有
-// 「学习 N/3」——因为硬事实档在管道第 0 步就 return，白名单与学习计数都不可达。
-// 这是**有意**的安全语义（DSH_HOME 写入永远人工），此处锁死，避免被当成 bug"修好"：
-//   ① 即使 allowRules 里有一条精确指向该文件的规则，也不得放行
-//   ② 该目标的确认计数不得写进 learning.json
+// ========== 3b. DSH 配置档：profile 改动自动放行；门自身数据与危险词仍人工 ==========
+// 口径变更（2026-10-04 用户决策）：DSH 自身配置修改风险可控 → 自动放行。这**反转**了
+// 2026-09-18 的「DSH_HOME 写入永远人工」决定，因此这里把新语义与三条边界一起锁死，
+// 避免以后被"简化"成无条件放行：
+//   ① profile / 插件 / 依赖改动 → 自动放行，判定器零调用，事件标 dsh-config
+//   ② 审批门自身数据目录 auto-approve/ → 仍人工，且白名单规则盖不过它（闸门排在白名单之前）
+//   ③ 命中毒品词 → 先转人工（DENY 层排在 dsh-config 档之前）
 {
   const cfgPath = join(dataDir, 'allowlist.json')
   const learningPath = join(dataDir, 'learning.json')
-  const target = join(DSH_HOME, 'profiles', 'desktop', 'cordis.patch.yml')
+  const profileTarget = join(DSH_HOME, 'profiles', 'desktop', 'cordis.patch.yml')
+  const gateTarget = join(DSH_HOME, 'auto-approve', 'allowlist.json')
 
   const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
-  cfg.allowRules = [{ tool: 'edit', mode: 'danger-full-access', contains: target, description: '本用例专用：指向 DSH_HOME 文件的白名单' }]
+  cfg.allowRules = [{ tool: 'edit', mode: 'danger-full-access', contains: profileTarget, description: '本用例专用：指向 DSH_HOME 文件的白名单' }]
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
   writeFileSync(learningPath, JSON.stringify({ enabled: true, stats: {}, history: {} }, null, 2) + '\n', 'utf8')
 
+  // ① profile 配置改动：自动放行
   const { state } = boot({ judgeReply: () => { throw new Error('must not be called') } })
-  const req = makeReq({
-    sessionId: 's-dshhome-order',
+  const allowed = await decide(null, makeReq({
+    sessionId: 's-dsh-config-allow',
     toolName: 'edit',
     justification: '在 profile patch 中加入 undo 插件的 profileName 覆盖行',
-    args: { file_path: target },
-    callId: 'dshhome-order-1',
-  })
-  const first = await decide(null, req, 'allowed-once')
-  assert.strictEqual(first.nextCalls, 1,
-    'a DSH_HOME target must still go to a human even with a matching allowlist rule (gate 0 precedes gate 2)')
-  assert.strictEqual(state.streamAttempts, 0, 'the hard-fact gate must short-circuit before the judge too')
-
-  // 非空断言：证明上面那条白名单规则**确实能匹配**这个目标 —— 否则本用例是空转，
-  // 把闸门顺序反过来也不会红。
-  const ruleMatchContext = `escalate sandbox to danger-full-access: 在 profile patch 中加入 undo 插件的 profileName 覆盖行 ${target}`
-  assert.ok(mod.matchRule(cfg.allowRules, 'edit', 'danger-full-access', null, ruleMatchContext),
-    'the injected allowlist rule must actually match this target, so the ordering assertion is not vacuous')
-
-  const learning = JSON.parse(readFileSync(learningPath, 'utf8'))
-  const keys = Object.keys(learning.stats)
-  assert.deepStrictEqual(keys, [],
-    'approving a DSH_HOME target must NOT create a learning counter (learning is unreachable behind gate 0)')
+    args: { file_path: profileTarget },
+    callId: 'dsh-config-allow-1',
+  }), 'allowed-once')
+  assert.strictEqual(allowed.outcome, 'allowed-once', 'a DSH profile edit is auto-approved')
+  assert.strictEqual(allowed.nextCalls, 0, 'a DSH profile edit must not prompt a human any more')
+  assert.strictEqual(state.streamAttempts, 0, 'the DSH-config gate must short-circuit before the judge')
 
   const eventsPath = join(dataDir, 'events.jsonl')
   const rows = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  const mine = rows.filter((e) => e.sessionId === 's-dshhome-order')
-  assert.strictEqual(mine[0].path, 'hard-deny', 'the record must be labelled with the hard-fact path')
-  assert.ok(mine.every((e) => e.learningCount === undefined),
-    'a hard-fact approval must not carry a learning count (no 「学习 N/3」 is shown)')
+  const allowedRow = rows.filter((e) => e.sessionId === 's-dsh-config-allow')
+  assert.strictEqual(allowedRow[0].verdict, 'dsh-config', 'the record must be labelled as a DSH-config auto-allow')
+  assert.ok(allowedRow.every((e) => e.learningCount === undefined),
+    'an auto-allowed DSH edit must not carry a learning count')
+
+  // ② 审批门自身数据目录：即使白名单里有精确指向它的规则，也必须人工
+  const ruleMatchContext = `escalate sandbox to danger-full-access: 更新配置 ${gateTarget}`
+  assert.ok(mod.matchRule(cfg.allowRules, 'edit', 'danger-full-access', null, ruleMatchContext) === null,
+    'sanity: the injected rule targets the profile file, not the gate data dir')
+  const gate = await decide(null, makeReq({
+    sessionId: 's-gate-dir',
+    toolName: 'write',
+    justification: '更新配置',
+    args: { file_path: gateTarget },
+    callId: 'gate-dir-1',
+  }), 'allowed-once')
+  assert.strictEqual(gate.nextCalls, 1,
+    "the gate's own data dir must still go to a human even when other DSH paths are auto-approved")
+
+  // ③ 危险词压在 dsh-config 档之前：同一个 profile 文件，但理由里带危险词 → 人工
+  const denyReq = makeReq({
+    sessionId: 's-dsh-config-deny',
+    toolName: 'pwsh',
+    justification: '先 git reset --hard 再写 profile patch',
+    args: { command: 'git reset --hard', file_path: profileTarget },
+    callId: 'dsh-config-deny-1',
+  })
+  const denied = await decide(null, denyReq, 'allowed-once')
+  assert.strictEqual(denied.nextCalls, 1, 'the DENY layer must outrank the DSH-config tier')
+  const denyRows = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    .filter((e) => e.sessionId === 's-dsh-config-deny')
+  assert.strictEqual(denyRows[0].path, 'deny', 'the dangerous-keyword path must win over dsh-config')
+
+  const learning = JSON.parse(readFileSync(learningPath, 'utf8'))
+  assert.deepStrictEqual(Object.keys(learning.stats), [],
+    'neither the auto-allowed nor the denied DSH operation may create a learning counter')
 
   cfg.allowRules = []
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
-  console.log('  ✓ 硬事实排在白名单/学习之前：DSH_HOME 目标即使有白名单规则也转人工，且不计数')
+  console.log('  ✓ DSH 配置档：profile 改动自动放行（判定器零调用）；门自身数据与危险词仍转人工')
 }
 
 // ================= 4. 危险词 → 转人工 =================

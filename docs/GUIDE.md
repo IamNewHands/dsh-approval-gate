@@ -2,23 +2,24 @@
 
 > 首页：[简体中文](../README.md) · [English](../README.en.md) · 指南：[中文](GUIDE.md) · [English](GUIDE.en.md)
 
-DeepSeek Harness 自动审批门控插件 v0.9.4：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
+DeepSeek Harness 自动审批门控插件 v0.9.5：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
 
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
 ```
-硬拒（凭据外泄 / 根与系统路径销毁）→ 硬事实人工（DSH_HOME / home 根）
-  → DENY（不可逆危险词）→ 白名单（确定性规则）→ denyRules（裁决拒绝升级）
-  → 脱敏 → 判定（JSON allow/ask/deny，硬类别 / 中立确认 / 失败计数）→ 学习沉淀
+硬拒（凭据外泄 / 根与系统路径销毁）→ 硬事实人工（home 根 / 门的例外）
+  → DENY（不可逆危险词）→ DSH 配置自动放行（v0.9.5）→ 白名单（确定性规则）
+  → denyRules（裁决拒绝升级）→ 脱敏 → 判定（JSON allow/ask/deny，硬类别 / 中立确认 / 失败计数）→ 学习沉淀
 ```
 
 - **⓪ 硬拒层**（吸收自 [dsh-auto-mode](https://github.com/NanmiCoder/dsh-auto-mode)，**最高优先，判定模型无权推翻**）：基于工具参数的**真实路径与凭据事实**判定，而非 justification 关键词
   - **直接拒绝档**（不弹窗，让 agent 改方案）：
     - **凭据外泄**：对外调用（`web_fetch` / `web_search` / `curl` / `wget`，或 deploy/publish/push/send/release 类工具名）的参数中携带凭据材料；或其 URL 带密码、或带 8 字符以上的 `token`/`api_key`/`signature`/`auth` 查询参数
     - **破坏性目标**：文件系统根（`/`、`C:\`）；操作系统或凭据关键路径（`/etc`、`/bin`、`/sbin`、`/usr`、`/system`、`/library`、`/boot`、`C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.azure`、`~/.kube`、`~/.config/gcloud`）；Windows 设备/NT 命名空间（`\\.\`、`\Device\`、`\\?\`、`\??\`）；Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1-9`、`LPT1-9`）；含义不明的盘符相对路径
-  - **人工档**（保留手动放行能力）：目标为 `$DSH_HOME` 或用户 home 根本身
+  - **DSH 配置档**（v0.9.5，**自动放行**）：目标在 `$DSH_HOME` 下的 profile / 插件 / 依赖改动（`cordis.patch.yml`、`package.json`、`pnpm-workspace.yaml`、`skills/`、`node_modules/` …）。用户 2026-10-04 决策：这块风险可控，不必每次人工（实测最近 7 天 36 次人工里 20 次是这类）。**两道例外转人工**：① 审批门自身的数据目录 `$DSH_HOME/auto-approve/`（改它等于放行自己）；② 凭据类文件名（`api-key` / `token` / `secret` / `credential` / `.env` / `id_rsa` / `*.pem` / `*.key` …）。本档**排在 DENY 层之后**：危险词仍然最高优先
+  - **人工档**（保留手动放行能力）：用户 home 根本身，以及 DSH 配置档的两道例外
   - 常规工作区操作不受影响，绝不被硬拒
-  - **⚠️ 人工档排在白名单与学习之前**：命中人工档即 `return`，因此这类操作**不计数、不学习、白名单规则盖不过、也没有追认按钮**。审批记录里只显示「人工通过」，**不会**出现「学习 N/3」——批准再多次也不会自动放行。这是有意语义（`$DSH_HOME` 下的 profile / 插件配置 / 凭据目录不由自动审批改写），不是学习失效。典型现场：反复修改 profile 的 `cordis.patch.yml`（2026-10-02 排查确认）
+  - **⚠️ 人工档排在白名单与学习之前**：命中人工档即 `return`，因此这类操作**不计数、不学习、白名单规则盖不过、也没有追认按钮**。审批记录里只显示「人工通过」，**不会**出现「学习 N/3」——批准再多次也不会自动放行。这是有意语义（home 根、审批门自身数据、凭据文件不由自动审批改写，也不因此被学习成放行规则），不是学习失效。典型现场：反复修改 profile 的 `cordis.patch.yml`（2026-10-02 排查确认）——**该现场已于 v0.9.5 改为自动放行**，因为用户明确认定 DSH 配置改动风险可控
 - **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词命中 → 转人工（fail-safe）
 - **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains` 组合规则（含学习沉淀的规则）
 - **③ denyRules 层**：此前用户**裁决拒绝**过的「工具+模式+类别」→ 永久转人工（不会自动放行用户明确拒绝过的操作）
@@ -261,7 +262,7 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 
 ## 安全设计
 
-1. **硬拒层最高优先且单调**（吸收自 dsh-auto-mode）：凭据外泄与根/系统路径销毁基于**路径与凭据事实**直接拒绝，判定模型无权推翻；DSH_HOME / home 根等硬事实转人工，保留手动放行能力
+1. **硬拒层最高优先且单调**（吸收自 dsh-auto-mode）：凭据外泄与根/系统路径销毁基于**路径与凭据事实**直接拒绝，判定模型无权推翻；home 根、审批门自身数据与凭据文件仍转人工，DSH 配置（`$DSH_HOME` 的 profile / 插件 / 依赖）自 v0.9.5 起自动放行
 2. **DENY 层次优先**：不可逆危险词命中即转人工，不消耗模型调用
 3. **硬风险类别永远人工（对称安全闸，v0.7.0 修正）**：`deletion`/`credential`/`remote`/`system`/`bulk` 不计数、不学习、不可被沉淀规则覆盖，也**不可被追认**；无论判定模型给 `allow` 还是 `deny`，命中硬类别一律**转人工**。此前 `deny` 分支排在硬类别之前，模型对硬类别判 `deny` 会被静默拒绝，使配置的硬类别失效——现已修复
 4. **判定输入脱敏**：密钥与大块正文在送出前被抹除/截断；工作区路径含敏感形态时转人工而不外发
@@ -298,7 +299,7 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 |------|----------|
 | `test/absorbed.test.mjs` | 五项吸收能力的回归测试，断言针对 `src/` 下的**真实导出实现**（不在测试内重复逻辑）：结构化 JSON 裁决协议、判定输入脱敏、按会话的判定失败计数、确定性硬拒两档、动态系统提示上下文（仅预设激活时注入）。用临时 `DSH_HOME` 隔离，绝不触碰真实 `~/.dsh/auto-approve` |
 | `test/unit.test.mjs` | 规则匹配、配置迁移、多机规则共享，以及 `looksDeny` 的**边界匹配**回归（直接打生产导出实现，不在测试内复制逻辑）：`Format-Table` / `--format` 前缀误伤、`--force-with-lease` / `--force-if-includes` / `docker rmi` 标志延长误报、真危险词在边界上仍必须命中 |
-| `test/pipeline.test.mjs` | 判定管道端到端测试，用**模拟宿主**真正执行注册的 `approval/request` 处理器：硬拒直接拒绝（不弹窗）→ 硬事实转人工 → 危险词 → 白名单 → 脱敏 → 结构化判定 → 硬类别（优先于 allow/deny）→ `deny`/`allow`/`ask` → 连续失败计数 → 确认制学习。断言处理器返回的裁决、是否调用了 `next()`（即是否弹窗），以及真正发给判定模型的消息内容。含 `deny + neutral` 静默拒绝与 `deny + 硬类别` 转人工的对照用例，以及用例 3b：**硬事实闸门排在白名单与学习之前**（`$DSH_HOME` 目标即使有白名单规则也转人工、不计数、事件不带 `learningCount`） |
+| `test/pipeline.test.mjs` | 判定管道端到端测试，用**模拟宿主**真正执行注册的 `approval/request` 处理器：硬拒直接拒绝（不弹窗）→ 硬事实转人工 → 危险词 → **DSH 配置自动放行** → 白名单 → 脱敏 → 结构化判定 → 硬类别（优先于 allow/deny）→ `deny`/`allow`/`ask` → 连续失败计数 → 确认制学习。断言处理器返回的裁决、是否调用了 `next()`（即是否弹窗），以及真正发给判定模型的消息内容。含 `deny + neutral` 静默拒绝与 `deny + 硬类别` 转人工的对照用例，以及用例 3b：**DSH 配置档的三条边界**（profile 改动自动放行且不调判定器、事件标 `dsh-config`；审批门自身数据目录即使有白名单规则也转人工；危险词排在 dsh-config 档之前） |
 | `test/reconsider.test.mjs` | 追认端点（`POST /api/auto-approve/reconsider`）的契约：硬拒档与硬风险类别一律 400 且不写规则、neutral 静默拒绝可追认（写带指纹规则 + 投递重试 + 记录 `reconsiderOf`）、事件 API 标注 `reconsidered` 并过滤追认记录、重复追认幂等、未知事件 404 |
 | `test/client-render-smoke.test.mjs` | 客户端 bundle 的**真实渲染**冒烟测试（最小 React hooks 垫片 + DOM/fetch 桩）：拒绝提示条常驻且带「重新审批通过」/「查看审批记录」、硬拒档不给追认按钮、审批视图仅可追认行有按钮、打开审批 tab 标记已读、已读记录刷新后不再弹 |
 

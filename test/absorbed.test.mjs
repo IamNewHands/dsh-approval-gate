@@ -180,9 +180,30 @@ console.log('Testing absorbed features (dsh-auto-mode port)...')
   assert.strictEqual(hd('write', { file_path: '\\\\.\\PhysicalDrive0' }, roots).tier, 'reject',
     'Windows device namespace must hard-reject')
 
-  // --- human 档：其余硬事实（保留手动放行能力） ---
-  assert.strictEqual(hd('write', { file_path: join(tempHome, 'dsh', 'auto-approve', 'x.json') }, roots).tier,
-    'human', 'DSH_HOME path must go to human, not hard reject')
+  // --- dsh-config 档：DSH 自身配置改动自动放行（用户 2026-10-04 决策） ---
+  assert.strictEqual(
+    hd('edit', { file_path: join(tempHome, 'dsh', 'profiles', 'desktop', 'cordis.patch.yml') }, roots).tier,
+    'dsh-config', 'a profile config edit is auto-approved (DSH config tier)')
+  assert.strictEqual(
+    hd('write', { file_path: join(tempHome, 'dsh', 'profiles', 'desktop', 'package.json') }, roots).tier,
+    'dsh-config', 'a profile manifest write is auto-approved')
+  assert.strictEqual(
+    hd('write', { file_path: join(tempHome, 'dsh', 'skills', 'x', 'SKILL.md') }, roots).tier,
+    'dsh-config', 'a skill file write is auto-approved')
+
+  // --- human 档：DSH 配置档的两个例外（必须人工）---
+  assert.strictEqual(
+    hd('write', { file_path: join(tempHome, 'dsh', 'auto-approve', 'x.json') }, roots).tier,
+    'human', "the gate's own data dir must stay human, never auto-approved")
+  assert.strictEqual(
+    hd('edit', { file_path: join(tempHome, 'dsh', 'auto-approve', 'allowlist.json') }, roots).tier,
+    'human', "rewriting the gate's own rules must stay human")
+  assert.strictEqual(
+    hd('edit', { file_path: join(tempHome, 'dsh', 'profiles', 'desktop', 'api-key.json') }, roots).tier,
+    'human', 'a credential-named file under DSH_HOME must stay human')
+  assert.strictEqual(
+    hd('edit', { file_path: join(tempHome, 'dsh', 'profiles', 'desktop', '.env') }, roots).tier,
+    'human', 'a dotenv under DSH_HOME must stay human')
 
   // --- 普通工作区操作不得误伤 ---
   assert.strictEqual(hd('write', { file_path: join(tempHome, 'ws', 'src', 'a.ts') }, roots), undefined,
@@ -206,7 +227,7 @@ console.log('Testing absorbed features (dsh-auto-mode port)...')
   // 风格不一致不得误判为包含（posix vs win32）
   assert.strictEqual(paths.isWithin('/home/u', 'C:\\home\\u'), false,
     'cross-style containment must be false')
-  console.log('  ✓ 4. 确定性硬拒（凭据/系统路径 reject，DSH_HOME human，无误伤）')
+  console.log('  ✓ 4. 确定性硬拒（凭据/系统路径 reject；DSH 配置 dsh-config 放行，门自身数据与凭据文件 human；无误伤）')
 }
 
 // ================= 5. 动态系统提示上下文 =================

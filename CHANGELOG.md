@@ -4,6 +4,60 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.5] — 2026-10-04
+
+**DSH 自身配置改动不再弹人工**：`$DSH_HOME` 下的 profile / 插件 / 依赖改动自动放行（两道例外仍人工）。这是对 2026-09-18「DSH_HOME 写入永远人工」决定的**反转**，依据是用户 2026-10-04 的口径与真实日志统计。
+
+### 背景与口径
+
+用户目标：**减少人工审批**。分档口径——
+
+| 区域 | 处理 |
+|---|---|
+| 工作区内操作 | 不需要审批（风险可控） |
+| git 相关操作 | 不需要审批（风险可控） |
+| **DSH 自身配置修改** | **不需要审批（风险可控）** ← 本次落地 |
+| 其他区域的增删改查 | 保留人工，尤其防「模型多读敏感文件导致泄密」 |
+
+实测依据（`$DSH_HOME/auto-approve/{audit.log,events.jsonl}`，30 天 2026-09-05→10-04）：
+
+- 总量：1178 事件、869 次自动放行（73.8%）、145 次转人工（**100% 被批准、0 次拒绝**）、11 次静默拒绝
+- **最近 7 天只有 36 次人工，其中 20 次（56%）是 DSH 配置修改** —— `cordis.patch.yml`、profile `package.json`、`pnpm-workspace.yaml`、profile 目录
+- 自动放行里「工作区外的真实路径」只有 21 条，全是用户明确要求做的事（Clash AppData 16 / DSH 4 / OpenViking 1）；**读敏感文件被自动放行 0 条**
+
+### 变更
+
+- **`src/index.mjs`：硬拒层新增 `dsh-config` 档**（`hardDenyFacts` 返回 `'dsh-config'`）：目标在 `$DSH_HOME` 下即自动放行。**该档延后到 DENY 层之后执行**，因此命中不可逆危险词仍然先转人工（危险词永远最高优先）
+- **两道例外仍转人工**（`DSH_CONFIG_EXCLUDE_RE`）：
+  1. **审批门自身的数据目录** `$DSH_HOME/auto-approve/` —— 规则 / 审计 / 学习 / 快照。改它等于放行自己，安全组件不能把自己交给被它看守的对象改写
+  2. **凭据类文件名**：`api-key` / `apikey` / `token` / `secret` / `credential` / `password` / `keyring` / `.env` / `.npmrc` / `.netrc` / `.git-credentials` / `id_rsa` / `id_ed25519` / `*.pem` / `*.key` / `*.pfx` / `*.p12` / `login data` / `cookies` —— 这条正对用户「防多读敏感文件泄密」的诉求
+- 自动放行事件标 `verdict: 'dsh-config'`（审计 `ALLOW … (dsh-config: DSH_HOME path …)`），客户端显示「DSH 配置（自动放行）」
+- **提示层指导文本**补一句：DSH 自身配置可直接执行、不必先征求同意（凭据文件与审批门自身数据除外），减少模型无谓的预先询问
+- 客户端 `VERDICT_NEUTRAL` 纳入 `dsh-config`（按常规自动放行配色）
+
+### 回放验证（用真实日志，不是推演）
+
+- 最近 7 天 20 次 DSH 配置人工 → **20 次全部变成自动放行**，例外命中 0 次
+- 30 天日志里出现过 12 条不同的 `$DSH_HOME` 路径：10 条自动放行（`cordis.patch.yml` 52 次、`package.json` 31 次、profile 目录 30 次、`skills/` 9 次、`pnpm-workspace.yaml` 8 次、`pnpm-lock.yaml` 8 次、`node_modules/dsh-approval-gate` 7 次、`.dsh` 根 4 次、`node_modules/dsh-win-notify` 2 次），2 条仍人工（`auto-approve/allowlist.json` 5 次、`auto-approve` 1 次）
+- 真实日志里**没有**出现新增例外所覆盖的敏感路径 —— 这两道例外是纯保险，不承担当前收益
+
+### 残余风险（有意保留，写在明处）
+
+- `$DSH_HOME/skills/**` 也进入自动放行。技能是**未来回合的指令**，属于自我改写面；用户本人维护技能，故按「DSH 配置风险可控」一并放行。若要收窄，在 `DSH_CONFIG_EXCLUDE_RE` 里加一段即可
+- `profiles/*/node_modules/**` 含插件代码（含本插件自身）。写它在**重启后才生效**，且用户的既定流程是从 git 重装；`auto-approve/` 数据仍人工，所以「改规则放行自己」这条路径没有打开
+
+### 回归测试
+
+- `test/absorbed.test.mjs` 用例 4：分档断言改为「reject 凭据/系统路径 → `dsh-config` profile 配置 / package.json / skills → `human` 门自身目录 / `api-key.json` / `.env`」
+- `test/pipeline.test.mjs` 用例 3：目标改为**审批门自身数据目录**（仍人工）；用例 3b 重写为 **DSH 配置档的三条边界**：① profile 改动自动放行、判定器零调用、事件标 `dsh-config`、不计数；② 门自身数据目录仍转人工；③ 命中毒品词时 DENY 层压在 dsh-config 档之前（事件 `path === 'deny'`）
+- docs/GUIDE（中/英）：管道图、⓪ 硬拒层三档描述、安全设计第 1 条、测试表全部同步
+
+### 兼容
+
+- **反转 2026-09-18 的决定**：`$DSH_HOME` 目标不再「永远人工」。home 根、其他工作区外路径、危险词、凭据外泄的行为**完全不变**
+- 无配置迁移、无需改动 `allowlist.json`；`version` 仍为 4
+- 与 0.9.4 的作用域模型无交互：`dsh-config` 是管道第 1b 步的确定性放行，不写规则、不计数
+
 ## [0.9.4] — 2026-10-04
 
 **作用域改为可选**：新审批可指定「仅本次 / 本会话 / 全局」，默认本会话；**0.9.3 判为停用的旧沉淀规则迁回全局生效**（用户 2026-10-04 决定）。
