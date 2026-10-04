@@ -63,8 +63,15 @@ const ACTION_LABELS = {
   other: '调用'
 }
 
-/** 不可逆删除/破坏类命令：命中即把操作类型标成「删除」（决定审批人的第一眼风险判断）。 */
-const DELETE_RE = /(?:^|[\s;&|()])(?:rm|rmdir|del|erase|remove-item|remove-itemproperty)\b|\b(?:format|mkfs(?:\.[a-z0-9]+)?|shutdown|reboot)\b|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|drop\s+(?:table|database)|truncate\s+table/i
+/**
+ * 不可逆删除/破坏类命令：命中即把操作类型标成「删除」（决定审批人的第一眼风险判断）。
+ *
+ * `format` 只认**磁盘格式化**形态（`format C:` / `format /q` / `format-volume`）：
+ * 裸 `\bformat\b` 会把 PowerShell 里极常见的 `Get-Date -Format o`、`Format-List`、
+ * `--json … format` 判成「删除」，审计表的「操作类型」行就骗人了
+ * （2026-10-04 现场实测：1219 条事件里 13 条被这么误标，全部来自裸 `format`）。
+ */
+const DELETE_RE = /(?:^|[\s;&|()])(?:rm|rmdir|del|erase|remove-item|remove-itemproperty)\b|(?:^|[\s;&|()])format\s+(?:[a-z]:|\/)|\bformat-volume\b|\bmkfs(?:\.[a-z0-9]+)?\b|\b(?:shutdown|reboot)\b|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|drop\s+(?:table|database)|truncate\s+table/i
 
 /** 对外写入/发布类命令：影响面在远端，单独标成「推送/发布」。 */
 const REMOTE_RE = /(?:^|[\s;&|()])(?:scp|rsync|ssh|curl|wget|invoke-webrequest|invoke-restmethod)\b|\bgit\b[^;&|()]*\bpush\b|\bgh\b[^;&|()]*\brelease\b|\b(?:npm|pnpm|yarn)\b[^;&|()]*\bpublish\b/i

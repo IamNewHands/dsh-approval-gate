@@ -4,6 +4,17 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.9] — 2026-10-05
+
+**修一个审计表的误标：`format` 被当成「删除」。** 0.9.8 上线后的现场验证中发现的。
+
+`src/zh.mjs` 的 `DELETE_RE` 里有一个裸的 `\bformat\b`（本意是 `format C:` 这种格式化磁盘），于是 PowerShell 里极常见的 `Get-Date -Format o`、`Format-List`、`--json … format` 全被标成「删除」—— 而「操作类型」行正是审批人第一眼判断风险的依据。实测 1219 条事件里 **13 条**被这么误标，全部来自裸 `format`。
+
+- `format` 现在只认**磁盘格式化**形态：`format C:` / `format /q` / `Format-Volume`
+- 破坏形态（`Remove-Item` / `rm -rf` / `git reset --hard` / `shutdown` / `mkfs` / `drop table`）不受影响
+- 纯展示层修复，**不动任何裁决**：`DELETE_RE` 只喂 `actionKeyFor()`，不参与硬拒 / 危险词 / 白名单 / 判定
+- 顺带确认 `DEFAULT_DENY_KEYWORDS` 里的 `format` **没有**这个问题：`matchDenyKeyword` 的左边界排除集含 `-`，所以 `-Format` 不会命中危险词层（现场证据：`Get-Date -Format` 的命令被正常放行）
+
 ## [0.9.8] — 2026-10-05
 
 **第 ④ 步：git 按命令锚定 + 工作区外一律人工 + 敏感路径形态永远人工。** 用户 2026-10-05 决策。

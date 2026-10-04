@@ -290,4 +290,32 @@ ok('纯中文非提权 → null（不改写）')
   ok('目标定域：paths 合并顺序 / 四态文案 / 穿越标注 / 紧凑事实白名单 / 卡文案行序')
 }
 
+// ================= 16. 操作类型标注：`format` 只认磁盘格式化 =================
+{
+  // 现场发现（2026-10-04）：裸 `\bformat\b` 把 `Get-Date -Format o` / `Format-List` /
+  // `--json … format` 判成「删除」，审计表的「操作类型」行骗人 —— 而那一行正是审批人
+  // 第一眼判断风险的依据。实测 1219 条事件里 13 条被这么误标。
+  const key = (command) => describeFacts({ toolName: 'pwsh', command }).actionKey
+
+  assert.notEqual(key('$p = "x"; Set-Content -LiteralPath $p -Value "0.9.8 live probe $(Get-Date -Format o)"'), 'delete',
+    'Get-Date -Format must not be labelled as a deletion')
+  assert.notEqual(key('gh run view 123 --json status | ConvertFrom-Json | Format-List'), 'delete',
+    'Format-List must not be labelled as a deletion')
+  assert.notEqual(key('$stamp = Get-Date -Format "yyyyMMdd-HHmmss"'), 'delete',
+    'a -Format timestamp must not be labelled as a deletion')
+
+  // 真正的破坏形态仍然标成「删除」
+  assert.equal(key('format C: /q'), 'delete', 'formatting a drive is still a deletion')
+  assert.equal(key('format /fs:ntfs D:'), 'delete', 'format with a flag is still a deletion')
+  assert.equal(key('Format-Volume -DriveLetter D'), 'delete', 'Format-Volume is still a deletion')
+  assert.equal(key('Remove-Item C:\\temp\\a.txt -Recurse'), 'delete', 'Remove-Item is still a deletion')
+  assert.equal(key('rm -rf ./dist'), 'delete', 'rm -rf is still a deletion')
+  assert.equal(key('git reset --hard HEAD~1'), 'delete', 'git reset --hard is still a deletion')
+  assert.equal(key('shutdown /s /t 0'), 'delete', 'shutdown is still a deletion')
+
+  // 普通命令落到「执行命令」，不因为 `format` 的子串而变成「删除」
+  assert.equal(key('npm test 2>&1 | Select-Object -Last 20'), 'exec', 'an ordinary command stays 执行命令')
+  ok('操作类型标注：`format` 只认磁盘格式化（-Format / Format-List 不再误标「删除」）')
+}
+
 console.log('\nzh.mjs: ' + n + ' 组断言全部通过')

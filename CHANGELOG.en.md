@@ -4,6 +4,17 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.9] — 2026-10-05
+
+**Fixes a mislabel in the audit table: `format` was read as "deletion".** Found while verifying 0.9.8 on live traffic.
+
+`DELETE_RE` in `src/zh.mjs` contained a bare `\bformat\b` (meant for `format C:` style disk formatting), so the extremely common PowerShell forms `Get-Date -Format o`, `Format-List` and `--json … format` were all labelled "deletion" — and the "operation type" row is the first thing an approver reads to judge risk. Measured: **13 of 1219** events were mislabelled this way, all from the bare `format`.
+
+- `format` now only matches **disk formatting**: `format C:` / `format /q` / `Format-Volume`
+- Destructive forms (`Remove-Item` / `rm -rf` / `git reset --hard` / `shutdown` / `mkfs` / `drop table`) are unaffected
+- Display-only fix, **no verdict changes**: `DELETE_RE` feeds `actionKeyFor()` only and takes no part in hard deny / dangerous keywords / the allowlist / the judge
+- Also confirmed the `format` entry in `DEFAULT_DENY_KEYWORDS` does **not** have this problem: `matchDenyKeyword`'s left-boundary exclusion set contains `-`, so `-Format` never trips the keyword layer (live evidence: a `Get-Date -Format` command was allowed normally)
+
 ## [0.9.8] — 2026-10-05
 
 **Step ④: anchor git rules to the command + always ask outside the workspace + sensitive path shapes always ask.** User decision, 2026-10-05.
