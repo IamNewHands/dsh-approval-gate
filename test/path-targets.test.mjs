@@ -37,6 +37,10 @@ writeFileSync(join(dataDir, 'allowlist.json'), JSON.stringify({
   hardCategories: ['deletion', 'credential', 'remote', 'system', 'bulk'],
   riskyThreshold: 2,
   judgeTimeoutMs: 300,
+  // 本文件测「目标提取 / 定域 / 判定器载荷」，不测定域放行：关掉 0.9.7 的放行层，
+  // 否则工作区内的调用会在到达判定器之前被放行，7a2 的载荷断言测不到。
+  // 定域放行与危险动作围栏由 test/fence-scope.test.mjs 覆盖。
+  scopeAutoAllow: false,
   learning: { enabled: true },
 }, null, 2) + '\n', 'utf8')
 

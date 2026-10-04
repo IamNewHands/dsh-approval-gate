@@ -170,6 +170,9 @@ export function describeFacts(input) {
   const scope = scopeFor(mode, o.cwd)
   const targetScope = String(o.targetScope || '').trim()
   const targetScopeText = targetScopeFor(targetScope, o.targetTraversal === true)
+  // 围栏拦截原因：命中「下载 / 可执行产物 / 持久化 / 递归删除」时由 host 传入，
+  // 是这次转人工的**真实理由**，必须出现在卡片和字段表格里，否则用户只看到模型原文。
+  const fenceText = clip(o.fence, 120)
   return {
     tool: toolName,
     actionKey,
@@ -183,6 +186,7 @@ export function describeFacts(input) {
     targetScope,
     targetScopeText,
     targetTraversal: o.targetTraversal === true,
+    fenceText,
     command,
     commandLabel,
     commandText,
@@ -224,6 +228,8 @@ export function compactFacts(facts) {
   if (targetScope) out.targetScope = targetScope
   const targetScopeText = str(facts.targetScopeText, 40)
   if (targetScopeText) out.targetScopeText = targetScopeText
+  const fenceText = str(facts.fenceText, 120)
+  if (fenceText) out.fenceText = fenceText
   if (facts.targetTraversal === true) out.targetTraversal = true
   const command = str(facts.command, 300)
   if (command) out.command = command
@@ -252,10 +258,12 @@ export function buildChineseReason(input) {
   const o = input || {}
   const f = describeFacts(o)
   const mode = String(o.mode || '').trim()
-  // 原文已是中文、且没有提权事实可补 → 不改写（避免替模型改措辞）
-  if (hasCJK(f.reason) && !mode) return null
+  // 原文已是中文、且没有提权事实可补 → 不改写（避免替模型改措辞）。
+  // 例外：命中围栏时必须改写 —— 否则卡片上只有模型自己的说法，看不出「为什么被拦」。
+  if (hasCJK(f.reason) && !mode && !f.fenceText) return null
   const lines = [`操作：${f.action}`, `路径：${f.pathText}`]
   if (f.targetScopeText) lines.push(`目标：${f.targetScopeText}`)
+  if (f.fenceText) lines.push(`拦截：${f.fenceText}`)
   if (mode) lines.push(`影响：${f.scopeShort}（${f.scopeDetail}）`)
   if (f.commandText) lines.push(f.commandText)
   if (f.reason) lines.push(`原因：${f.reason}`)

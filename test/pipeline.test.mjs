@@ -35,6 +35,10 @@ writeFileSync(join(dataDir, 'allowlist.json'), JSON.stringify({
   hardCategories: ['deletion', 'credential', 'remote', 'system', 'bulk'],
   riskyThreshold: 2,
   judgeTimeoutMs: 300,
+  // 本文件只测「判定管道」本身（DENY → 白名单 → 判定 → 学习），因此关掉 0.9.7 的
+  // 定域放行层：否则工作区内的调用会在到达判定器之前被放行，用例测不到判定行为。
+  // 定域放行 / 危险动作围栏由 test/fence-scope.test.mjs 单独覆盖。
+  scopeAutoAllow: false,
   learning: { enabled: true },
 }, null, 2) + '\n', 'utf8')
 
@@ -625,7 +629,9 @@ function boot(opts) {
     sessionId: 's-sanitize',
     toolName: 'pwsh',
     justification: '调用接口同步数据',
-    args: { command: `curl -H "Authorization: Bearer ${SECRET}" https://api.test/sync` },
+    // 命令刻意不用 curl/wget：那会命中 0.9.7 的「网络下载围栏」，判定器根本不会被调用。
+    // 这里要验证的是「密钥不出站」，换成一条能走到判定器的普通命令，语义不变。
+    args: { command: `node scripts/sync.mjs --auth "Bearer ${SECRET}"` },
   })
   const { outcome } = await decide(null, req)
   assert.strictEqual(outcome, 'allowed-once', 'sanitized call still judged')

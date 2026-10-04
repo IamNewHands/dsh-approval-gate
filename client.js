@@ -44,7 +44,7 @@ window.__ModuleLoader__.load({
 .ag-time{flex:none;color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
 .ag-notice-close{width:24px;height:24px;flex:none;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:transparent;border:none;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;padding:0}
 .ag-notice-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
-.ag-view{box-sizing:border-box;height:100%;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);position:relative}
+.ag-view{box-sizing:border-box;height:100%;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);position:relative;overflow-anchor:none}
 .ag-view::after{content:"";pointer-events:none;position:absolute;left:0;right:0;bottom:0;height:32px;z-index:3;background:linear-gradient(180deg, color-mix(in srgb, var(--dsw-alias-bg-layer-1) 0%, transparent) 0px, var(--dsw-alias-bg-layer-1) 32px)}
 .ag-view-head{box-sizing:border-box;flex:none;border-bottom:1px solid var(--dsw-alias-border-l2);padding:10px 14px 8px;display:flex;flex-direction:column;gap:2px}
 .ag-view-title{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:22px}
@@ -291,6 +291,9 @@ window.__ModuleLoader__.load({
         const risky = f.targetScope && f.targetScope !== 'inside'
         rows.push(['目标位置', String(f.targetScopeText), risky ? 'ag-facts-v-warn' : ''])
       }
+      // 围栏拦截：这条记录转人工的**真实理由**（下载 / 可执行产物 / 持久化 / 递归删除）。
+      // 没有它，用户只能看到模型自己的说法，判断不出「为什么这次要人工」。
+      if (f.fenceText) rows.push(['拦截原因', String(f.fenceText), 'ag-facts-v-warn'])
       const scope = [f.scopeShort, f.scopeDetail]
         .map(function (s) { return s ? String(s) : '' })
         .filter(Boolean)
@@ -830,6 +833,27 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ================= 「审批」视图的滚动定位 =================
+    /**
+     * 最近的可滚动祖先（= 宿主的常驻滚动容器）。
+     *
+     * 为什么需要它：DSH 把各 tab 渲染在**同一个**常驻滚动容器里
+     * （conversation 的 `scrollBody`，`.ank0OG_scrollBody{overflow-y:auto}`），
+     * 切 tab 不换容器、也不重置 scrollTop。chat 视图永远停在底部，于是切到
+     * 「审批」时沿用的就是「已滚到底」的位置 —— 而本视图是**最新在上**，
+     * 用户每次进来都看不到最新记录，得手动往上拉一段。
+     */
+    function nearestScrollParent(el) {
+      let cur = el && el.parentElement
+      while (cur && cur !== document.body && cur !== document.documentElement) {
+        let oy = ''
+        try { oy = (window.getComputedStyle(cur) || {}).overflowY || '' } catch (e) { oy = '' }
+        if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && cur.scrollHeight > cur.clientHeight + 1) return cur
+        cur = cur.parentElement
+      }
+      return null
+    }
+
     // ================= 审批历史视图（conversation.view，order=20，轨迹右侧） =================
     function HistoryView(props) {
       const sessionId = (props && (props.sessionId || (props.slotsProps && props.slotsProps.sessionId))) || null
@@ -842,6 +866,32 @@ window.__ModuleLoader__.load({
       const [busyId, setBusyId] = React.useState(null) // 正在追认的事件 id
       const [feedback, setFeedback] = React.useState(null)
       const aliveRef = React.useRef(true)
+      const viewRef = React.useRef(null) // .ag-view 根：滚动定位的参照点
+      const listRef = React.useRef(null) // .ag-list：宿主自己约束高度时它就是滚动容器
+      const pinnedRef = React.useRef(false) // 本次挂载是否已做过「进入即定位到最新」
+
+      /** 本视图顶部相对共享滚动容器顶部的偏移（0 = 已对齐到最新记录） */
+      const newestOffset = function () {
+        const root = viewRef.current
+        if (!root) return 0
+        const el = nearestScrollParent(root)
+        if (!el) return 0
+        return root.getBoundingClientRect().top - el.getBoundingClientRect().top
+      }
+
+      /** 把「最新一条记录」（列表第一行）滚进视口：列表自身归零 + 对齐共享滚动容器 */
+      const pinToNewest = function () {
+        const list = listRef.current
+        if (list) list.scrollTop = 0
+        const root = viewRef.current
+        if (!root) return
+        const el = nearestScrollParent(root)
+        if (!el) return
+        const delta = root.getBoundingClientRect().top - el.getBoundingClientRect().top
+        if (Math.abs(delta) < 1) return
+        const max = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0))
+        el.scrollTop = Math.min(max, Math.max(0, el.scrollTop + delta))
+      }
 
       /** 拉取本会话全部审批事件（时间倒序）；组件卸载后丢弃结果 */
       const loadEvents = function () {
@@ -929,6 +979,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(function () {
         aliveRef.current = true
+        pinnedRef.current = false
         setEvents(null)
         setError(null)
         loadSnapStats(sessionId)
@@ -945,12 +996,32 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
+      /**
+       * 进入「审批」tab（组件挂载）时把滚动位置拉到最新记录 —— 宿主复用同一个常驻
+       * 滚动容器，chat 停在底部的位置会被带进来，而列表是「最新在上」。
+       * 之后每 5 秒轮询到新记录时，只在用户本来就贴着顶部（≤48px）才继续跟随，
+       * 用户主动下滚查看历史后不再打扰。
+       */
+      React.useEffect(function () {
+        if (!events || events.length === 0) return
+        if (!pinnedRef.current) {
+          // ref 由 React 在 commit 阶段挂好；仍为空说明本帧还没挂上 DOM，留给下次轮询再定位
+          if (!viewRef.current && !listRef.current) return
+          pinnedRef.current = true
+          pinToNewest()
+          return
+        }
+        const list = listRef.current
+        const listTop = list ? list.scrollTop : 0
+        if (listTop <= 48 && newestOffset() > -48) pinToNewest()
+      }, [events])
+
       // 待处理拒绝数：已拒绝但尚未追认的记录（硬拒档也算，它只能靠人工重做，但至少看得见）
       const pendingRejects = (events || []).filter(function (ev) {
         return isRejectEvent(ev) && !ev.reconsidered
       })
 
-      return React.createElement('div', { className: 'ag-view' },
+      return React.createElement('div', { className: 'ag-view', ref: viewRef },
         React.createElement('div', { className: 'ag-view-head' },
           React.createElement('div', { className: 'ag-view-title' },
             '自动放行审批',
@@ -990,7 +1061,7 @@ window.__ModuleLoader__.load({
           ? React.createElement('div', { className: 'ag-loading' }, '加载中…')
           : events.length === 0
             ? React.createElement('div', { className: 'ag-empty' }, error ? ('加载失败：' + error) : '本会话暂无审批记录')
-            : React.createElement('div', { className: 'ag-list' },
+            : React.createElement('div', { className: 'ag-list', ref: listRef },
                 events.map(function (ev) {
                   const kind = ev.kind || 'auto'
                   // pending（等待中）不在视图展示终态记录（提示条负责）
@@ -1155,6 +1226,7 @@ window.__ModuleLoader__.load({
       const [judgeProvider, setJudgeProvider] = React.useState('')
       const [judgeModel, setJudgeModel] = React.useState('')
       const [sedimentScope, setSedimentScope] = React.useState('session')
+      const [scopeAutoAllow, setScopeAutoAllow] = React.useState(true)
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -1170,6 +1242,7 @@ window.__ModuleLoader__.load({
               setJudgeProvider(jm && jm.provider ? String(jm.provider) : '')
               setJudgeModel(jm && jm.model ? String(jm.model) : '')
               setSedimentScope(data.config.sedimentScope === 'global' ? 'global' : 'session')
+              setScopeAutoAllow(data.config.scopeAutoAllow !== false)
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -1363,6 +1436,24 @@ window.__ModuleLoader__.load({
             }, '保存'),
             React.createElement('span', { className: 'ag-set-item-meta' },
               '决定人工确认后自动沉淀 / 判定器不可用后批准沉淀的规则写在哪个范围；单次的追认可逐个另选'),
+          ),
+          // 定域放行（用户 2026-10-04 决策）：目标全部落在工作区内时直接放行。
+          // 与围栏是一对：围栏（下载 / 可执行产物 / 持久化 / 递归删除）排在它前面，
+          // 所以「区内放行」不会把 `curl -o evil.exe` 这类区内操作一起放掉。
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('label', { className: 'ag-set-item-meta', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+              React.createElement('input', {
+                type: 'checkbox', checked: scopeAutoAllow,
+                onChange: function (e) { setScopeAutoAllow(e.target.checked) },
+              }),
+              '定域放行：目标全部在工作区内 → 直接放行',
+            ),
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn', disabled: busy,
+              onClick: function () { api({ op: 'set', kind: 'scopeAutoAllow', value: scopeAutoAllow }) },
+            }, '保存'),
+            React.createElement('span', { className: 'ag-set-item-meta' },
+              '工作区外的读写、以及下载 / 可执行产物 / 持久化 / 递归删除仍转人工；关闭后工作区内的提权也走判定器'),
           ),
           React.createElement('div', { className: 'ag-set-row' },
             React.createElement('input', { className: 'ag-set-input', style: { width: 110 }, placeholder: 'tool', value: newRule.tool, onChange: function (e) { setNewRule(Object.assign({}, newRule, { tool: e.target.value })) } }),

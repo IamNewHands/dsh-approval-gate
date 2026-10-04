@@ -124,6 +124,9 @@ function createEnv(events, opts) {
     clearInterval: () => {},
     setTimeout: () => 1,
     clearTimeout: () => {},
+    // 滚动定位要用 getComputedStyle 找可滚动祖先。默认返回 visible，
+    // 需要真实几何的用例在渲染后替换 env.computedStyle（见 attachScrollDom）。
+    getComputedStyle: (el) => (env.computedStyle ? env.computedStyle(el) : { overflowY: 'visible' }),
   }
   env.window = win
   env.document = {
@@ -169,7 +172,7 @@ function createEnv(events, opts) {
         }),
       })
     }
-    return Promise.resolve({ ok: true, json: () => Promise.resolve({ events, hardCategories: options.hardCategories }) })
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ events: events.slice(), hardCategories: options.hardCategories }) })
   }
   return env
 }
@@ -243,6 +246,17 @@ async function renderSettled(booted, Component, props) {
   return renderSlot(booted, Component, props)
 }
 
+/**
+ * 驱动一次真实的 5 秒轮询：提示条广播「拒绝已读」是组件里既有的刷新入口
+ * （`window.addEventListener(SEEN_EVENT, onSeen)` → `loadEvents()`），用它比直接改 state 更贴近运行时。
+ */
+async function pollOnce(booted, Component, props, env) {
+  env.window.dispatchEvent(new env.window.CustomEvent('dsh-approval-gate:rejects-seen'))
+  await new Promise((r) => setImmediate(r))
+  await new Promise((r) => setImmediate(r))
+  return renderSlot(booted, Component, props)
+}
+
 /** 递归收集元素树里的文本、class 与按钮；传 renderer 时继续展开函数组件（如字段表格）。 */
 function inspect(node, out, renderer) {
   out = out || { text: '', classes: [], buttons: [] }
@@ -262,6 +276,47 @@ function inspect(node, out, renderer) {
   if (node.props && node.props.children !== undefined) inspect(node.props.children, out, renderer)
   if (renderer && typeof node.type === 'function') inspect(renderer(node.type, node.props), out, renderer)
   return out
+}
+
+/**
+ * 最小 DOM / 布局模型：只够验证「进入审批视图时把共享滚动容器拉回最新记录」。
+ *
+ * 真实布局（宿主 CSS）：
+ *   .ank0OG_scrollBody{overflow-y:auto}   ← 常驻滚动容器，各 tab 共用，切 tab 不重置 scrollTop
+ *     > [data-slot=conversation.session] > .ank0OG_viewArea > .ag-view > .ag-list
+ *
+ * 几何按「容器顶部固定在视口 0，子元素 top = 内容偏移 − 容器 scrollTop」建模 ——
+ * 这正是 pinToNewest 依赖的关系，因此断言能真正约束行为而不是复述实现。
+ */
+function attachScrollDom(env, tree) {
+  const find = (node, cls) => {
+    if (!node || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const n of node) { const hit = find(n, cls); if (hit) return hit }
+      return null
+    }
+    const c = node.props && node.props.className
+    if (typeof c === 'string' && c.split(' ').indexOf(cls) >= 0) return node
+    return node.props ? find(node.props.children, cls) : null
+  }
+  const scrollBody = {
+    overflowY: 'auto', scrollTop: 0, scrollHeight: 900, clientHeight: 400,
+    parentElement: null, getBoundingClientRect: () => ({ top: 0 }),
+  }
+  const viewArea = { overflowY: 'visible', contentTop: 0, parentElement: scrollBody }
+  const view = { overflowY: 'visible', contentTop: 300, parentElement: viewArea }
+  const list = { overflowY: 'auto', contentTop: 300, scrollTop: 0, parentElement: view }
+  view.getBoundingClientRect = () => ({ top: view.contentTop - scrollBody.scrollTop })
+  list.getBoundingClientRect = () => ({ top: list.contentTop - scrollBody.scrollTop })
+
+  const viewNode = find(tree, 'ag-view')
+  const listNode = find(tree, 'ag-list')
+  const viewRef = viewNode && viewNode.props ? viewNode.props.ref : null
+  const listRef = listNode && listNode.props ? listNode.props.ref : null
+  if (viewRef && typeof viewRef === 'object') viewRef.current = view
+  if (listRef && typeof listRef === 'object') listRef.current = list
+  env.computedStyle = (el) => ({ overflowY: el.overflowY || 'visible' })
+  return { scrollBody, view, list, hasViewRef: !!viewRef, hasListRef: !!listRef }
 }
 
 // ================= 1. 静默拒绝 → 常驻提示条 + 追认按钮 =================
@@ -647,6 +702,47 @@ function inspect(node, out, renderer) {
   assert.strictEqual(historyEntry.options.label(), '审批 (2)',
     'the notice strip alone publishes the count (2 recorded rows, the pending one only lives in the strip)')
   console.log('  ✓ 顶部「审批」tab：label thunk 带本会话记录条数（pending 不计入）')
+}
+
+// ================= 7e. 进入「审批」视图默认停在最新记录 =================
+{
+  // 宿主把各 tab 渲染在**同一个**常驻滚动容器里，切 tab 不重置 scrollTop：chat 永远停在
+  // 底部，于是进「审批」时最新记录（列表第一行）在视口外，用户每次都要手动往上拉。
+  // 断言：挂载时把共享滚动容器对齐到本视图顶部；新记录到达且用户本来就贴着顶部时继续跟随；
+  // 用户主动下滚查看历史后不再被拽回去。
+  const env = createEnv([
+    { id: 101, kind: 'auto', tool: 'pwsh', ts: '2026-10-04T12:00:00.000Z', verdict: 'rule', justification: '最新一条', files: [] },
+    { id: 100, kind: 'auto', tool: 'pwsh', ts: '2026-10-04T11:59:00.000Z', verdict: 'rule', justification: '较早一条', files: [] },
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+
+  const first = await renderSettled(booted, History, { sessionId: 's14' })
+  const dom = attachScrollDom(env, first)
+  assert.ok(dom.hasViewRef && dom.hasListRef, '.ag-view / .ag-list must carry refs for scroll pinning')
+
+  // 下一轮轮询：effect 带着真实 DOM 跑一次 → 定位到最新记录
+  // （提示条广播「已读」是组件里既有的刷新入口，用它驱动一次真实 loadEvents）
+  await pollOnce(booted, History, { sessionId: 's14' }, env)
+  assert.strictEqual(dom.scrollBody.scrollTop, 300,
+    'entering the approval view aligns the shared scroll container to the view top (= newest record)')
+  assert.strictEqual(dom.list.scrollTop, 0, 'the list itself is reset to the top too')
+
+  // 新记录到达（浏览器滚动锚定把视图往下推）→ 用户本来贴着顶部 → 继续跟随
+  dom.view.contentTop = 340
+  dom.list.contentTop = 340
+  await pollOnce(booted, History, { sessionId: 's14' }, env)
+  assert.strictEqual(dom.scrollBody.scrollTop, 340,
+    'a new record keeps the newest row visible while the user is at the top')
+
+  // 用户主动下滚查看历史 → 轮询不再把视图拽回去
+  dom.view.contentTop = 900
+  dom.list.contentTop = 900
+  dom.scrollBody.scrollTop = 900
+  await pollOnce(booted, History, { sessionId: 's14' }, env)
+  assert.strictEqual(dom.scrollBody.scrollTop, 900,
+    'a poll does not yank the user back once they scrolled away from the newest record')
+  console.log('  ✓ 进入「审批」视图停在最新记录；贴顶时跟随新记录，用户下滚后不打扰')
 }
 
 console.log('All client render smoke tests passed successfully!')

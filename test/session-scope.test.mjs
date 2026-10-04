@@ -53,6 +53,11 @@ function writeConfig(patch) {
     hardCategories: ['deletion', 'credential', 'remote', 'system', 'bulk'],
     riskyThreshold: 3,
     judgeTimeoutMs: 2000,
+    // 本文件只测「规则作用域」（本会话 / 全局 / 一次性 / 提升）：
+    // 关掉 0.9.7 的定域放行层，否则工作区内的调用会被它直接放行，
+    // 「另一个会话不被本会话规则放行」这条断言就观察不到判定器了。
+    // 定域放行 / 危险动作围栏由 test/fence-scope.test.mjs 覆盖。
+    scopeAutoAllow: false,
     learning: { enabled: true },
   }, patch || {}), null, 2) + '\n', 'utf8')
 }
