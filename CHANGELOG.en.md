@@ -4,6 +4,27 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.10] — 2026-10-05
+
+**The other half of the same `format` bug: the bare `format` keyword in the dangerous-keyword list caused spurious escalations.** 0.9.9 fixed the audit label (display layer); this one fixes an actual extra human prompt.
+
+`DEFAULT_DENY_KEYWORDS` contained a bare `'format'`, and `matchDenyKeyword`'s boundary rule lets a **standalone word** `format` match:
+
+| Command | Before | After |
+|---|---|---|
+| `Write-Output '--- format fix present? ---'` | ❌ escalated | ✅ allowed |
+| `npm run format` | ❌ escalated | ✅ allowed |
+| `gh run view 1 --json status --format json` | ✅ allowed (`-` blocked by the left boundary) | ✅ allowed |
+| `Get-Date -Format o` | ✅ allowed | ✅ allowed |
+| `format C: /fs:ntfs` | ✅ escalated | ✅ escalated |
+| `Format-Volume -DriveLetter D` | ❌ allowed (not in the default list) | ✅ escalated |
+
+Live evidence (2026-10-05): my own `Write-Output '--- format fix present? ---'` produced a `DENY`. The audit log only records `DENY pwsh mode=danger-full-access | escalate sandbox to danger-full-access: …`, so which keyword matched was invisible; a reproduction script pinned it on the bare `format`.
+
+- Default list: `'format'` → `'format c:'` + `'format /'` + `'format-volume'` (also adds `Format-Volume`, which the default list lacked)
+- **Migration**: a persisted config (the user has hand-written a long keyword list) that still holds a bare `'format'` is rewritten by `normalizeConfig` into the three shaped entries and saved — idempotent, no other keyword touched
+- `looksDeny` gains 3 negative and 2 positive assertions; the migration has its own idempotency assertion
+
 ## [0.9.9] — 2026-10-05
 
 **Fixes a mislabel in the audit table: `format` was read as "deletion".** Found while verifying 0.9.8 on live traffic.

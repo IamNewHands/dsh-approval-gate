@@ -103,9 +103,34 @@ assert.strictEqual(looksDeny('pwsh Get-Date -Format "yyyy-MM-dd"'), false, 'Get-
 assert.strictEqual(looksDeny('pwsh git log --format=%h -n 5'), false, '--format should NOT be blocked')
 assert.strictEqual(looksDeny('pwsh prettier --format src/index.js'), false, '--format flag should NOT be blocked')
 assert.strictEqual(looksDeny('pwsh Format-List *'), false, 'Format-List should NOT be blocked')
+// 裸 `format` 曾经是一个危险词：任何「独立成词」的 format 都会转人工
+// （2026-10-05 现场：`Write-Output '--- format fix present? ---'` 触发了一次 DENY）。
+// 现在只认形态化的 `format c:` / `format /` / `format-volume`。
+assert.strictEqual(looksDeny("pwsh Write-Output '--- format fix present? ---'"), false,
+  'a standalone word "format" in an echo string must NOT be blocked')
+assert.strictEqual(looksDeny('pwsh npm run format'), false, 'running a formatter must NOT be blocked')
+assert.strictEqual(looksDeny('pwsh gh run view 1 --json status --format json'), false, '--format json must NOT be blocked')
+
+// 迁移：已经落盘的配置里如果有裸 `format`，normalizeConfig 要把它换成形态化三条（幂等）
+{
+  const migrated = mod.normalizeConfig({ denyKeywords: ['rm -rf', 'format', 'shutdown'] })
+  assert.ok(!migrated.denyKeywords.some((k) => String(k).trim().toLowerCase() === 'format'),
+    'a persisted bare `format` keyword must be migrated away')
+  assert.ok(migrated.denyKeywords.some((k) => String(k).trim().toLowerCase() === 'format c:'),
+    'the migration adds `format c:`')
+  assert.ok(migrated.denyKeywords.some((k) => String(k).trim().toLowerCase() === 'format-volume'),
+    'the migration adds `format-volume`')
+  assert.ok(migrated.denyKeywords.includes('rm -rf'), 'other keywords survive the migration')
+
+  const again = mod.normalizeConfig({ denyKeywords: migrated.denyKeywords })
+  assert.strictEqual(again.denyKeywords.filter((k) => String(k).trim().toLowerCase() === 'format c:').length, 1,
+    'the migration is idempotent')
+}
 
 // True positives MUST be blocked
 assert.strictEqual(looksDeny('format C: /fs:ntfs'), true, 'format C: must be blocked')
+assert.strictEqual(looksDeny('format /q D:'), true, 'format with a flag must be blocked')
+assert.strictEqual(looksDeny('Format-Volume -DriveLetter D'), true, 'Format-Volume must be blocked')
 assert.strictEqual(looksDeny('rm -rf /data'), true, 'rm -rf must be blocked')
 assert.strictEqual(looksDeny('shutdown /s /t 0'), true, 'shutdown must be blocked')
 assert.strictEqual(looksDeny('reboot now'), true, 'reboot must be blocked')

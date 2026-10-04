@@ -597,10 +597,14 @@ function recordAutoAllow(sessionId, toolName, mode, reason, justification, verdi
 }
 
 // 不可逆危险操作（deny 层，命中即转人工，优先级最高）
+// `format` 只列**形态化**的三条：裸 `format` 会命中「独立成词的 format」
+// （`npm run format`、回显字符串里的 `format`、`gh … --json … format`），
+// 而它的本意是 `format C:` 这种格式化磁盘。`-Format` / `--format` 因为有连字符，
+// 本来就被 matchDenyKeyword 的左边界挡掉（见 unit.test.mjs）。
 const DEFAULT_DENY_KEYWORDS = [
   'rm -rf', 'rm -fr', 'rm -r -f', 'rm --recursive --force',
   'push --force', 'force-push', 'force push', 'drop table', 'drop database',
-  'mkfs', 'mkfs.ext', 'format', 'shutdown', 'reboot', 'dd of=',
+  'mkfs', 'mkfs.ext', 'format c:', 'format /', 'format-volume', 'shutdown', 'reboot', 'dd of=',
   'delete from', 'truncate table', 'truncate ', 'terraform destroy', 'revoke',
   '清空数据库', '删除数据库', '格式化', 'sudo rm', 'chmod 777 /',
   'git reset --hard', 'git clean -fd', 'docker rm', 'docker system prune'
@@ -1376,6 +1380,17 @@ const bundledSeed = loadJson(BUNDLED_ALLOWLIST_PATH, null)
 function normalizeConfig(raw) {
   const cfg = raw && typeof raw === 'object' ? raw : {}
   cfg.denyKeywords = cfg.denyKeywords || DEFAULT_DENY_KEYWORDS
+  // 迁移（v0.9.10）：把裸 `format` 危险词换成形态化的三条。
+  // 裸 `format` 会命中「独立成词的 format」——`npm run format`、回显字符串里的 `format`
+  // 都会转人工（2026-10-05 现场：我自己的 `Write-Output '--- format fix present? ---'`
+  // 触发了一次 DENY）。它的本意只是 `format C:` 这种格式化磁盘，形态化后破坏性不变、误报消失。
+  // 幂等：跑第二遍时列表里已经没有裸 `format`。
+  if (Array.isArray(cfg.denyKeywords) && cfg.denyKeywords.some((k) => String(k).trim().toLowerCase() === 'format')) {
+    cfg.denyKeywords = cfg.denyKeywords.filter((k) => String(k).trim().toLowerCase() !== 'format')
+    for (const shape of ['format c:', 'format /', 'format-volume']) {
+      if (!cfg.denyKeywords.some((k) => String(k).trim().toLowerCase() === shape)) cfg.denyKeywords.push(shape)
+    }
+  }
   if (!Array.isArray(cfg.allowRules)) {
     cfg.allowRules = DEFAULT_ALLOW_RULES.slice()
   } else {

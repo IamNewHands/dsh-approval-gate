@@ -4,6 +4,27 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.10] — 2026-10-05
+
+**修同一个 `format` 的另一半：危险词表里的裸 `format` 会误转人工。** 0.9.9 修的是审计表的标签（展示层），这一版修的是**真的多弹一次人工**。
+
+危险词表 `DEFAULT_DENY_KEYWORDS` 里有一个裸的 `'format'`，`matchDenyKeyword` 的边界规则允许「独立成词的 format」命中，于是：
+
+| 命令 | 修前 | 修后 |
+|---|---|---|
+| `Write-Output '--- format fix present? ---'` | ❌ 转人工 | ✅ 放行 |
+| `npm run format` | ❌ 转人工 | ✅ 放行 |
+| `gh run view 1 --json status --format json` | ✅ 放行（`-` 被左边界挡掉） | ✅ 放行 |
+| `Get-Date -Format o` | ✅ 放行 | ✅ 放行 |
+| `format C: /fs:ntfs` | ✅ 转人工 | ✅ 转人工 |
+| `Format-Volume -DriveLetter D` | ❌ 放行（默认表里没这条） | ✅ 转人工 |
+
+现场证据（2026-10-05）：我自己的 `Write-Output '--- format fix present? ---'` 触发了一次 `DENY`，审计日志里只留 `DENY pwsh mode=danger-full-access | escalate sandbox to danger-full-access: …`，看不出是哪个词命中的 —— 复现脚本定位到裸 `format`。
+
+- 默认表：`'format'` → `'format c:'` + `'format /'` + `'format-volume'`（顺带补上 `Format-Volume`，它原本不在默认表里）
+- **迁移**：已经落盘的配置（用户手写过很长一张危险词表）里若还有裸 `'format'`，`normalizeConfig` 会把它换成形态化三条并落盘 —— 幂等，其他关键词一个不动
+- `looksDeny` 新增 3 条反例断言 + 2 条正例断言；迁移另有幂等断言
+
 ## [0.9.9] — 2026-10-05
 
 **修一个审计表的误标：`format` 被当成「删除」。** 0.9.8 上线后的现场验证中发现的。
