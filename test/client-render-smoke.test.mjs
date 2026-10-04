@@ -597,6 +597,34 @@ function inspect(node, out, renderer) {
   console.log('  ✓ 结构化事实 → 字段表格（操作类型/路径/影响范围/命令/说明），无 facts 的老事件仍回退文本')
 }
 
+// ================= 7c2. 目标定域 → 「目标位置」行（工作区外高亮） =================
+{
+  // 「这次碰的是哪些位置」与「影响范围」（沙箱模式）是两个轴。用户审「模型有没有读到
+  // 工作区外的敏感文件」时看的是前者，所以它在表格里单独占一行，越界时用警示色。
+  const mk = (id, targetScope, targetScopeText) => ({
+    id, kind: 'auto', tool: 'pwsh', mode: 'danger-full-access', ts: '2026-10-04T10:00:00.000Z',
+    verdict: 'rule', justification: '写配置', files: ['C:\\Users\\shiro\\AppData\\x\\Merge.yaml'],
+    targetScope,
+    facts: {
+      tool: 'pwsh', action: '新增/写入', actionKey: 'write', mode: 'danger-full-access',
+      scopeShort: '整机', scopeDetail: '工作区外任意路径可读写，含系统位置；改动不可自动回滚',
+      paths: ['C:\\Users\\shiro\\AppData\\x\\Merge.yaml'], targetScope, targetScopeText,
+      command: 'Copy-Item "C:\\Users\\shiro\\AppData\\x\\Merge.yaml" .', reason: '写配置',
+    },
+  })
+  const env = createEnv([mk(86, 'outside', '工作区外'), mk(87, 'inside', '工作区内')])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's12b' })
+  const info = inspect(tree, null, booted.React.render.bind(booted.React))
+  assert.ok(info.text.includes('目标位置'), 'the 「目标位置」 field is rendered')
+  assert.ok(info.text.includes('工作区外'), 'an out-of-workspace target is stated in plain Chinese')
+  assert.ok(info.text.includes('工作区内'), 'and an in-workspace one is stated too')
+  assert.ok(info.classes.some((c) => c.indexOf('ag-facts-v-warn') >= 0),
+    'the out-of-workspace row is colour-coded as a warning')
+  console.log('  ✓ 目标定域：字段表格新增「目标位置」行，工作区外/无法定域用警示色')
+}
+
 // ================= 7d. 顶部「审批」tab 的条数 =================
 {
   // 宿主把 conversation.view 的 label 当字符串渲染，因此条数只能靠 label thunk +

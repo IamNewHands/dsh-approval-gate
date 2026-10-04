@@ -36,7 +36,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // 吸收自 NanmiCoder/dsh-auto-mode（MIT）：判定输入脱敏 / 路径事实硬拒 / 结构化裁决协议
 import { sanitizeClassifierText, sanitizeClassifierArguments } from './sanitize.mjs'
-import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential } from './paths.mjs'
+import { resolveRoots, hardDestructiveTargetReason, containsCredentialMaterial, urlContainsCredential, extractAbsolutePaths, classifyPathScope, hasPathTraversal } from './paths.mjs'
 import { parseClassifierText, buildClassifierPayload, CLASSIFIER_SYSTEM_PROMPT } from './classifier.mjs'
 // 审批说明中文化：面向审批人的说明一律中文（命令/路径原样保留）
 import { buildChineseReason, describeFacts, compactFacts } from './zh.mjs'
@@ -465,6 +465,68 @@ function resolveToolCallFiles(callId, events) {
 }
 
 /**
+ * 本次调用「指向」的绝对路径目标，与 resolveToolCallFiles 的分工：
+ *   - resolveToolCallFiles 只回答「会写哪里」（供改动前快照，必须是写目标）；
+ *   - 本函数回答「碰到了哪里」，命令类工具即便只读也提取，供审计定域与判定器输入。
+ *
+ * 只收绝对路径形态：`origin/main`、`refs/heads/x`、`src/a.ts` 这类相对片段无法单独定域，
+ * 收进来只会制造「看起来在工作区内」的假象（2026-10-04 取证：628 条带命令的真实事件里
+ * 458 条记录不到任何绝对路径，审计无法回答「这次动的是工作区内还是外」）。
+ *
+ * @param {string|null|undefined} callId approval 请求关联的工具调用 ID
+ * @param {Array} events 会话事件列表
+ * @returns {Array<{raw: string, path: string, kind: string}>|null} 绝对路径目标（未命中返回 null）
+ */
+function resolveToolCallTargets(callId, events) {
+  const args = resolveToolCallArgs(callId, events)
+  if (!args || typeof args !== 'object') return null
+  const found = []
+  const seen = new Set()
+  const add = (text) => {
+    if (found.length >= 24) return
+    for (const p of extractAbsolutePaths(text)) {
+      if (seen.has(p.path)) continue
+      seen.add(p.path)
+      found.push(p)
+    }
+  }
+  for (const k of ['file_path', 'filePath', 'path', 'filename', 'file', 'target', 'source', 'dest', 'destination']) {
+    const v = args[k]
+    if (Array.isArray(v)) v.forEach((one) => { if (typeof one === 'string') add(one) })
+    else if (typeof v === 'string') add(v)
+    if (found.length >= 24) break
+  }
+  for (const k of ['command', 'cmd', 'script', 'CommandLine']) {
+    const v = args[k]
+    if (typeof v === 'string' && v) add(v)
+    if (found.length >= 24) break
+  }
+  return found.length > 0 ? found : null
+}
+
+/**
+ * 目标定域：`inside` / `outside` / `mixed` / `unknown`。
+ *
+ * 两个刻意保守的规则：
+ *   1. 一个 data 目标都没有 → `unknown`（不是 inside）：相对片段、变量拼出的路径都算未知。
+ *   2. 文本里有 `..` 穿越且字面量全在工作区内 → 降级为 `unknown`：
+ *      `cd D:\ws\x; Get-Content ..\..\Users\me\.ssh\id_rsa` 只提取到工作区内路径，
+ *      但真实目标在工作区外，报「工作区内」是危险的假阴性。
+ * 消费方必须把 `unknown` 与 `outside` 同等对待（fail-closed）。
+ *
+ * @param {Array} targets - resolveToolCallTargets() 的产物
+ * @param {object} roots - resolveRoots() 的产物
+ * @param {string} text - 本次调用的命令/说明文本（供穿越检测）
+ * @returns {{scope: string, inside: string[], outside: string[], traversal: boolean}}
+ */
+function targetScopeOf(targets, roots, text) {
+  const base = classifyPathScope(targets || [], roots)
+  const traversal = hasPathTraversal(text)
+  if (traversal && base.scope === 'inside') return Object.assign({}, base, { scope: 'unknown', traversal: true })
+  return Object.assign({}, base, { traversal })
+}
+
+/**
  * 记录一次审批事件（结构化，供 client 审查界面轮询展示）。
  * kind: 'auto'（自动放行）/ 'manual-pending'（转人工等待）/ 'manual-approved'（人工通过）/
  *       'manual-rejected'（人工拒绝）
@@ -502,6 +564,15 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   // command：本次调用的真实命令文本（pwsh 等命令类工具没有 file_path，追认规则需要它做指纹，
   // 否则只能退化成 justification 里的偶然词，如 2026-09-18 的 contains:"job"）
   if (o.command) ev.command = String(o.command).slice(0, 400)
+  // targets：本次调用指向的**绝对路径**（与 files 不同，含只读目标；用于回答「动的是哪里」）。
+  // files 只装写目标（供改动前快照），两者刻意分开：把只读目标当写目标会给敏感文件拍快照。
+  if (Array.isArray(o.targets) && o.targets.length > 0) {
+    ev.targets = o.targets.map((t) => String(t).slice(0, 260)).slice(0, 12)
+  }
+  // targetScope：目标定域（inside / outside / mixed / unknown）。unknown 与 outside 同等危险：
+  // 相对片段与变量拼出的路径都落在 unknown，消费方不得把它读成「工作区内」。
+  if (o.targetScope) ev.targetScope = String(o.targetScope).slice(0, 16)
+  if (o.targetTraversal) ev.targetTraversal = true
   // reconsiderOf：追认记录指回被追认的原事件 id（供审查视图标注「已追认」）
   if (Number.isInteger(o.reconsiderOf)) ev.reconsiderOf = o.reconsiderOf
   try {
@@ -2473,6 +2544,13 @@ export default {
         const toolCmd = resolveToolCallCommand(req.callId, events)
         // 说明用命令：严格命中落空时回溯最近同名调用（只影响给人看的说明，不影响安全裁决）
         const displayCmd = resolveDisplayCommand(req.callId, toolName, events)
+        // 判定根路径：工作区 = 会话 cwd。提前到这里，因为「目标定域」要用它
+        const roots = rootsForSession(session)
+        // 本次调用指向的绝对路径目标（含只读目标）与定域结果：
+        // 审计据此回答「动的是工作区内还是外」，判定器据此看到真实路径事实。
+        const toolTargets = resolveToolCallTargets(req.callId, events)
+        const scopeText = [toolCmd, displayCmd.command, justification].filter(Boolean).join(' ')
+        const targetScope = targetScopeOf(toolTargets, roots, scopeText)
         // 结构化审批事实：中文说明（zh）与审查界面字段表格（facts）同源，
         // 命令与路径原样保留，只为「一眼看清改什么、动哪里、影响多大」。
         const factInput = {
@@ -2482,6 +2560,9 @@ export default {
           command: toolCmd || displayCmd.command,
           commandSource: toolCmd ? 'callId' : displayCmd.source,
           files: toolFiles,
+          targets: (toolTargets || []).map((t) => t.raw),
+          targetScope: targetScope.scope,
+          targetTraversal: targetScope.traversal,
           cwd: sessionCwd
         }
         const zhReason = buildChineseReason(factInput)
@@ -2490,7 +2571,10 @@ export default {
         const filesOpt = Object.assign(
           toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd },
           toolCmd ? { command: toolCmd } : {},
-          facts ? { facts } : {}
+          facts ? { facts } : {},
+          { targetScope: targetScope.scope },
+          targetScope.traversal ? { targetTraversal: true } : {},
+          toolTargets ? { targets: toolTargets.map((t) => t.raw) } : {}
         )
         // 记录用 opts：filesOpt 语义不变，仅追加 zh（审查界面渲染用）
         const displayOpts = zhReason ? Object.assign({}, filesOpt, { zh: zhReason }) : filesOpt
@@ -2562,7 +2646,6 @@ export default {
 
         // ---- 0. 确定性硬拒层（吸收自 dsh-auto-mode：分类器无权推翻） ----
         // 事实来源：工具参数的真实路径 + 凭据材料正则，而非 justification 关键词。
-        const roots = rootsForSession(session)
         const callArgs = resolveToolCallArgs(req.callId, events) || {}
         const hardFacts = hardDenyFacts(toolName, callArgs, roots)
         let dshConfigAllow = null
@@ -2625,13 +2708,21 @@ export default {
           audit(`REDACT  ${toolName} 工作区路径含敏感形态，转人工`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'redacted-target')
         }
+        // 送判定器的路径事实：写目标（toolFiles）∪ 命令里的绝对路径目标（toolTargets）。
+        // 只给 toolFiles 时，`cd D:\ws\x; git push ...` 这类命令在判定器眼里「不涉及任何文件」，
+        // 判定器只能凭说明措辞猜；补上绝对路径后它才能看到「目标全在工作区内」。
+        const effectPaths = []
+        for (const p of [...(toolTargets || []).map((t) => t.raw), ...(toolFiles || [])]) {
+          if (!p || effectPaths.includes(p)) continue
+          effectPaths.push(p)
+        }
         const judgeFields = {
           toolName,
           mode,
           policyReason: sanitizeClassifierText(matchContext),
           workspaceRoot: roots.workspace,
           // 结构化事实：本次调用涉及的文件的绝对路径 + 改动前是否存在
-          filesystemEffects: (toolFiles || []).slice(0, 8).map((f) => ({
+          filesystemEffects: effectPaths.slice(0, 8).map((f) => ({
             path: sanitizeClassifierText(String(f)),
             existedBefore: (() => { try { return existsSync(resolveAbsPath(f, sessionCwd)) } catch { return false } })()
           })),

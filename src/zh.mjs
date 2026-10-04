@@ -105,6 +105,24 @@ function scopeFor(mode, cwd) {
   return { scopeShort: '未提权', scopeDetail: '沙箱模式不变；本次审批只放行这一次调用' }
 }
 
+/**
+ * 目标定域 → 一句人话。
+ *
+ * 与 scopeFor()（沙箱模式的影响范围）是两个不同的轴：这里回答「这次碰的是哪些位置」。
+ * `unknown` 必须显式说出来，不能留空 —— 相对片段、变量拼出的路径、`..` 穿越都落在这里，
+ * 留空会被读成「没问题」。
+ */
+function targetScopeFor(scope, traversal) {
+  const base = {
+    inside: '工作区内',
+    outside: '工作区外',
+    mixed: '跨工作区内外',
+    unknown: '无法定域（没有绝对路径）'
+  }[String(scope || '')]
+  if (!base) return ''
+  return traversal && String(scope) !== 'outside' ? `${base} · 含 .. 穿越` : base
+}
+
 /** 截断过长文本，保留可读性。 */
 function clip(text, max) {
   const s = String(text == null ? '' : text).trim()
@@ -120,7 +138,10 @@ function clip(text, max) {
  * @param {string} [input.mode] - 解析出的目标沙箱模式，非提权请求时为空。
  * @param {string} [input.justification] - 模型给出的原始说明（可能英文）。
  * @param {string} [input.command] - 本次调用真实命令文本。
- * @param {string[]} [input.files] - 本次调用真实目标路径。
+ * @param {string[]} [input.files] - 本次调用的写目标（供改动前快照，可能是相对路径）。
+ * @param {string[]} [input.targets] - 本次调用指向的绝对路径（含只读目标，命令类工具也能提）。
+ * @param {string} [input.targetScope] - 目标定域：inside / outside / mixed / unknown。
+ * @param {boolean} [input.targetTraversal] - 命令里出现 `..` 穿越。
  * @param {string} [input.cwd] - 会话工作区。
  * @param {string} [input.commandSource] - 命令来源：'lastSameTool' 时标注「回溯最近同名调用」。
  * @returns {object} 事实对象（字段全部为可直接展示的字符串/数组）。
@@ -132,10 +153,14 @@ export function describeFacts(input) {
   const commandTool = isCommandTool(toolName)
   const actionKey = actionKeyFor(toolName, command, commandTool)
   const mode = String(o.mode || '').trim()
+  // 操作路径 = 绝对路径目标在前（可定域的事实），写目标在后（可能是相对路径）
   const files = (Array.isArray(o.files) ? o.files : []).filter(Boolean).map(String)
-  const shown = files.slice(0, 5).join('、')
-  const pathText = files.length > 0
-    ? shown + (files.length > 5 ? ` 等 ${files.length} 处` : '')
+  const targets = (Array.isArray(o.targets) ? o.targets : []).filter(Boolean).map(String)
+  const merged = []
+  for (const p of [...targets, ...files]) if (!merged.includes(p)) merged.push(p)
+  const shown = merged.slice(0, 5).join('、')
+  const pathText = merged.length > 0
+    ? shown + (merged.length > 5 ? ` 等 ${merged.length} 处` : '')
     : NOT_PROVIDED
   // 命令来自「回溯最近同名调用」时标注来源，避免被当成这次调用的确切参数
   const commandLabel = o.commandSource === 'lastSameTool' ? '回溯最近同名调用' : ''
@@ -143,6 +168,8 @@ export function describeFacts(input) {
     ? `命令${commandLabel ? `（${commandLabel}）` : ''}：${command}`
     : (commandTool ? `命令：${NOT_PROVIDED}` : '')
   const scope = scopeFor(mode, o.cwd)
+  const targetScope = String(o.targetScope || '').trim()
+  const targetScopeText = targetScopeFor(targetScope, o.targetTraversal === true)
   return {
     tool: toolName,
     actionKey,
@@ -150,9 +177,12 @@ export function describeFacts(input) {
     mode,
     scopeShort: scope.scopeShort,
     scopeDetail: scope.scopeDetail,
-    paths: files,
+    paths: merged,
     pathText,
-    pathsMissing: files.length === 0,
+    pathsMissing: merged.length === 0,
+    targetScope,
+    targetScopeText,
+    targetTraversal: o.targetTraversal === true,
     command,
     commandLabel,
     commandText,
@@ -190,6 +220,11 @@ export function compactFacts(facts) {
     if (paths.length > 0) out.paths = paths
   }
   if (facts.pathsMissing) out.pathsMissing = true
+  const targetScope = str(facts.targetScope, 16)
+  if (targetScope) out.targetScope = targetScope
+  const targetScopeText = str(facts.targetScopeText, 40)
+  if (targetScopeText) out.targetScopeText = targetScopeText
+  if (facts.targetTraversal === true) out.targetTraversal = true
   const command = str(facts.command, 300)
   if (command) out.command = command
   const commandLabel = str(facts.commandLabel, 40)
@@ -220,6 +255,7 @@ export function buildChineseReason(input) {
   // 原文已是中文、且没有提权事实可补 → 不改写（避免替模型改措辞）
   if (hasCJK(f.reason) && !mode) return null
   const lines = [`操作：${f.action}`, `路径：${f.pathText}`]
+  if (f.targetScopeText) lines.push(`目标：${f.targetScopeText}`)
   if (mode) lines.push(`影响：${f.scopeShort}（${f.scopeDetail}）`)
   if (f.commandText) lines.push(f.commandText)
   if (f.reason) lines.push(`原因：${f.reason}`)

@@ -150,6 +150,7 @@ window.__ModuleLoader__.load({
 .ag-facts-v-write{color:var(--dsw-alias-state-success-primary)}
 .ag-facts-v-edit{color:var(--dsw-alias-state-business-primary)}
 .ag-facts-v-remote{color:var(--dsw-alias-state-warn-label)}
+.ag-facts-v-warn{color:var(--dsw-alias-state-warn-label)}
 `
 
     const VERDICT_LABELS = {
@@ -283,6 +284,13 @@ window.__ModuleLoader__.load({
       const paths = Array.isArray(f.paths) ? f.paths.filter(Boolean) : []
       if (paths.length > 0) rows.push(['操作路径', paths.map(String).join('\n'), 'ag-facts-v-mono'])
       else if (f.pathsMissing) rows.push(['操作路径', 'host未提供', ''])
+      // 目标定域：工作区内 / 工作区外 / 跨内外 / 无法定域。
+      // 与下面「影响范围」（沙箱模式）是两个轴：这一行回答「碰的是哪些位置」，
+      // 是用户审「模型有没有读到工作区外敏感文件」时的第一眼依据。
+      if (f.targetScopeText) {
+        const risky = f.targetScope && f.targetScope !== 'inside'
+        rows.push(['目标位置', String(f.targetScopeText), risky ? 'ag-facts-v-warn' : ''])
+      }
       const scope = [f.scopeShort, f.scopeDetail]
         .map(function (s) { return s ? String(s) : '' })
         .filter(Boolean)
@@ -325,6 +333,8 @@ window.__ModuleLoader__.load({
         parts.push(String(f.command).slice(0, 60))
       }
       if (f.scopeShort) parts.push(String(f.scopeShort))
+      // 目标在工作区外/无法定域时补一句，让提示条第一眼就能看出这次越界
+      if (f.targetScope && f.targetScope !== 'inside' && f.targetScopeText) parts.push(String(f.targetScopeText))
       return parts.join(' · ')
     }
 

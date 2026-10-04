@@ -2,7 +2,7 @@
 
 > 首页：[简体中文](../README.md) · [English](../README.en.md) · 指南：[中文](GUIDE.md) · [English](GUIDE.en.md)
 
-DeepSeek Harness 自动审批门控插件 v0.9.5：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
+DeepSeek Harness 自动审批门控插件 v0.9.6：**最小人工介入，只把必须人工确认的操作转人工（fail-safe）**。
 
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
@@ -212,11 +212,24 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
    - **diff 快照管理**：视图顶部显示「diff 快照 占用 · 条数」，并提供两个清理入口——**「仅清本会话」**（只删除当前会话的快照，不影响其他会话未查看的 diff）与**「清空全部」**（二次确认后清空所有会话；均仅删除对比数据，不影响审批记录本身，删除后历史文件不可再查看对比）
    - 限制：仅文本文件（单文件 ≤256KB、每事件 ≤5 个文件）会保存快照，二进制/超限文件不可点击
 
-数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold，v0.8.1 起的中文说明 `zh`，以及 v0.9.0 起的结构化事实 `facts`），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
+数据链路：host 每次判定追加结构化事件到 `~/.dsh/auto-approve/events.jsonl`（`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered，含 sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold，v0.8.1 起的中文说明 `zh`，v0.9.0 起的结构化事实 `facts`，以及 v0.9.6 起的目标定域 `targets` / `targetScope` / `targetTraversal`），浏览器通过 `GET /api/auto-approve/events?sessionId=&since=` 轮询（2s 增量 / 视图 5s 全量）。
 
 > `zh` 是**面向审批人的中文说明**（v0.8.1+，v0.9.0 起按字段分行）：`src/zh.mjs` 用真实事实（目标模式 / 真实命令 / 真实目标路径）生成，形如「操作：删除 / 路径：C:\temp\a.txt / 影响：整机（工作区外任意路径可读写，含系统位置；改动不可自动回滚）/ 命令：Remove-Item C:\temp\a.txt / 原因：<模型原文>」；命令与路径原样保留，模型原文放在「原因」行。原文已是中文且无提权事实时不改写（返回 null）。前端优先渲染 `zh`，缺 `zh`（老事件）回退 `justification`；`justification` 永远保存原文。
 
-> `facts` 是**结构化审批事实**（v0.9.0+）：字段为 `tool` / `action`（操作类型：删除、推送/发布、新增/写入、修改、执行命令、读取、检索、调用）/ `actionKey`（供前端配色）/ `mode` / `scopeShort`（整机、工作区、只读、未提权）/ `scopeDetail`（后果一句话）/ `paths[]`（最多 8 条）/ `pathsMissing` / `command` / `commandLabel` / `reason`。落盘前经 `compactFacts()` 白名单过滤与逐项截断，避免 `events.jsonl` 无界膨胀；**盘上缺 `facts` 的老事件由事件 API 在响应里按已记录的事实（tool / mode / files / command / justification）现算补上，不回写文件**——事件日志保留当初写下的事实。浏览器端**审批记录行优先渲染 `facts` 字段表格**（操作类型 / 操作路径 / 影响范围 / 执行命令 / 模型说明，另附非 neutral 的风险类别），`facts` 缺失的老事件回退渲染 `zh` / `justification` 文本。注意：宿主审批卡（`dsh-client-ui-approval`）把 `reason` 当纯文本渲染、不解析 Markdown/HTML 且不保留换行，因此卡片上只能显示字段分行的纯文本，**表格只存在于本插件的「审批」视图**；不注入依赖宿主内部 DOM 的 CSS，以免 DSH 升级后样式失效。
+> `facts` 是**结构化审批事实**（v0.9.0+，v0.9.6 起含目标定域）：字段为 `tool` / `action`（操作类型：删除、推送/发布、新增/写入、修改、执行命令、读取、检索、调用）/ `actionKey`（供前端配色）/ `mode` / `scopeShort`（整机、工作区、只读、未提权）/ `scopeDetail`（后果一句话）/ `paths[]`（最多 8 条，绝对路径目标在前、写目标在后）/ `pathsMissing` / **`targetScope`**（`inside` / `outside` / `mixed` / `unknown`）/ **`targetScopeText`**（中文一句话）/ **`targetTraversal`**（命令里有 `..` 穿越）/ `command` / `commandLabel` / `reason`。落盘前经 `compactFacts()` 白名单过滤与逐项截断，避免 `events.jsonl` 无界膨胀；**盘上缺 `facts` 的老事件由事件 API 在响应里按已记录的事实（tool / mode / files / command / justification）现算补上，不回写文件**——事件日志保留当初写下的事实。浏览器端**审批记录行优先渲染 `facts` 字段表格**（操作类型 / 操作路径 / **目标位置** / 影响范围 / 执行命令 / 模型说明，另附非 neutral 的风险类别），`facts` 缺失的老事件回退渲染 `zh` / `justification` 文本。注意：宿主审批卡（`dsh-client-ui-approval`）把 `reason` 当纯文本渲染、不解析 Markdown/HTML 且不保留换行，因此卡片上只能显示字段分行的纯文本，**表格只存在于本插件的「审批」视图**；不注入依赖宿主内部 DOM 的 CSS，以免 DSH 升级后样式失效。
+
+> **目标定域**（v0.9.6+）：事件新增 `targets`（绝对路径，最多 12 条）与 `targetScope`。它与 `facts.scopeShort`（沙箱模式的影响范围）是**两个不同的轴**：`targetScope` 回答「这次碰的是哪些位置」，字段表格里单独占「目标位置」一行，非 `inside` 时用警示色。语义刻意保守（fail-closed）：
+>
+> | 情形 | `targetScope` |
+> |---|---|
+> | 提取到的 `data` 目标全在 workspace 之下 | `inside` |
+> | 有 workspace 之外的目标（无内部目标） | `outside` |
+> | 内外都有 | `mixed` |
+> | 一个 `data` 目标都没有（相对片段、`-D $dir` 这类变量、只有 URL） | `unknown` |
+> | 命令里有 `..\` / `../` 穿越且字面量全在工作区内 | 降级为 `unknown` |
+>
+> `unknown` **必须**与 `outside` 同等对待，不得读成「工作区内」。只提取**绝对路径字面量**：`origin/main`、`refs/heads/x`、`src/a.ts`、`IamNewHands/repo`、URL 路径段一律不产出目标；引号内的整段优先（`'C:\Program Files\Git\bin\bash.exe'` 不会被截成 `C:\Program`）；`/d/GitHub_Clone/x`（Git-Bash 写法）折算到 `D:` 后比较；系统程序位置（`/usr/bin/env`、`C:\Windows\System32\…`、`C:\Program Files\…`）与设备伪文件（`/dev/null`）不算 `data` 目标。**`files` 语义不变**：仍只装写目标（供改动前快照），只读目标只进 `targets` —— 否则 `Get-Content ~/.ssh/id_rsa` 会把私钥内容复制进审批门自己的快照目录。判定模型的 `filesystemEffects` 用「命令绝对路径 ∪ 写目标」，因此命令类工具不再以「不涉及任何文件」的形态送判。**本版不改动确定性裁决逻辑**（硬拒 / 危险词 / 白名单 / 学习一行未动）：`unknown` / `outside` 目前只落审计，不影响放行与转人工；但判定模型的输入变了，判定层对命令类调用的裁决可能与以前不同。已知误报：命令里内嵌脚本/配置正文时可能产出 POSIX 根形态的假目标（如 heredoc 里的 `/build-app.yml`），只会让定域偏保守。
+
 
 > 顶部「审批」tab 的条数（v0.9.0+）：宿主把 `conversation.view` 的 `label` 经 `resolveSlotLabel()` 的结果**当字符串**渲染 tab 文案，且只在「slot 变更 / locale 发布」时重算 tab 列表（`refreshViews` 同时订阅 `slots.subscribe` 与 `locale.subscribe`）。因此条数实现为 **label thunk 读模块级计数 + 条数真变化时发布一次 locale**（注册一次性 namespace 后立即撤销，避免「同一 namespace 不能重复 register」）。口径 = 本会话「审批」视图真正列出的行数（`manual-pending` 只活在提示条里，不计入），数字与打开 tab 后看到的行数一致。`locale` 服务不可用时退回静态「审批」，不影响审批本身。
 

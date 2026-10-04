@@ -2,7 +2,7 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.9.5: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.9.6: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
@@ -240,11 +240,25 @@ Review entry points appear on auto-approval or human-approval (strict DSH design
    - **Snapshot management**: the view header shows "diff snapshots <size> · <count>" with two cleanup actions — **"This session only"** (removes only the current session's snapshots, never touching other sessions' unviewed diffs) and **"Clear all"** (double-confirmed, clears every session). Both delete comparison data only — approval records stay — and after clearing, historical files can no longer be diffed
    - Limits: only text files (≤256KB each, ≤5 per event) get snapshots; binary/oversized files are not clickable
 
-Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.jsonl` per judgment (`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered, plus sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold and, since v0.8.1, the Chinese explanation `zh`); the browser polls `GET /api/auto-approve/events?sessionId=&since=` (2s incremental / 5s full refresh in the view).
+Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.jsonl` per judgment (`kind`: auto / manual-pending / manual-approved / manual-rejected / hard-reject / judge-deny / reconsidered, plus sessionId/tool/mode/reason/justification/verdict/files/learningCount/threshold, the Chinese explanation `zh` since v0.8.1, the structured `facts` since v0.9.0, and target localisation `targets` / `targetScope` / `targetTraversal` since v0.9.6); the browser polls `GET /api/auto-approve/events?sessionId=&since=` (2s incremental / 5s full refresh in the view).
 
 > `zh` is the **approver-facing Chinese explanation** (v0.8.1+): when the original is English or carries the host prefix `escalate sandbox to <mode>:`, `src/zh.mjs` builds it from real facts (target mode / real command / real target paths) and states the consequence; commands and paths stay verbatim and the model's original text is appended as a note. The frontend renders `zh` first and falls back to `justification` when a `zh` is absent (older events); `justification` always keeps the original.
 
-> `hard-reject` and `judge-deny` are **judge-layer silent rejections** (no dialog was shown): the hard-deny tier and a judge `deny` / consecutive failure respectively. The review view shows both in red as "Rejected outright" with the concrete reason.
+> **Target localisation** (v0.9.6+): events gain `targets` (absolute paths, max 12), `targetScope` and `targetTraversal`. It is a **different axis** from `facts.scopeShort` (the sandbox mode's blast radius): `targetScope` answers "which locations did this touch", occupies its own "target location" row in the field table, and is colour-coded as a warning when it is not `inside`. The semantics are deliberately conservative (fail-closed):
+>
+> | Case | `targetScope` |
+> |---|---|
+> | Every extracted `data` target is under the workspace | `inside` |
+> | At least one target outside the workspace (none inside) | `outside` |
+> | Both inside and outside | `mixed` |
+> | No `data` target at all (relative fragments, variables like `-D $dir`, URLs only) | `unknown` |
+> | The command contains `..\` / `../` traversal while all literals are in-workspace | degraded to `unknown` |
+>
+> `unknown` **must** be treated exactly like `outside` and never read as "inside the workspace". Only **absolute path literals** are extracted: `origin/main`, `refs/heads/x`, `src/a.ts`, `IamNewHands/repo` and URL path segments produce no target; a quoted span wins (`'C:\Program Files\Git\bin\bash.exe'` is not truncated to `C:\Program`); the Git-Bash form `/d/GitHub_Clone/x` is folded onto `D:` before comparison; system program locations (`/usr/bin/env`, `C:\Windows\System32\…`, `C:\Program Files\…`) and device pseudo-files (`/dev/null`) are not `data` targets. **`files` keeps its meaning**: write targets only (for pre-change snapshots); read-only targets go to `targets` alone — otherwise `Get-Content ~/.ssh/id_rsa` would copy private-key content into the gate's own snapshot directory. The judge's `filesystemEffects` is "absolute paths in the command ∪ write targets", so command tools are no longer sent as "touches no files". **The deterministic verdict logic is unchanged** (hard deny / dangerous keywords / allowlist / learning are untouched): `unknown` / `outside` currently feed the audit only and do not affect allow/escalate — but the judge's input changed, so the judge layer may rule differently on command-flavoured calls. Known false positive: a command embedding script or config bodies may yield POSIX-root-shaped phantom targets (e.g. `/build-app.yml` inside a heredoc), which only makes localisation more conservative.
+
+> `facts` is the **structured approval fact** set (v0.9.0+, extended with target localisation in v0.9.6): `tool` / `action` / `actionKey` / `mode` / `scopeShort` / `scopeDetail` / `paths[]` (max 8, absolute targets first, write targets after) / `pathsMissing` / **`targetScope`** / **`targetScopeText`** / **`targetTraversal`** / `command` / `commandLabel` / `reason`. It passes through `compactFacts()` (whitelist + per-field truncation) before being written, so `events.jsonl` cannot grow without bound; **older events on disk are given `facts` on the fly by the events API from what was recorded (tool / mode / files / command / justification), with nothing written back**. The browser renders the field table first (operation type / target path / **target location** / blast radius / command / model note), falling back to `zh` / `justification` text for events without `facts`.
+
+
 >
 > `reconsidered` is a **reconsideration record** (v0.7.0+): its `reconsiderOf` points back at the original event. The events API filters the reconsideration records out and adds `reconsidered: true` to the original event, which the frontend uses to label it "Reconsideration approved · … (was rejected outright)" and drop it from the pending count. Reconsideration does not rewrite the original event: the rejection did happen, so the reason stays visible in parentheses (v0.7.1 wording).
 

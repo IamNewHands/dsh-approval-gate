@@ -239,4 +239,55 @@ ok('纯中文非提权 → null（不改写）')
   ok('真实事故样本 → 4 字段一眼可读（替换掉原来那段散文）')
 }
 
+// 15. 目标定域：绝对路径目标排在工作区路径之前，且定域结论单独成行
+{
+  const inside = describeFacts({
+    toolName: 'pwsh',
+    mode: 'danger-full-access',
+    justification: '推送修复。',
+    command: 'cd D:\\GitHub_Clone\\x; git push origin main',
+    files: ['IamNewHands/dsh-approval-gate'],
+    targets: ['D:\\GitHub_Clone\\x'],
+    targetScope: 'inside'
+  })
+  assert.deepEqual(inside.paths, ['D:\\GitHub_Clone\\x', 'IamNewHands/dsh-approval-gate'],
+    'absolute targets come first; the write-target list is appended, not replaced')
+  assert.equal(inside.targetScope, 'inside')
+  assert.equal(inside.targetScopeText, '工作区内')
+  assert.equal(inside.pathsMissing, false)
+
+  assert.equal(describeFacts({ toolName: 'pwsh', targetScope: 'outside' }).targetScopeText, '工作区外')
+  assert.equal(describeFacts({ toolName: 'pwsh', targetScope: 'mixed' }).targetScopeText, '跨工作区内外')
+  assert.equal(describeFacts({ toolName: 'pwsh', targetScope: 'unknown' }).targetScopeText,
+    '无法定域（没有绝对路径）', 'unknown must be spelled out, never left blank')
+  assert.equal(describeFacts({ toolName: 'pwsh' }).targetScopeText, '',
+    'no scope information at all → no line (old events stay unchanged)')
+  assert.equal(describeFacts({ toolName: 'pwsh', targetScope: 'inside', targetTraversal: true }).targetScopeText,
+    '工作区内 · 含 .. 穿越', 'a traversal is spelled out next to the scope')
+  assert.equal(describeFacts({ toolName: 'pwsh', targetScope: 'outside', targetTraversal: true }).targetScopeText,
+    '工作区外', 'outside already covers the traversal — no redundant suffix')
+
+  const compact = compactFacts(inside)
+  assert.equal(compact.targetScope, 'inside')
+  assert.equal(compact.targetScopeText, '工作区内')
+  assert.equal(compactFacts(describeFacts({ toolName: 'pwsh', targetTraversal: true })).targetTraversal, true)
+  assert.equal(compactFacts(describeFacts({ toolName: 'pwsh' })).targetScope, undefined,
+    'a call with no scope information must not invent one')
+
+  const text = buildChineseReason({
+    toolName: 'pwsh',
+    mode: 'danger-full-access',
+    justification: '备份并写入工作区外的 Clash 覆写配置。',
+    command: 'Copy-Item "C:\\Users\\shiro\\AppData\\Roaming\\x\\Merge.yaml" "C:\\Users\\shiro\\AppData\\Roaming\\x\\Merge.yaml.bak"',
+    targets: ['C:\\Users\\shiro\\AppData\\Roaming\\x\\Merge.yaml'],
+    targetScope: 'outside'
+  })
+  const lines = text.split('\n')
+  assert.match(lines[0], /^操作：/)
+  assert.match(lines[1], /^路径：C:\\Users\\shiro\\AppData\\Roaming\\x\\Merge\.yaml/)
+  assert.equal(lines[2], '目标：工作区外', 'the scope line sits right under the path line')
+  assert.match(lines[3], /^影响：整机（/)
+  ok('目标定域：paths 合并顺序 / 四态文案 / 穿越标注 / 紧凑事实白名单 / 卡文案行序')
+}
+
 console.log('\nzh.mjs: ' + n + ' 组断言全部通过')

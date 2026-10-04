@@ -4,6 +4,58 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.6] — 2026-10-04
+
+**Approval records can finally answer "did this touch inside or outside the workspace?"**: deterministic absolute-path extraction and target localisation land, so command-flavoured tools (`pwsh` / `bash`) no longer lose their absolute paths, and relative fragments in the model's prose no longer masquerade as targets.
+
+This is the **prerequisite step** of the "fewer human approvals" line, not an approval rule itself: only once "all targets are inside the workspace" can be answered reliably is the next step (auto-approve in-workspace operations) safe to build. **The deterministic decision logic is untouched** — hard deny, dangerous keywords, the allowlist, learning and every allow/escalate branch are unchanged. The one behavioural surface that does move is the **judge's input, which now carries real path evidence** (see below); the judge's verdicts may therefore shift. That cannot be verified offline and must be observed on live traffic after a restart.
+
+### Background (real-log forensics)
+
+A command like `cd D:\GitHub_Clone\x; git push origin main` clearly contains an absolute path, yet write-target extraction required a "write-shaped" command and therefore returned nothing; the recorded event fell back to regex-scraping the **model's prose**:
+
+- Of 628 real events carrying a command, **458 (73%) recorded no absolute path at all**
+- The recorded "targets" were relative fragments — `IamNewHands/dsh-approval-gate`, `origin/main`, `.git/objects` — which cannot be localised, so "did the model read outside the workspace?" was unanswerable
+- Read-only targets (`Get-Content`) were lost the same way, leaving the judge's `filesystemEffects` empty and forcing it to guess from wording
+
+### Changes
+
+- **`src/paths.mjs` gains three pure functions** (no IO, unit-testable):
+  - `extractAbsolutePaths(text)` → `{ raw, path, kind }[]`: recognises only four absolute shapes (drive / UNC / POSIX root / `~`), with `kind` ∈ `data` / `program` / `device`
+  - `classifyPathScope(paths, roots)` → `{ scope, inside, outside }` where `scope` ∈ `inside` / `outside` / `mixed` / `unknown`
+  - `hasPathTraversal(text)`: detects `..\` / `../` traversal
+- **Only absolute paths are extracted**: `origin/main`, `refs/heads/x`, `src/a.ts`, `IamNewHands/repo` and URL path segments produce no target — they cannot be localised on their own and would only create a false "looks in-workspace" impression
+- **Quoted spans win**: `'C:\Program Files\Git\bin\bash.exe'` is no longer truncated to `C:\Program`, and the Git-Bash form `/d/GitHub_Clone/x` is folded onto `D:` before comparison
+- **System program locations and device pseudo-files are not data targets**: `/usr/bin/env`, `C:\Windows\System32\…`, `C:\Program Files\…`, `/dev/null` do not take part in localisation — otherwise `bash.exe` would make a purely in-workspace operation look like "outside the workspace"
+- **`src/index.mjs` gains `resolveToolCallTargets()` and `targetScopeOf()`**: command tools yield targets even when read-only; events gain `targets` (absolute, max 12), `targetScope` and `targetTraversal`
+- **`files` semantics deliberately unchanged**: it still holds write targets only (for pre-change snapshots). Read-only targets go to `targets` alone — otherwise `Get-Content ~/.ssh/id_rsa` would copy private-key content into the gate's own snapshot directory, creating a new leak surface
+- **The judge's input gains real paths**: `filesystemEffects` is now "absolute paths found in the command ∪ write targets", so `cd D:\ws\x; git push` is no longer sent as "touches no files"
+- **New "target location" row in the field table** (`src/zh.mjs` + `client.js`): `工作区内` / `工作区外` / `跨工作区内外` / `无法定域（没有绝对路径）`, colour-coded as a warning when not `inside`; the host card's plain text gains a `目标：…` line. This is a different axis from "blast radius" (sandbox mode), hence a separate row
+
+### Fail-closed boundaries (deliberately conservative)
+
+| Case | Result | Why |
+|---|---|---|
+| No `data` target at all | `unknown` (**not** `inside`) | Relative fragments and paths built from variables (`-D $dir`) are unknown; `unknown` must be treated exactly like `outside` |
+| A `..` traversal with all literal paths in-workspace | Degraded to `unknown` | `cd D:\ws\x; Get-Content ..\..\Users\me\.ssh\id_rsa` yields only in-workspace paths; reporting `inside` would be a dangerous false negative |
+| URL path segments, `owner/repo` prose | No target produced | Not filesystem targets |
+
+### Replay verification (real logs, not projection)
+
+- **30 days (1184 events, 628 with a command)**: scope `inside` 475 / `mixed` 29 / `outside` 131 / `unknown` 549. Of the 276 events that previously had relative fragments only, **138 (50%) are now localisable**
+- **Last 7 days (488 events, 430 with a command)**: `inside` 309 / `mixed` 20 / `outside` 82 / `unknown` 77. Of the 145 fragment-only events, **99 (68%) are now localisable**
+- Auto-approved events (869 over 30 days) by the new scope: `inside` 423 / `outside` 61 / `mixed` 25 / `unknown` 364 — the first time this distribution can be produced at all
+
+### Known limits and residual risk (stated up front)
+
+- **Embedded text can produce phantom targets**: when a command embeds script or config bodies (YAML inside a Python heredoc), POSIX-root-shaped false paths such as `/build-app.yml` may appear. This only makes localisation **more conservative** (`outside`), never a false `inside`
+- **The recorded `command` is truncated at 400 characters**: targets of very long commands may be missed — this affects the audit record only; live decisions use the full command
+- **The deterministic verdict logic is unchanged**: `unknown` and `outside` currently do not affect allow/escalate at all; they only feed the audit. **The judge's input did change, though** (`filesystemEffects` grew from "write targets" to "absolute paths in the command ∪ write targets"), so the judge layer may rule differently on command-flavoured calls — the direction should be more accurate (no more guessing from wording), but it cannot be measured offline and needs live traffic to confirm
+
+### Next (not yet implemented)
+
+Allow-by-scope (all targets inside ⇒ auto-approve; one outside ⇒ human), anchoring git by command, always-human for anything outside the workspace, and always-human for sensitive path shapes. The replay shows **11 of the last 7 days' 13 distinct human approvals had all targets inside the workspace** — that is the near-term ceiling of that lever.
+
 ## [0.9.5] — 2026-10-04
 
 **DSH's own configuration changes no longer prompt a human**: profile / plugin / dependency edits under `$DSH_HOME` auto-approve (two exceptions still escalate). This **reverses** the 2026-09-18 "writes under `DSH_HOME` always require a human" decision, based on the user's 2026-10-04 policy and real-log measurements.
