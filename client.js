@@ -1016,10 +1016,14 @@ window.__ModuleLoader__.load({
         if (listTop <= 48 && newestOffset() > -48) pinToNewest()
       }, [events])
 
-      // 待处理拒绝数：已拒绝但尚未追认的记录（硬拒档也算，它只能靠人工重做，但至少看得见）
-      const pendingRejects = (events || []).filter(function (ev) {
-        return isRejectEvent(ev) && !ev.reconsidered
-      })
+      // 待处理 = **可以追认**的拒绝数（= 视图里真的带「重新审批通过」按钮的行）。
+      //
+      // 为什么不能把 hard-reject / manual-rejected 算进来：服务端 RECONSIDERABLE_KINDS 只认
+      // `judge-deny`，这两类**没有任何可点的动作**，算进待处理会让角标永远降不到 0。
+      // 现场（2026-10-05）：一次被拒绝的围栏探针（manual-rejected）让标题长期挂着「待处理 1」，
+      // 用户找不到任何能做的事 —— 数字与列表里可点的动作对不上，比不显示更糟。
+      // 「有拒绝还没看过」由提示条的「未读」负责（基于 seen 集合），不在这里重复。
+      const pendingRejects = (events || []).filter(isReconsiderable)
 
       return React.createElement('div', { className: 'ag-view', ref: viewRef },
         React.createElement('div', { className: 'ag-view-head' },
@@ -1116,6 +1120,9 @@ window.__ModuleLoader__.load({
                     tagText = '自动放行 · ' + (VERDICT_LABELS[ev.verdict] || ev.verdict || 'auto')
                     tagCls = 'ag-tag' + (VERDICT_NEUTRAL.has(ev.verdict) ? ' ag-tag-neutral' : '')
                   }
+                  // 左侧红条标的是「这一行是一次拒绝」，不是「这一行有待办」——
+                  // 待办口径见 pendingRejects（只数可追认的）。类名沿用 ag-row-pending，
+                  // 语义以本注释为准：不可追认的拒绝（hard-reject / manual-rejected）也照样标红条。
                   return React.createElement('div', { className: 'ag-row' + (isRejectEvent(ev) && !ev.reconsidered ? ' ag-row-pending' : ''), key: ev.id },
                     React.createElement('div', { className: 'ag-row-rail' },
                       React.createElement('span', { className: glyphCls }, glyph),

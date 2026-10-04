@@ -4,6 +4,22 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.12] — 2026-10-05
+
+**Fixes the "pending" badge: non-re-approvable rejections no longer pin it at 1.** The user asked live: "why is there a pending 1?"
+
+That 1 came from the probe command I sent while verifying the fence in the previous round (you rejected it → `kind: manual-rejected`, `path: fence`). The record itself is fine; the badge's semantics were not:
+
+- The old rule `isRejectEvent(ev) && !ev.reconsidered` counted `hard-reject` and `manual-rejected` too
+- But the server's `RECONSIDERABLE_KINDS` accepts **only `judge-deny`**, so those two have **nothing to click**
+- Result: the badge could never reach 0, and the number did not match any available action — worse than showing nothing
+
+Now **"pending" = the number of re-approvable rejections** (`isReconsiderable`, i.e. the rows that really carry a "re-approve" button), consistent with the view's own subtitle ("rejected records can be re-approved…").
+
+- "There is a rejection you have not looked at" stays with the notice strip's "unread" (driven by the seen set) and is not duplicated here
+- The red left border on a row is **unchanged in meaning**: it marks "this row is a rejection", not "this row is pending" — non-re-approvable rejections keep it (a comment now says so, since the class name `ag-row-pending` is misleading)
+- Regression assertion: with a `manual-rejected`, a `hard-reject` and a hard-category `judge-deny` all present, no "pending" badge is shown; a single re-approvable `judge-deny` still shows "pending 1" (the rule was not loosened to "never show")
+
 ## [0.9.11] — 2026-10-05
 
 **The 0.9.10 migration was neutralised by the seed rules — fix the seed file.** Caught during restart verification.

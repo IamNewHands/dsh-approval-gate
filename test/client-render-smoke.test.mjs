@@ -382,6 +382,36 @@ function attachScrollDom(env, tree) {
   console.log('  ✓ 审批视图：仅 neutral 的 judge-deny 有追认按钮（硬拒/硬类别不给）')
 }
 
+// ================= 3a2. 「待处理」只数可追认的行（不可追认的拒绝不能把角标钉住） =================
+{
+  // 现场（2026-10-05）：一次被拒绝的围栏探针是 manual-rejected，服务端 RECONSIDERABLE_KINDS
+  // 只认 judge-deny ⇒ 这一行没有「重新审批通过」按钮，但旧口径把它算进待处理，
+  // 于是标题永远挂着「待处理 1」，用户找不到任何能做的事。
+  const mk = (id, kind, path, category) => ({
+    id, kind, path, category: category || 'neutral', tool: 'pwsh',
+    ts: '2026-10-05T13:0' + id + ':00.000Z', verdict: kind, justification: '测试 ' + kind, files: [],
+  })
+  const env = createEnv([
+    mk(1, 'manual-rejected', 'fence'),
+    mk(2, 'hard-reject', 'hard-deny', 'credential'),
+    mk(3, 'judge-deny', 'classifier-deny', 'system'), // 硬类别 → 也不可追认
+  ])
+  const booted = boot(env)
+  const History = booted.component('dsh-approval-gate.history')
+  const tree = await renderSettled(booted, History, { sessionId: 's3b' })
+  const info = inspect(tree)
+  assert.ok(!/待处理/.test(info.text),
+    'non-reconsiderable rejections (manual-rejected / hard-reject / hard category) must not pin the badge: ' + info.text.slice(0, 300))
+  assert.ok(/人工拒绝/.test(info.text) || /已直接拒绝/.test(info.text), 'they are still listed as rejections')
+
+  // 对照：一条可追认的 judge-deny 出现时，角标必须是 1 —— 口径不能放宽成「永不显示」
+  const env2 = createEnv([mk(4, 'judge-deny', 'classifier-deny')])
+  const booted2 = boot(env2)
+  const tree2 = await renderSettled(booted2, booted2.component('dsh-approval-gate.history'), { sessionId: 's3c' })
+  assert.ok(/待处理 1/.test(inspect(tree2).text), 'an actionable judge-deny still counts as 待处理 1')
+  console.log('  ✓ 「待处理」只数可追认的行：不可追认的拒绝不再把角标钉在 1')
+}
+
 // ================= 3b. 追认按钮的显隐跟随服务端下发的 hardCategories =================
 {
   // hardCategories 可在设置页修改且参与多机同步，因此不能在前端硬编码：
