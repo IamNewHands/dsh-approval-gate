@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
 .ag-notice-card-pending{border-color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-state-warn-tertiary)}
 .ag-notice-card-manual{border-color:var(--dsw-alias-state-warn-primary)}
 .ag-notice-card-reject{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-interactive-bg-hover-danger)}
-.ag-notice-actions{flex:none;display:flex;align-items:center;gap:6px}
+.ag-notice-actions{flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .ag-notice-btn{box-sizing:border-box;height:24px;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;border:1px solid var(--dsw-alias-border-l2);background:transparent;border-radius:12px;align-items:center;padding:0 10px;font-size:12px;line-height:22px;display:inline-flex;white-space:nowrap}
 .ag-notice-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .ag-notice-hint{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
@@ -97,6 +97,7 @@ window.__ModuleLoader__.load({
 .ag-set-item-label{flex:1 1 auto;min-width:0;color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;font-family:var(--ds-font-family-code);word-break:break-all}
 .ag-set-item-meta{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;white-space:nowrap}
 .ag-set-item-del{flex:none;width:24px;height:24px;color:var(--dsw-alias-label-tertiary);cursor:pointer;background:transparent;border:none;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;padding:0}
+.ag-set-btn-mini{height:24px;border-radius:12px;padding:0 10px;font-size:12px;line-height:16px}
 .ag-set-item-del:hover{background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary)}
 .ag-set-empty{color:var(--dsw-alias-label-caption);margin:0;font-size:13px;line-height:20px;padding:4px 2px}
 .ag-set-tag{box-sizing:border-box;flex:none;height:18px;border-radius:9px;align-items:center;padding:0 8px;font-size:11px;line-height:18px;display:inline-flex;letter-spacing:.02em}
@@ -156,9 +157,11 @@ window.__ModuleLoader__.load({
       'flash-safe': 'Flash 判定安全',
       learned: '沉淀规则',
       fpHit: '已确认操作',
-      'flash-same': 'Flash 同类验证'
+      'flash-same': 'Flash 同类验证',
+      once: '追认 · 仅本次放行',
+      'learned-judge-unavailable': '已确认操作（判定器不可用）'
     }
-    const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same'])
+    const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same', 'once', 'learned-judge-unavailable'])
     /**
      * 生效的硬风险类别。默认值与 host 的 DEFAULT_HARD_CATEGORIES 一致，但 host 会通过
      * 事件 API 下发**实际配置**（hardCategories 是可在设置页改、且参与多机同步的键）。
@@ -196,9 +199,14 @@ window.__ModuleLoader__.load({
      */
     function reconsideredLabel(ev) {
       const p = ev && ev.path
-      if (p === 'judge-unavailable') return '已追认放行 · 判定器不可用（曾直接拒绝）'
-      if (p === 'classifier-deny') return '已追认放行 · 判定为有害或越权（曾直接拒绝）'
-      return '已追认放行 · 曾直接拒绝'
+      const how = ev && ev.reconsiderScope === 'once' ? '仅本次'
+        : ev && ev.reconsiderScope === 'global' ? '已写入全局规则'
+          : ev && ev.reconsiderScope === 'session' ? '已写入本会话规则'
+            : ''
+      const suffix = how ? '（' + how + '）' : ''
+      if (p === 'judge-unavailable') return '已追认放行 · 判定器不可用（曾直接拒绝）' + suffix
+      if (p === 'classifier-deny') return '已追认放行 · 判定为有害或越权（曾直接拒绝）' + suffix
+      return '已追认放行 · 曾直接拒绝' + suffix
     }
 
     // ================= 顶部「审批」tab 的条数 =================
@@ -403,6 +411,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 追认的作用域选项（用户 2026-10-04 决策：新增审批时可指定本次 / 本会话 / 全局）。
+     * 「仅本次」不写规则，只挂一张一次性额度给 AI 重试那一次；另外两个写入放行规则。
+     */
+    const RECONSIDER_SCOPES = [
+      { scope: 'once', label: '仅本次', title: '只放行这一次（不写规则），并让 AI 重试该操作' },
+      { scope: 'session', label: '本会话', title: '写入放行规则，仅本会话生效，并让 AI 重试该操作' },
+      { scope: 'global', label: '全局', title: '写入放行规则，所有会话生效，并让 AI 重试该操作' },
+    ]
+
+    /**
      * 未读拒绝数（用于「审批」tab 角标）。事件从新到旧传入；遇到第一条已读记录即停止，
      * 因为「已读」是按切到审批 tab 的时刻整体推进的。
      */
@@ -481,12 +499,12 @@ window.__ModuleLoader__.load({
         }).catch(function () {})
       }
 
-      const doReconsider = function (ev) {
+      const doReconsider = function (ev, scope) {
         setBusy(true)
         fetch('/api/auto-approve/reconsider', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: sessionId, eventId: ev.id }),
+          body: JSON.stringify({ sessionId: sessionId, eventId: ev.id, scope: scope }),
         }).then(function (r) { return r.json() }).then(function (res) {
           if (res && res.ok) {
             // 已追认：标为已读并收起提示条
@@ -643,11 +661,16 @@ window.__ModuleLoader__.load({
           isReject
             ? React.createElement('div', { className: 'ag-notice-actions' },
                 canReconsider
-                  ? React.createElement('button', {
-                      type: 'button', className: 'ag-notice-btn', disabled: busy,
-                      title: '追认这次拒绝：写入自动放行规则，并让 AI 重试该操作',
-                      onClick: function () { doReconsider(notice) },
-                    }, busy ? '处理中…' : '重新审批通过')
+                  ? React.createElement('span', { className: 'ag-notice-hint' }, '重新审批通过：')
+                  : null,
+                canReconsider
+                  ? RECONSIDER_SCOPES.map(function (o) {
+                      return React.createElement('button', {
+                        key: o.scope, type: 'button', className: 'ag-notice-btn', disabled: busy,
+                        title: o.title,
+                        onClick: function () { doReconsider(notice, o.scope) },
+                      }, busy ? '处理中…' : o.label)
+                    })
                   : null,
                 React.createElement('button', {
                   type: 'button', className: 'ag-notice-btn',
@@ -1046,14 +1069,18 @@ window.__ModuleLoader__.load({
                       // 追认入口：仅判定层静默拒绝、且非硬风险类别（与 host 端围栏一致）
                       canReconsider
                         ? React.createElement('div', { className: 'ag-row-actions' },
-                            React.createElement('button', {
-                              type: 'button',
-                              className: 'ag-set-btn ag-set-btn-primary',
-                              disabled: busyId !== null,
-                              title: '追认这次拒绝：写入自动放行规则，并让 AI 重试该操作',
-                              onClick: function () { doReconsider(ev) },
-                            }, busyId === ev.id ? '处理中…' : '重新审批通过'),
-                            React.createElement('span', { className: 'ag-set-item-meta' }, '追认后同类操作将自动放行'),
+                            React.createElement('span', { className: 'ag-set-item-meta' }, '重新审批通过：'),
+                            RECONSIDER_SCOPES.map(function (o) {
+                              return React.createElement('button', {
+                                key: o.scope,
+                                type: 'button',
+                                className: 'ag-set-btn' + (o.scope === 'session' ? ' ag-set-btn-primary' : ''),
+                                disabled: busyId !== null,
+                                title: o.title,
+                                onClick: function () { doReconsider(ev, o.scope) },
+                              }, busyId === ev.id ? '处理中…' : o.label)
+                            }),
+                            React.createElement('span', { className: 'ag-set-item-meta' }, '「仅本次」不写规则；「本会话 / 全局」写入放行规则'),
                           )
                         : null,
                     ),
@@ -1081,16 +1108,18 @@ window.__ModuleLoader__.load({
     // ================= 设置页：自动审批规则管理（settings.section） =================
     const RULE_SOURCE_TAGS = {
       default: React.createElement('span', { className: 'ag-set-tag ag-set-tag-blue' }, '预置'),
-      learned: React.createElement('span', { className: 'ag-set-tag ag-set-tag-green' }, '本会话沉淀'),
+      learned: React.createElement('span', { className: 'ag-set-tag ag-set-tag-green' }, '沉淀'),
       user: React.createElement('span', { className: 'ag-set-tag ag-set-tag-gray' }, '用户'),
-      inactive: React.createElement('span', { className: 'ag-set-tag ag-set-tag-gray' }, '旧沉淀 · 已停用'),
+    }
+    // 生效范围：全局 / 仅本会话（scope 由 host 判定，前端只画）
+    const RULE_SCOPE_TAGS = {
+      global: React.createElement('span', { className: 'ag-set-tag ag-set-tag-blue' }, '全局'),
+      session: React.createElement('span', { className: 'ag-set-tag ag-set-tag-green' }, '本会话'),
     }
     function ruleSource(rule) {
       const d = String(rule && rule.description || '')
       const learned = d.indexOf('自动沉淀：') === 0 || d.indexOf('人工确认后') >= 0 || d.indexOf('flash 同类') >= 0
         || d.indexOf('判定器不可用，人工批准后沉淀：') === 0 || d.indexOf('用户追认：') === 0
-      // legacyInactive 由 host 计算（旧版无会话归属的沉淀规则，0.9.3 起不再参与匹配）
-      if (rule && rule.legacyInactive) return 'inactive'
       if (learned) return 'learned'
       if (d === '用户自定义') return 'user'
       return 'default'
@@ -1114,6 +1143,7 @@ window.__ModuleLoader__.load({
       const [catalogNote, setCatalogNote] = React.useState(null)
       const [judgeProvider, setJudgeProvider] = React.useState('')
       const [judgeModel, setJudgeModel] = React.useState('')
+      const [sedimentScope, setSedimentScope] = React.useState('session')
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -1128,6 +1158,7 @@ window.__ModuleLoader__.load({
               const jm = data.config.judgeModel
               setJudgeProvider(jm && jm.provider ? String(jm.provider) : '')
               setJudgeModel(jm && jm.model ? String(jm.model) : '')
+              setSedimentScope(data.config.sedimentScope === 'global' ? 'global' : 'session')
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -1305,7 +1336,23 @@ window.__ModuleLoader__.load({
               '白名单 · 自动放行规则'),
             React.createElement('p', { className: 'ag-set-card-sub' },
               '管道第二步：命中规则直接自动放行（不过 Flash）。示例：tool=edit + mode=danger-full-access → 所有工作区外 edit 自动放行。' +
-              '「本会话沉淀」是审批/学习产生的规则，只在它产生的那个会话生效；你手写的规则全局生效。')),
+              '每条规则标注生效范围：「全局」对所有会话生效，「本会话」只对审批当时那个会话生效（可一键提升为全局）。')),
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('span', { className: 'ag-set-item-meta' }, '新审批沉淀的作用域：'),
+            React.createElement('select', {
+              className: 'ag-set-input', value: sedimentScope,
+              onChange: function (e) { setSedimentScope(e.target.value) },
+            },
+              React.createElement('option', { value: 'session' }, '仅本会话（默认）'),
+              React.createElement('option', { value: 'global' }, '全局（所有会话）'),
+            ),
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn', disabled: busy,
+              onClick: function () { api({ op: 'set', kind: 'sedimentScope', value: sedimentScope }) },
+            }, '保存'),
+            React.createElement('span', { className: 'ag-set-item-meta' },
+              '决定人工确认后自动沉淀 / 判定器不可用后批准沉淀的规则写在哪个范围；单次的追认可逐个另选'),
+          ),
           React.createElement('div', { className: 'ag-set-row' },
             React.createElement('input', { className: 'ag-set-input', style: { width: 110 }, placeholder: 'tool', value: newRule.tool, onChange: function (e) { setNewRule(Object.assign({}, newRule, { tool: e.target.value })) } }),
             React.createElement('input', { className: 'ag-set-input', style: { width: 150 }, placeholder: 'mode（可选）', value: newRule.mode, onChange: function (e) { setNewRule(Object.assign({}, newRule, { mode: e.target.value })) } }),
@@ -1328,13 +1375,22 @@ window.__ModuleLoader__.load({
                   if (rule.mode) parts.push('mode=' + rule.mode)
                   if (rule.category) parts.push('category=' + rule.category)
                   if (rule.contains) parts.push('contains=' + rule.contains)
-                  const label = (parts.join('  ') || '(任意)') + (rule.sessionId ? '  · 会话 ' + String(rule.sessionId).slice(0, 12) : '')
+                  const label = (parts.join('  ') || '(任意)') + (rule.sessionScoped ? '  · 会话 ' + String(rule.sessionId || '').slice(0, 12) : '')
                   const src = ruleSource(rule)
                   const isPre = preAllow.indexOf(JSON.stringify({ mode: rule.mode, description: rule.description })) >= 0 || (rule.mode === 'workspace-write' && !rule.tool && !rule.category && !rule.contains)
                   return React.createElement('div', { className: 'ag-set-item', key: idx },
                     React.createElement('span', { className: 'ag-set-item-label' }, label),
                     rule.description ? React.createElement('span', { className: 'ag-set-item-meta' }, rule.description) : null,
                     RULE_SOURCE_TAGS[src] || RULE_SOURCE_TAGS.default,
+                    RULE_SCOPE_TAGS[rule.sessionScoped ? 'session' : 'global'],
+                    // 会话作用域的规则一键提升为全局（不用删了重加）
+                    rule.sessionScoped
+                      ? React.createElement('button', {
+                          type: 'button', className: 'ag-set-btn ag-set-btn-mini', disabled: busy,
+                          title: '提升为全局：所有会话都按这条规则自动放行',
+                          onClick: function () { api({ op: 'promote', kind: 'allowRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains, sessionId: rule.sessionId } }) },
+                        }, '提升为全局')
+                      : null,
                     React.createElement('button', {
                       type: 'button', className: 'ag-set-item-del', title: '删除', 'aria-label': '删除规则',
                       onClick: function () {

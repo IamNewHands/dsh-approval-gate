@@ -2,7 +2,7 @@
 
 > Home: [English](../README.en.md) · [简体中文](../README.md) · Guide: [English](GUIDE.en.md) · [中文](GUIDE.md)
 
-DeepSeek Harness auto-approval gate plugin v0.9.3: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
+DeepSeek Harness auto-approval gate plugin v0.9.4: **minimal human intervention — only operations that must be confirmed go to a human (fail-safe)**.
 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
@@ -207,7 +207,7 @@ A new "Auto Approval" section in the DSH settings panel (`settings.section`, sty
 - **Setup card**: detects whether the `auto-approve` permission preset exists in `cordis.patch.yml`; if missing, click "Configure" to write it automatically (text-level edit, comments preserved), effective after restart
 - **Pipeline overview**: judgment pipeline + active hard-risk category badges
 - **① DENY · deny list** (`denyKeywords`): view/add/remove dangerous keywords (removing a predefined keyword asks for confirmation)
-- **② Allow list** (`allowRules`): view (tagged predefined / **本会话沉淀** (session-scoped) / **旧沉淀 · 已停用** (retired) / user; sediment rows show their owning session) / add (tool/mode/category/contains form) / remove — e.g. `tool=edit, mode=danger-full-access` auto-approves out-of-workspace edits. **Approval-produced rules apply only to the session that produced them**; rules you write yourself stay global
+- **② Allow list** (`allowRules`): view (source tags 预置/沉淀/用户 plus scope tags **全局** / **本会话**; session rules show their owner) / add (tool/mode/category/contains form) / remove / **promote to global** (one click for a session rule). The card top holds the **"new approval sediment scope"** setting: this session (default) / global
 - **③ denyRules · always-human**: rejection-upgraded rules, view/remove. Deliberately **not** session-scoped: crossing sessions only ever adds a human prompt and allows nothing
 - **④ Flash · thresholds & timeout**: edit `riskyThreshold` (within one session, auto-approve starts at the N+1th occurrence after N confirmations) / `judgeTimeoutMs` / `judgeFailureLimit` directly
 - **⑤ Learning · in progress**: confirmation counts (n/N) + samples; counting is **per session** (the key is `session|tool|mode|category`, the UI shows the last three plus the session), with a **"Stop" button** to intervene (removes count and samples, restarts learning)
@@ -250,7 +250,7 @@ Data flow: the host appends a structured event to `~/.dsh/auto-approve/events.js
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/auto-approve/reconsider` | POST | `{sessionId, eventId, retry?}` → reconsiders one judge-layer silent rejection. Writes a fingerprint-scoped **and session-scoped** `allowRules` entry (its `description` is prefixed "User reconsidered:") and, when `retry !== false`, delivers a retry instruction. Returns `{ok, rule, duplicate, delivery}`; 400 with the reason (the `error` says whether it is the hard-deny tier, a hard-risk category, or a record with **no session owner** — the last cannot be scoped, so write an allowlist rule by hand) when not reconsiderable |
+| `/api/auto-approve/reconsider` | POST | `{sessionId, eventId, retry?, scope?}` → reconsiders one judge-layer silent rejection. `scope` is `once` (**this once**: no rule, just a one-shot grant covering the retry) / `session` (default: a rule scoped to the session) / `global` (explicitly global; no session owner required). Writes a fingerprint-scoped `allowRules` entry (its `description` is prefixed "User reconsidered:") and, when `retry !== false`, delivers a retry instruction. Returns `{ok, scope, rule, duplicate, delivery}` (`rule` is null for `once`); 400 with the reason (the `error` says whether it is the hard-deny tier, a hard-risk category, or `scope=session` with no session owner — the last can pick "global" instead) when not reconsiderable |
 
 Fences (enforced server-side; the UI merely hides the button): `kind` must be `judge-deny`, and `category` must not hit `hardCategories`.
 
@@ -267,18 +267,20 @@ Fences (enforced server-side; the UI merely hides the button): `kind` must be `j
 
 Neutral confirmation learning: within one **session**, each human approval of the same tool|mode|category increments the count; after **N confirmations (default 3), the N+1th occurrence auto-approves** and persists a fingerprinted rule. In the threshold state: fingerprint hit auto-approves; otherwise Flash semantically verifies against confirmed samples (SAME approves / DIFFERENT goes to human); rejections upgrade to denyRules (always human, deliberately **not** session-scoped); in-progress learning can be stopped from the settings page.
 
-**Scope (v0.9.3)** — "approvals apply only to the session that earned them":
+**Scope (v0.9.4)** — a new approval picks "this once / this session / global", session by default:
 
 | Object | Scope | Notes |
 |--------|-------|-------|
 | Learning counters / samples (`learning.json`) | the session that produced them | key is `sessionId\|tool\|mode\|category`; capped at 400 entries, oldest evicted |
-| Sedimented / reconsidered / judge-unavailable allow rules | the session that produced them | rules carry a `sessionId`; another session re-runs the judgement |
-| `allowRules` **you** wrote (description `用户自定义`) | global | that is configuration, not approval |
-| Repository-seed and built-in default rules | global | same |
+| Automatic sediments (learning threshold, judge-unavailable approval) | the settings page's "new approval sediment scope" | **this session** by default; a re-approval can choose per call |
+| Rules written by a re-approval | **chosen per call** | the notice strip and each history row offer three buttons: **仅本次** (writes no rule, only allows the retry) / this session / global |
+| A rule with `scope:'session'` but **no** owner | **never applies** (`'none'`) | fail-safe: an unprovable owner must never be upgraded into a global allowance |
+| Where a rule came from | global unless explicitly session-scoped | rules you wrote, repository-seed rules, built-in defaults and **rules sedimented before this upgrade** (including old re-approval rules) are all global |
 | `denyRules` (rejection upgrades) | global | deliberate asymmetry: on the rejection side crossing sessions only adds a human prompt and allows nothing |
-| Legacy owner-less sediment / re-approval rules | **retired** | they cannot prove an owning session; the settings page labels them "旧沉淀 · 已停用" and you can delete them |
 
-Cost and remedy: an allowance learned in one session applies only there. If an operation should be allowed everywhere, write an allowlist rule by hand (settings page "add"; the description becomes `用户自定义`, which is global).
+A session rule can be turned global at any time via **"提升为全局"** in the settings page's ② card, or by writing the rule by hand (its description becomes `用户自定义`, which is global).
+
+**About "this once"**: it writes no rule and keeps no persistent state — it only hands the "let the AI retry once" flow an in-memory one-shot grant that expires on use, so it cannot leave a long-lived allowance on disk.
 
 ## Security Design
 
@@ -286,11 +288,11 @@ Cost and remedy: an allowance learned in one session applies only there. If an o
 2. **DENY layer**: irreversible keywords go to human with zero model calls and zero false negatives
 3. **Hard-risk categories are always human (symmetric gate, corrected in v0.7.0)**: `deletion`/`credential`/`remote`/`system`/`bulk` are never counted, learned, covered by persisted rules, or **reconsiderable**; whether the judge answers `allow` or `deny`, a hard category goes to a human. The `deny` branch used to precede the hard-category check, so a model `deny` on a hard category was rejected silently and made the configured categories inert — that is fixed
 4. **Secrets never leave the machine**: judge inputs are redacted (tokens, key blocks, `Bearer` headers, `key=value` secrets) and truncated before the request is sent; secret-named and bulk-content argument fields are replaced by placeholders
-5. **Learned rules carry category + operation fingerprint + session owner**: persisted rules are `{tool, mode, category, contains, sessionId}` (contains = a fingerprint you confirmed); only the same fingerprint auto-approves, and only inside its owning session (v0.9.3). When the fingerprint misses, flash does **semantic similarity verification** against your confirmed samples — DIFFERENT or verification failure always goes to human; rejected operations upgrade to denyRules (with fingerprint; without one, the whole kind is blocked), never auto-approved
+5. **Learned rules carry category + operation fingerprint + scope**: persisted rules are `{tool, mode, category, contains, scope?, sessionId?}` (contains = a fingerprint you confirmed) and only the same fingerprint auto-approves; the scope comes from the settings page (this session by default), `scope:'global'` applies everywhere, and `scope:'session'` requires a `sessionId` (without an owner it never applies and is never silently upgraded to global). When the fingerprint misses, flash does **semantic similarity verification** against your confirmed samples — DIFFERENT or verification failure always goes to human; rejected operations upgrade to denyRules (with fingerprint; without one, the whole kind is blocked), never auto-approved
 6. **Fail-safe**: judge failure, timeout (20s × 2 attempts), or malformed/unparseable output → neutral degradation or human; hard risks are never auto-approved. Consecutive failures are counted per session (first 2 silently rejected, the 3rd offers one manual approval) so an outage cannot trap the task
 7. **Authorization is human-only**: only direct-human session messages count (at most 4, sanitized, 4000-character budget). Repository content, tool output, assistant prose, skills, plugins and subagent text are not authorization
 8. **Recoverable first**: `workspace-write` (workspace writes) auto-approve by default; the judge runs only for escalations
-9. **Per-session gating**: only sessions that explicitly selected the "Auto Approval (Flash)" preset are intercepted; approval-produced allow rules **also apply only inside the session that produced them** (v0.9.3)
+9. **Per-session gating**: only sessions that explicitly selected the "Auto Approval (Flash)" preset are intercepted; approval-produced allow rules are written at the scope chosen in the settings page (this session by default, per-call global, or one-click promotion)
 10. **Judge only, never execute**: the plugin returns an allow/forward decision; it does not modify the rest of the approval flow
 11. **API origin fence (tightened in v0.9.3)**: `/api/auto-approve/*` prefers the host credential fence `connection.requestRejection` (the same cookie/token as `/api/health` and `/api/sessions`); the fallback path (no `connection` service) requires the origin to be literally same-origin with the request's `Host` (scheme + host + port), where only "the Host is loopback and the origin is a loopback alias" may differ in port, and `javascript:` / `data:` / `null` origins are rejected outright. **A literally same-origin DNS-rebinding page cannot be told apart by any Origin comparison** — the real defence is the credential fence (a rebinding page cannot obtain the cookie scoped to 127.0.0.1); treat the fallback as a legacy-deployment backstop only
 

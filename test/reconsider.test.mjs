@@ -223,23 +223,25 @@ const ruleCount = () => JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).allowRules
   const rules = res.payload.config.allowRules
   const scoped = rules.filter((r) => r.sessionScoped)
   assert.ok(scoped.length >= 1, 'session-scoped rules are flagged for the settings page')
-  assert.ok(scoped.every((r) => typeof r.sessionId === 'string' && r.sessionId), 'the flag agrees with sessionId')
+  assert.ok(scoped.every((r) => r.scope === 'session' && typeof r.sessionId === 'string' && r.sessionId),
+    'the flag agrees with the explicit scope + sessionId')
   const shipped = rules.find((r) => (r.description || '').indexOf('工作区写入') === 0)
   assert.ok(shipped, 'the shipped workspace-write rule is listed')
   assert.strictEqual(shipped.sessionScoped, false, 'shipped rules are not session-scoped')
-  assert.strictEqual(shipped.legacyInactive, false, 'shipped rules are not retired learned rules')
+  assert.strictEqual(shipped.scope, 'global', 'shipped rules are global')
+  assert.strictEqual(res.payload.config.sedimentScope, 'session', 'the default sediment scope is reported as session')
 
-  // 旧版无归属的沉淀规则：host 必须把它标成已停用，否则设置页会显示成生效中
+  // 旧版无归属的沉淀规则：作用域回全局（用户 2026-10-04 决定迁回），快照必须如实标注
   const cfgNow = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
   cfgNow.allowRules.push({ tool: 'write', category: 'neutral', contains: 'legacy-x', description: '自动沉淀：中立 人工确认后自动放行' })
   writeFileSync(CONFIG_PATH, JSON.stringify(cfgNow, null, 2) + '\n', 'utf8')
   const res2 = await call(state, '/api/auto-approve/rules', 'GET')
   const legacy = res2.payload.config.allowRules.find((r) => r.contains === 'legacy-x')
-  assert.strictEqual(legacy.legacyInactive, true, 'an owner-less learned rule is flagged as retired')
-  assert.strictEqual(legacy.sessionScoped, false, '…and it is not mistaken for a live scoped rule')
+  assert.strictEqual(legacy.scope, 'global', 'an owner-less learned rule is global again')
+  assert.strictEqual(legacy.sessionScoped, false, '…and it is not session-scoped')
   cfgNow.allowRules = cfgNow.allowRules.filter((r) => r.contains !== 'legacy-x')
   writeFileSync(CONFIG_PATH, JSON.stringify(cfgNow, null, 2) + '\n', 'utf8')
-  console.log('  ✓ 规则快照带 sessionScoped / legacyInactive 注解')
+  console.log('  ✓ 规则快照带 scope / sessionScoped / sedimentScope 注解')
 }
 
 // ================= 6. 重复追认幂等（不重复写规则） =================

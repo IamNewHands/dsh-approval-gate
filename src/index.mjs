@@ -751,12 +751,12 @@ function getRulesSnapshot(permissionPresets) {
       version: config.version || CONFIG_VERSION,
       judgeModel: config.judgeModel || null,
       denyKeywords: config.denyKeywords || [],
-      // 展示用注解（判定逻辑在 ruleUsableInSession / isLearnedRuleDescription）：
-      //   sessionScoped   —— 该规则由审批产生，只在其归属会话生效
-      //   legacyInactive —— 旧版无归属的自动沉淀规则，0.9.3 起不再参与匹配
+      // 展示用注解（判定逻辑只有一个 owner：ruleScope / ruleUsableInSession）：
+      //   scope         —— 'global' 全局生效 | 'session' 仅归属会话生效
+      //   sessionScoped —— 是否受会话限制（前端据此决定要不要给「提升为全局」按钮）
       allowRules: (config.allowRules || []).map((r) => Object.assign({}, r, {
-        sessionScoped: Boolean(r && typeof r.sessionId === 'string' && r.sessionId),
-        legacyInactive: Boolean(r) && !r.sessionId && isLearnedRuleDescription(r.description),
+        scope: ruleScope(r) === 'session' ? 'session' : 'global',
+        sessionScoped: ruleScope(r) === 'session',
       })),
       denyRules: config.denyRules || [],
       hardCategories: config.hardCategories || [],
@@ -764,6 +764,7 @@ function getRulesSnapshot(permissionPresets) {
       judgeTimeoutMs: config.judgeTimeoutMs || 20000,
       judgeFailureLimit: config.judgeFailureLimit || 1,
       judgeMaxTokens: config.judgeMaxTokens || 1024,
+      sedimentScope: sedimentScope(),
       learning: { enabled: learning.enabled !== false }
     },
     learning: {
@@ -863,7 +864,7 @@ function ensureAutoApprovePreset(permissionPresets) {
   }
 }
 
-/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|judgeModel */
+/** 规则修改：op=add|remove|set|promote，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|judgeMaxTokens|judgeFailureLimit|judgeModel|sedimentScope */
 function applyRuleOp(op, kind, value) {
   reloadConfig()
 
@@ -876,6 +877,32 @@ function applyRuleOp(op, kind, value) {
     saveJson(ALLOWLIST_PATH, config)
     audit(`CONFIG  ${kind} → ${n}`)
     return { ok: true, set: true, value: n }
+  }
+
+  // 新沉淀的作用域：审批/学习产生的放行规则默认写在哪一层（用户 2026-10-04 决策）
+  if (kind === 'sedimentScope') {
+    if (op !== 'set') return { ok: false, error: 'sedimentScope 使用 set 操作' }
+    const v = String(value || '')
+    if (v !== 'session' && v !== 'global') return { ok: false, error: "sedimentScope 只能是 'session' 或 'global'" }
+    config.sedimentScope = v
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  sedimentScope → ${v}`)
+    return { ok: true, set: true, value: v }
+  }
+
+  // 把一条会话作用域的规则提升为全局（op=promote，kind=allowRules）
+  if (op === 'promote') {
+    if (kind !== 'allowRules') return { ok: false, error: 'promote 只支持 allowRules' }
+    const v = value && typeof value === 'object' ? value : null
+    if (!v) return { ok: false, error: 'promote 需要规则标识对象' }
+    const hit = (config.allowRules || []).find((r) => sameAllowRule(r, v))
+    if (!hit) return { ok: false, error: '未找到该规则' }
+    if (ruleScope(hit) === 'global') return { ok: true, promoted: false, already: true }
+    hit.scope = 'global'
+    delete hit.sessionId
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  promote allowRule → 全局 ${JSON.stringify(hit)}`)
+    return { ok: true, promoted: true }
   }
 
   // 判定模型解耦配置（judgeModel）
@@ -1260,38 +1287,103 @@ function matchRule(rules, toolName, mode, category, justification) {
 }
 
 /**
- * 「由审批自动产生」的放行规则：描述前缀是它们唯一的共同标记。
- * 旧数据没有 sessionId，只能靠描述识别——**这是旧数据的兼容判据，不是业务逻辑**；
- * 新产生的规则一律带 sessionId，不再依赖描述。
+ * 一条 allowRule 的生效范围：`'global'` | `'session'` | `'none'`（永不匹配）。
+ *
+ * 判据顺序（用户 2026-10-04 决策）：
+ *   1. 显式 `scope: 'global'` → 全局（新审批选了「全局」，或从会话规则「提升为全局」）
+ *   2. 显式 `scope: 'session'` → 必须有 `sessionId`；没有归属（旧数据被改写等）返回 'none'，
+ *      **fail-safe：证明不了归属就不生效**，绝不因此变成全局
+ *   3. 无 `scope`：带 `sessionId` → 会话作用域（0.9.3 的规则）；不带 → **全局**
+ *      （旧版沉淀 / 追认 / 判定器不可用沉淀的规则、用户手写、仓库种子、内置默认）
+ *
+ * 为什么旧沉淀规则回到全局：2026-10-03 曾把「无归属的自动沉淀规则」判为停用，用户 2026-10-04
+ * 决定**迁移回全局生效**（原先沉淀的白名单继续放行），并把作用域改为**新审批时可选**。
  */
-const LEARNED_RULE_DESC_RE = /^(?:自动沉淀：|判定器不可用，人工批准后沉淀：|用户追认：)/
-function isLearnedRuleDescription(description) {
-  return LEARNED_RULE_DESC_RE.test(String(description || ''))
+export function ruleScope(rule) {
+  if (!rule || typeof rule !== 'object') return 'global'
+  if (rule.scope === 'global') return 'global'
+  const sid = typeof rule.sessionId === 'string' ? rule.sessionId : ''
+  if (rule.scope === 'session') return sid ? 'session' : 'none'
+  return sid ? 'session' : 'global'
 }
 
 /**
- * 规则在当前会话是否可用（用户 2026-10-03 决策：**审批只在当前会话生效**）。
- *
- *   - 带 sessionId 的规则 → 只在其归属会话生效
- *   - 不带 sessionId 的规则 →
- *       · 用户手写 / 仓库种子 / 内置默认 → 全局生效（那是「配置」，不是「审批」）
- *       · 旧版自动沉淀的规则 → **停用**：它无法证明属于哪个会话，继续生效就等于
- *         保留上游 issue #4 P0-2 的跨会话放行（任一会话养出的规则影响所有会话）
+ * 规则在当前会话是否可用。全局规则不随会话变化；会话规则只在其归属会话生效。
  *
  * @param {object} rule 一条 allowRule
  * @param {string} sessionId 当前会话 id
  * @returns {boolean} 该规则是否可参与本次判定
  */
 export function ruleUsableInSession(rule, sessionId) {
-  if (!rule || typeof rule !== 'object') return false
-  const sid = typeof rule.sessionId === 'string' ? rule.sessionId : ''
-  if (sid) return sid === String(sessionId || '')
-  return !isLearnedRuleDescription(rule.description)
+  const scope = ruleScope(rule)
+  if (scope === 'global') return true
+  if (scope === 'none') return false
+  return String(rule.sessionId) === String(sessionId || '')
 }
 
 /** 当前会话可用的规则集合。白名单层与沉淀层共用；denyRules 有意不过滤（拒绝侧保持全局） */
 export function rulesForSession(rules, sessionId) {
   return (Array.isArray(rules) ? rules : []).filter((r) => ruleUsableInSession(r, sessionId))
+}
+
+/**
+ * 按作用域给规则打标：会话作用域要求会话归属，缺归属时不写（宁可这次不放行，
+ * 也不要把「本会话」的批准放大成全局规则）。
+ * @returns {boolean} 是否成功写入作用域字段
+ */
+function applyRuleScope(rule, scope, sessionId) {
+  if (!rule || typeof rule !== 'object') return false
+  if (scope === 'global') {
+    rule.scope = 'global'
+    delete rule.sessionId
+    return true
+  }
+  const sid = String(sessionId || '')
+  if (!sid) return false
+  rule.scope = 'session'
+  rule.sessionId = sid
+  return true
+}
+
+/** 配置里的新沉淀作用域；只认 'global'，其余一律按更安全的 'session' */
+function sedimentScope() {
+  return config.sedimentScope === 'global' ? 'global' : 'session'
+}
+
+/**
+ * 「仅本次放行」的一次性额度：追认时选「本次」不写规则，改在这里挂一张一次性凭条，
+ * 由 AI 重试的那次审批消费掉。
+ *
+ * **只存内存**：它的生命周期就是「让 AI 重试一次」——进程重启后重试本身也不存在了，
+ * 没有必要落盘，也就没有一次性状态残留在磁盘上被误用的风险。
+ * key = sessionId，value = 待消费的规则形状（字段与 allowRules 一致）
+ */
+const ONCE_GRANT_MAX = 20
+const onceGrants = new Map()
+
+function grantOnce(sessionId, rule) {
+  const key = String(sessionId || '')
+  if (!key || !rule) return false
+  const list = onceGrants.get(key) || []
+  list.push(rule)
+  onceGrants.set(key, list.slice(-ONCE_GRANT_MAX))
+  return true
+}
+
+/** 消费一条匹配的一次性凭条（命中即删除；只在请求所属会话内查找） */
+function consumeOnceGrant(sessionId, toolName, mode, category, justification) {
+  const key = String(sessionId || '')
+  const list = onceGrants.get(key)
+  if (!list || list.length === 0) return null
+  for (let i = 0; i < list.length; i++) {
+    if (matchRule([list[i]], toolName, mode, category, justification)) {
+      const hit = list[i]
+      list.splice(i, 1)
+      if (list.length === 0) onceGrants.delete(key)
+      return hit
+    }
+  }
+  return null
 }
 
 /**
@@ -1540,6 +1632,7 @@ export default {
               // 前端据此把该条标注为「已追认」并撤销「待处理」角标——角标代表未读，
               // 已读位置由浏览器侧持久化，不在服务端状态里。
               const reconsidered = new Set()
+              const reconsiderScopes = new Map()
               const rows = []
               for (const line of text.split('\n')) {
                 if (!line.trim()) continue
@@ -1548,6 +1641,9 @@ export default {
               for (const row of rows) {
                 if (row && row.kind === 'reconsidered' && Number.isInteger(row.reconsiderOf)) {
                   reconsidered.add(row.reconsiderOf)
+                  // 追认时的作用域（once/session/global）：前端在记录行上如实标出这次追认
+                  // 是「仅本次」还是写入了规则，避免用户以为它已经变成长期放行
+                  if (row.scope) reconsiderScopes.set(row.reconsiderOf, String(row.scope))
                 }
               }
               for (const ev of rows) {
@@ -1557,6 +1653,7 @@ export default {
                 const copy = Object.assign({}, ev)
                 // reconsidered：本事件是否已被用户追认（前端据此撤销待处理角标）
                 if (reconsidered.has(ev.id)) copy.reconsidered = true
+                if (reconsiderScopes.has(ev.id)) copy.reconsiderScope = reconsiderScopes.get(ev.id)
                 // 老事件没有 facts（v0.9.0 之前落的盘）：按已记录的事实现算一份，
                 // 让整段历史也能渲染字段表格。**不回写文件**——事件日志保留当初写下的事实。
                 if (!copy.facts) {
@@ -1904,47 +2001,69 @@ export default {
               if (fingerprint) rule.contains = fingerprint
               const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
               if (keywords.length > 0) rule.keywords = keywords
-              // 追认也是「审批」：规则只对该记录所属会话生效（用户 2026-10-03 决策）。
-              // 事件没记会话（老数据）时退回请求体里的 sessionId；两者都没有则不写，
-              // 宁可让用户用手写白名单，也不落一条无法限定范围的全局放行。
+              // 追认的作用域（用户 2026-10-04 决策：新增审批时可选）：
+              //   once    仅本次放行 —— **不写规则**，挂一张一次性凭条给 AI 重试那一次用
+              //   session 只在本会话生效（默认，取设置页的沉淀作用域）
+              //   global  所有会话生效 —— 用户显式选择，因此不再要求会话归属
+              const scope = ['once', 'session', 'global'].includes(String(body.scope || ''))
+                ? String(body.scope)
+                : sedimentScope()
               const ruleSession = String(event.sessionId || sessionId || '')
-              if (!ruleSession) {
-                audit(`RECONSIDER event=${eventId} 无会话归属 → 不写规则（无法限定生效范围）`)
-                return send(res, 400, {
-                  ok: false,
-                  error: '该记录没有会话归属（老版本事件未记录 sessionId），无法把追认限定在会话内；请改用设置页的「白名单规则」手动放行。',
-                })
-              }
-              rule.sessionId = ruleSession
-              const sameRule = (r) => sameAllowRule(r, rule)
-              const dup = config.allowRules.some(sameRule)
-              if (!dup) {
-                // 围栏 3：无任何指纹时不写规则。
-                // 旧行为写的是「工具+模式+类别」宽规则，等于放行该工具在 danger-full-access 下的
-                // 一切操作（事故：2026-09-18 20:43:39 落了一条 {tool:write, mode:danger-full-access,
-                // category:neutral} 无指纹规则，覆盖了此后所有 write 提权）。宁可这次不放行，
-                // 也不要把一次追认放大成永久全工具放行。
+              // 是否命中已有规则：必须在写入**之前**求值（写完之后再查必然命中自己）
+              let dup = false
+
+              if (scope === 'once') {
+                if (!ruleSession) {
+                  return send(res, 400, { ok: false, error: '「仅本次放行」需要会话归属才能把额度挂到本次重试上；请带上 sessionId。' })
+                }
                 if (!fingerprint && keywords.length === 0) {
-                  audit(`RECONSIDER event=${eventId} 无可用指纹 → 不写宽规则（拒绝把一次追认放大为全工具放行）`)
                   return send(res, 400, {
                     ok: false,
-                    error: '该记录没有可用的操作指纹（无文件路径、无命令、说明中也没有可识别目标），无法安全地只放行同类操作；请改用设置页的「白名单规则」按工具/路径手动放行。',
+                    error: '该记录没有可用的操作指纹（无文件路径、无命令、说明中也没有可识别目标），无法只为这一次放行；请改用设置页的「白名单规则」按工具/路径手动放行。',
                   })
                 }
-                rule.description = '用户追认：同类操作自动放行'
-                config.allowRules.push(rule)
-                saveJson(ALLOWLIST_PATH, config)
-                audit(`RECONSIDER event=${eventId} +allowRule ${JSON.stringify(rule)}`)
+                grantOnce(ruleSession, rule)
+                audit(`RECONSIDER event=${eventId} scope=once（不写规则，挂一次性额度）${JSON.stringify(rule)}`)
               } else {
-                // 同一目标重复追认：并集候选，补齐旧规则缺失的指纹形态（旧规则只有最长片段）
-                const merged = config.allowRules.find(sameRule)
-                const union = Array.from(new Set([...(merged.keywords || []), ...keywords]))
-                if (union.length !== (merged.keywords || []).length) {
-                  merged.keywords = union
+                // 围栏 3：会话作用域必须能证明归属；全局作用域是用户显式选择的，不要求归属
+                if (scope === 'session' && !ruleSession) {
+                  audit(`RECONSIDER event=${eventId} scope=session 但无会话归属 → 拒绝`)
+                  return send(res, 400, {
+                    ok: false,
+                    error: '该记录没有会话归属（老版本事件未记录 sessionId），无法把追认限定在会话内；请改选「全局」，或用设置页的「白名单规则」手动放行。',
+                  })
+                }
+                applyRuleScope(rule, scope, ruleSession)
+                const sameRule = (r) => sameAllowRule(r, rule)
+                dup = config.allowRules.some(sameRule)
+                if (!dup) {
+                  // 围栏 4：无任何指纹时不写规则。
+                  // 旧行为写的是「工具+模式+类别」宽规则，等于放行该工具在 danger-full-access 下的
+                  // 一切操作（事故：2026-09-18 20:43:39 落了一条 {tool:write, mode:danger-full-access,
+                  // category:neutral} 无指纹规则，覆盖了此后所有 write 提权）。宁可这次不放行，
+                  // 也不要把一次追认放大成永久全工具放行。
+                  if (!fingerprint && keywords.length === 0) {
+                    audit(`RECONSIDER event=${eventId} 无可用指纹 → 不写宽规则（拒绝把一次追认放大为全工具放行）`)
+                    return send(res, 400, {
+                      ok: false,
+                      error: '该记录没有可用的操作指纹（无文件路径、无命令、说明中也没有可识别目标），无法安全地只放行同类操作；请改用设置页的「白名单规则」按工具/路径手动放行。',
+                    })
+                  }
+                  rule.description = '用户追认：同类操作自动放行'
+                  config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
-                  audit(`RECONSIDER event=${eventId} 规则已存在，补齐 keywords ${JSON.stringify(union)}`)
+                  audit(`RECONSIDER event=${eventId} +allowRule scope=${scope} ${JSON.stringify(rule)}`)
                 } else {
-                  audit(`RECONSIDER event=${eventId} 规则已存在 ${JSON.stringify(rule)}`)
+                  // 同一目标重复追认：并集候选，补齐旧规则缺失的指纹形态（旧规则只有最长片段）
+                  const merged = config.allowRules.find(sameRule)
+                  const union = Array.from(new Set([...(merged.keywords || []), ...keywords]))
+                  if (union.length !== (merged.keywords || []).length) {
+                    merged.keywords = union
+                    saveJson(ALLOWLIST_PATH, config)
+                    audit(`RECONSIDER event=${eventId} 规则已存在，补齐 keywords ${JSON.stringify(union)}`)
+                  } else {
+                    audit(`RECONSIDER event=${eventId} 规则已存在 ${JSON.stringify(rule)}`)
+                  }
                 }
               }
 
@@ -1952,21 +2071,26 @@ export default {
               let delivery = { ok: false, via: 'none' }
               if (body.retry !== false && sessionId) {
                 const files = (event.files || []).map((f) => '`' + f + '`').join('、')
+                const scopeNote = scope === 'once'
+                  ? '本次放行（不写规则：仅这一次会自动放行，之后同一操作仍按正常判定）'
+                  : scope === 'global'
+                    ? '已写入自动放行规则（全局生效：所有会话都会放行同类操作）'
+                    : '已写入自动放行规则（仅本会话生效）'
                 const content = '你之前的操作被自动审批门控拒绝了，用户已在审批记录中追认通过，现在可以重试：\n' +
                   '- 操作：' + (event.justification || event.reason || '(无说明)') + '\n' +
                   '- 涉及文件：' + (files || '(未记录)') + '\n' +
                   '- 原判定：' + (event.verdict || 'judge-deny') + (cat !== 'neutral' ? '（category=' + cat + '）' : '') + '\n' +
-                  '- 已写入自动放行规则：' + JSON.stringify(rule) + '\n' +
-                  '请重新执行同一操作；该操作现在会自动放行。'
+                  '- ' + scopeNote + '\n' +
+                  '请重新执行同一操作。'
                 delivery = await sendToSession(sessionId, content)
                 audit(`RECONSIDER event=${eventId} retry via=${delivery.via || 'none'}`)
               }
 
               // 记录一条追认事件：审查视图据此把该条静默拒绝标注为「已追认」并撤销待处理角标
               recordApprovalEvent(sessionId || event.sessionId, event.tool, event.mode, event.reason, event.justification, 'reconsidered',
-                { kind: 'reconsidered', path: 'reconsider', category: cat, files: event.files || [], reconsiderOf: event.id })
+                { kind: 'reconsidered', path: 'reconsider', category: cat, files: event.files || [], reconsiderOf: event.id, scope })
 
-              send(res, 200, { ok: true, rule, duplicate: dup, delivery })
+              send(res, 200, { ok: true, scope, rule: scope === 'once' ? null : rule, duplicate: dup, delivery })
             } catch (e) {
               send(res, 400, { ok: false, error: String((e && e.message) || e) })
             }
@@ -2375,22 +2499,22 @@ export default {
               const fpText = String(jst || '') + ' ' + ((toolFiles || []).join(' '))
               const fingerprint = extractOperationFingerprint(fpText)
               const candidates = extractFingerprintCandidates(fpText)
+              const scope = sedimentScope()
               const rule = { tool: tName, category: cat || 'neutral' }
               if (tMode) rule.mode = tMode
               if (fingerprint) rule.contains = fingerprint
               const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
               if (keywords.length > 0) rule.keywords = keywords
               // 无任何指纹时**不写宽规则**：那会放行该工具在 danger-full-access 下的一切操作。
-              if (!sid) {
-                // 没有会话 id 就没有生效范围可言；写成全局规则等于把「一次批准」放大到所有会话
-                audit(`LEARN   判定器不可用转人工已批准，但会话 id 缺失 → 不沉淀（无法限定生效范围）`)
-              } else if (fingerprint || keywords.length > 0) {
-                rule.sessionId = String(sid)
-                if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
+              if (fingerprint || keywords.length > 0) {
+                if (!applyRuleScope(rule, scope, sid)) {
+                  // 作用域为本会话却没有会话 id：范围无从谈起，不写（也绝不静默升级成全局）
+                  audit(`LEARN   判定器不可用转人工已批准，但作用域=本会话且会话 id 缺失 → 不沉淀`)
+                } else if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                   rule.description = '判定器不可用，人工批准后沉淀：' + (fingerprint || keywords[0])
                   config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
-                  audit(`LEARN   判定器不可用转人工已批准，沉淀白名单（限本会话 ${String(sid).slice(0, 12)}）${JSON.stringify(rule)}`)
+                  audit(`LEARN   判定器不可用转人工已批准，沉淀白名单（${scope === 'global' ? '全局' : '本会话 ' + String(sid).slice(0, 12)}）${JSON.stringify(rule)}`)
                 }
               } else {
                 audit(`LEARN   判定器不可用转人工已批准，但无可用指纹 → 不沉淀宽规则`)
@@ -2429,8 +2553,17 @@ export default {
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'deny')
         }
 
-        // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        //    规则按会话过滤：审批产生的规则只在其归属会话生效（用户 2026-10-03 决策）
+        // 2. 白名单层：确定性放行（不过 flash）。两个来源：一次性额度 + 规则命中。
+        //    两者都排在硬拒/硬事实/危险词之后，因此不会绕过任何安全闸。
+        //    2a. 「仅本次放行」一次性额度（追认时选「本次」）：不写规则，只放行匹配的这一次
+        const onceHit = consumeOnceGrant(sessionId, toolName, mode, null, ruleMatchContext)
+        if (onceHit) {
+          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (once: 追认时选的「仅本次放行」，额度已消费)`)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'once', displayOpts)
+          return 'allowed-once'
+        }
+
+        //    2b. 规则命中。规则按会话过滤：会话作用域的规则只在其归属会话生效，全局规则不受影响
         const matchedRule = matchRule(rulesForSession(config.allowRules, sessionId), toolName, mode, null, ruleMatchContext)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
@@ -2578,13 +2711,16 @@ export default {
           if (fpHit) {
             // ① 指纹确定性命中（用户确认过该操作）→ 自动放行 + 沉淀规则
             if (learning.enabled) {
-              const rule = { tool: toolName, category: cat, contains: fingerprint, sessionId: String(sessionId) }
+              const scope = sedimentScope()
+              const rule = { tool: toolName, category: cat, contains: fingerprint }
               if (mode) rule.mode = mode
-              if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
+              if (!applyRuleScope(rule, scope, sessionId)) {
+                audit(`LEARN   ${key} 作用域=本会话但会话 id 缺失 → 不沉淀`)
+              } else if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                 rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} 人工确认后自动放行`
                 config.allowRules.push(rule)
                 saveJson(ALLOWLIST_PATH, config)
-                audit(`LEARN   ${key} 已沉淀白名单（限本会话）${JSON.stringify(rule)}`)
+                audit(`LEARN   ${key} 已沉淀白名单（${scope === 'global' ? '全局' : '本会话'}）${JSON.stringify(rule)}`)
               }
             }
             audit(`ALLOW   ${toolName} mode=${mode || 'none'} (neutral-learned=${confirmed + 1}/${threshold}) | ${reason.slice(0, 100)}`)
@@ -2602,13 +2738,16 @@ export default {
             if (sim.verdict === 'same') {
               // 判同类 → 自动放行；有指纹则沉淀规则（无指纹不沉淀，保留样本供后续验证）
               if (learning.enabled && fingerprint) {
-                const rule = { tool: toolName, category: cat, contains: fingerprint, sessionId: String(sessionId) }
+                const scope = sedimentScope()
+                const rule = { tool: toolName, category: cat, contains: fingerprint }
                 if (mode) rule.mode = mode
-                if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
+                if (!applyRuleScope(rule, scope, sessionId)) {
+                  audit(`LEARN   ${key} 作用域=本会话但会话 id 缺失 → 不沉淀`)
+                } else if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                   rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} flash 同类验证`
                   config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
-                  audit(`LEARN   ${key} flash 判同类，已沉淀白名单（限本会话）${JSON.stringify(rule)}`)
+                  audit(`LEARN   ${key} flash 判同类，已沉淀白名单（${scope === 'global' ? '全局' : '本会话'}）${JSON.stringify(rule)}`)
                 }
                 delete learning.stats[key]
                 delete learning.history[key]

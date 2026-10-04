@@ -26,6 +26,9 @@ const CLIENT_SRC = readFileSync(join(REPO_ROOT, 'client.js'), 'utf8')
 
 console.log('Testing client bundle render (smoke)...')
 
+/** 追认的三个作用域按钮文案（与 client.js 的 RECONSIDER_SCOPES 一致） */
+const SCOPE_LABELS = ['仅本次', '本会话', '全局']
+
 // ================= 最小 React 垫片 =================
 /**
  * 每个组件函数各自持有一份 hooks 状态（按组件身份键控）——bundle 注册的是
@@ -280,9 +283,10 @@ function inspect(node, out, renderer) {
   assert.ok(/已直接拒绝/.test(info.text), 'the notice reports the rejection')
   assert.ok(info.classes.some((c) => c.indexOf('ag-notice-card-reject') >= 0), 'reject styling is applied')
   assert.ok(/未读/.test(info.text), 'the notice explains it stays until seen')
-  assert.ok(info.buttons.some((b) => b.text === '重新审批通过'), 'a neutral silent reject offers re-approval')
+  assert.ok(SCOPE_LABELS.every((l) => info.buttons.some((b) => b.text === l)),
+    'a neutral silent reject offers all three re-approval scopes: ' + SCOPE_LABELS.join(' / '))
   assert.ok(info.buttons.some((b) => b.text === '查看审批记录'), 'a jump-to-tab action is offered')
-  console.log('  ✓ 静默拒绝 → 常驻提示条 + 「重新审批通过」/「查看审批记录」')
+  console.log('  ✓ 静默拒绝 → 常驻提示条 + 追认三作用域（仅本次/本会话/全局）+「查看审批记录」')
 }
 
 // ================= 2. 硬拒档 → 常驻但**不**给追认按钮 =================
@@ -298,7 +302,7 @@ function inspect(node, out, renderer) {
   assert.ok(tree, 'a hard reject still surfaces on screen')
   const info = inspect(tree)
   assert.ok(/凭据外泄或系统路径销毁/.test(info.text), 'the hard-reject reason is shown')
-  assert.ok(!info.buttons.some((b) => b.text === '重新审批通过'),
+  assert.ok(!SCOPE_LABELS.some((l) => info.buttons.some((b) => b.text === l)),
     'the hard-deny tier must not offer re-approval (a whitelist rule cannot override it)')
   console.log('  ✓ 硬拒档 → 常驻提示条，但不提供追认按钮')
 }
@@ -315,12 +319,12 @@ function inspect(node, out, renderer) {
   const History = booted.component('dsh-approval-gate.history')
   const tree = await renderSettled(booted, History, { sessionId: 's3' })
   const info = inspect(tree)
-  const reapprove = info.buttons.filter((b) => b.text === '重新审批通过')
+  const reapprove = info.buttons.filter((b) => b.text === '仅本次')
   assert.strictEqual(reapprove.length, 1,
     'exactly one row (the neutral judge-deny) offers re-approval; got ' + reapprove.length)
   assert.ok(/待处理/.test(info.text), 'the view reports how many rejects are still pending')
   assert.ok(/已直接拒绝/.test(info.text), 'silent rejects are listed')
-  console.log('  ✓ 审批视图：仅 neutral 的 judge-deny 有「重新审批通过」（硬拒/硬类别不给）')
+  console.log('  ✓ 审批视图：仅 neutral 的 judge-deny 有追认按钮（硬拒/硬类别不给）')
 }
 
 // ================= 3b. 追认按钮的显隐跟随服务端下发的 hardCategories =================
@@ -335,7 +339,7 @@ function inspect(node, out, renderer) {
   const History = booted.component('dsh-approval-gate.history')
   const tree = await renderSettled(booted, History, { sessionId: 's6' })
   const info = inspect(tree)
-  const reapprove = info.buttons.filter((b) => b.text === '重新审批通过')
+  const reapprove = info.buttons.filter((b) => b.text === '仅本次')
   assert.strictEqual(reapprove.length, 1,
     'exactly the category the server removed from hardCategories offers re-approval; got ' + reapprove.length)
   console.log('  ✓ 追认按钮跟随服务端 hardCategories（自定义类别被拦、被移出的类别放开）')
@@ -347,7 +351,7 @@ function inspect(node, out, renderer) {
   // 但用户已放行该操作 → 文案与配色必须从「被拒」翻转，否则用户看到红色「已直接拒绝」
   // 会以为追认没生效（真实踩坑：event 214/215，判定器不可用 → 追认后仍显示红色拒绝）。
   const env = createEnv([
-    { id: 51, kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral', tool: 'edit', ts: '2026-09-17T11:22:03.000Z', verdict: 'judge-deny', justification: '写 custom_phrase.dict.yaml', files: [], reconsidered: true },
+    { id: 51, kind: 'judge-deny', path: 'judge-unavailable', category: 'neutral', tool: 'edit', ts: '2026-09-17T11:22:03.000Z', verdict: 'judge-deny', justification: '写 custom_phrase.dict.yaml', files: [], reconsidered: true, reconsiderScope: 'once' },
     { id: 52, kind: 'judge-deny', path: 'classifier-deny', category: 'neutral', tool: 'edit', ts: '2026-09-17T11:23:00.000Z', verdict: 'judge-deny', justification: '仍未追认', files: [] },
   ])
   const booted = boot(env)
@@ -356,6 +360,8 @@ function inspect(node, out, renderer) {
   const info = inspect(tree)
   assert.ok(/已追认放行 · 判定器不可用（曾直接拒绝）/.test(info.text),
     'a reconsidered record reads as approved-and-released, keeping the original reason in parentheses')
+  assert.ok(/（仅本次）/.test(info.text),
+    'a once-only reconsideration says so — the user must not think it became a standing allowance')
   assert.ok(!/已追认 · 已直接拒绝/.test(info.text),
     'the old "已追认 · 已直接拒绝" wording must be gone (it looked like it was still rejected)')
   assert.ok(/待处理 1/.test(info.text),
@@ -489,28 +495,32 @@ function inspect(node, out, renderer) {
   console.log('  ✓ 裁判模型卡片：目录可用走下拉框，目录不可用退化手填')
 }
 
-// ================= 6c. 白名单卡片：作用域标签与旧沉淀停用标注 =================
+// ================= 6c. 白名单卡片：作用域标签 / 提升为全局 / 沉淀作用域设置 =================
 {
-  // legacyInactive / sessionScoped 由 host 计算（见 test/reconsider.test.mjs 5b），
-  // 这里只验证前端把它们画对：本会话沉淀 / 旧沉淀已停用 / 用户。
+  // scope / sessionScoped 由 host 计算（见 test/reconsider.test.mjs 5b 与 session-scope.test.mjs），
+  // 这里只验证前端把它们画对：来源标签（沉淀/用户）+ 作用域标签（全局/本会话）+ 提升按钮。
   const env = createEnv([], {
     config: {
+      sedimentScope: 'session',
       allowRules: [
-        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'a.yaml', description: '自动沉淀：中立 人工确认后自动放行', sessionId: 'sess-abc123def456', sessionScoped: true, legacyInactive: false },
-        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'b.yaml', description: '自动沉淀：中立 人工确认后自动放行', sessionScoped: false, legacyInactive: true },
-        { tool: 'edit', mode: 'workspace-write', category: 'neutral', contains: 'c.yaml', description: '用户自定义', sessionScoped: false, legacyInactive: false },
+        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'a.yaml', description: '自动沉淀：中立 人工确认后自动放行', sessionId: 'sess-abc123def456', scope: 'session', sessionScoped: true },
+        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'b.yaml', description: '自动沉淀：中立 人工确认后自动放行', scope: 'global', sessionScoped: false },
+        { tool: 'edit', mode: 'workspace-write', category: 'neutral', contains: 'c.yaml', description: '用户自定义', scope: 'global', sessionScoped: false },
       ],
     },
   })
   const booted = boot(env)
   const tree = await renderSettled(booted, booted.component('dsh-approval-gate.settings'), {})
   const info = inspect(tree)
-  assert.ok(/本会话沉淀/.test(info.text), 'a session-scoped learned rule is labelled as session-scoped')
+  assert.ok(/全局/.test(info.text), 'global rules carry a 全局 tag')
+  assert.ok(/本会话/.test(info.text), 'session rules carry a 本会话 tag')
   assert.ok(/会话 sess-abc123d/.test(info.text), 'the owning session is shown (truncated to 12 chars)')
-  assert.ok(/旧沉淀 · 已停用/.test(info.text), 'an owner-less legacy learned rule is labelled retired')
-  assert.ok(/用户/.test(info.text), 'a user-authored rule keeps its own tag')
-  assert.ok(/只在它产生的那个会话生效/.test(info.text), 'the card explains the per-session scope')
-  console.log('  ✓ 白名单卡片：本会话沉淀 / 旧沉淀已停用 / 用户 三种标签与作用域说明')
+  assert.ok(info.buttons.some((b) => b.text === '提升为全局'), 'a session rule can be promoted to global in one click')
+  assert.strictEqual(info.buttons.filter((b) => b.text === '提升为全局').length, 1,
+    'only the session-scoped rule offers promotion')
+  assert.ok(/新审批沉淀的作用域/.test(info.text), 'the sediment-scope setting is exposed')
+  assert.ok(/仅本会话/.test(info.text), 'the default option is labelled 仅本会话')
+  console.log('  ✓ 白名单卡片：作用域标签 + 提升为全局 + 沉淀作用域设置')
 }
 
 // ================= 7. 审批说明中文化：zh 字段优先渲染 =================

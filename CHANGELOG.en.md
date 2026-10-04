@@ -4,7 +4,55 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.4] — 2026-10-04
+
+**Scope becomes a choice**: a new approval can be specified as "this once / this session / global" (session by default), and **the legacy learned rules that 0.9.3 retired go back to being global** (user decision, 2026-10-04).
+
+### Background
+
+To close the cross-session poisoning path, 0.9.3 did two rather strict things: (1) owner-less sedimented / re-approval rules were **retired** outright, and (2) every approval-produced rule applied only inside its session. That blocked the poisoning, but it also threw away the whitelist the user had already built up. This release follows the user's decision: migrate the existing rules back to global, and make scope a per-approval choice going forward.
+
+### Changes
+
+**Scope model (src/index.mjs)**
+
+- New `ruleScope(rule)` is the **single owner** of scope interpretation: `'global'` / `'session'` / `'none'`
+  - explicit `scope:'global'` → global (a new approval chose "global", or the rule was promoted from a session rule)
+  - explicit `scope:'session'` → requires a `sessionId`; **without an owner it returns `'none'` (never matches)** — fail-safe: an unprovable owner must never be upgraded into a global allowance
+  - no `scope`: with a `sessionId` → session scope (rules created during 0.9.3); without one → **global** (legacy sediment / re-approval / judge-unavailable rules, rules you wrote, repository-seed rules, built-in defaults)
+- `ruleUsableInSession()` now reads `ruleScope()`; the previous description-prefix retirement heuristic (`LEARNED_RULE_DESC_RE`) is deleted
+
+**A new approval's scope (three options)**
+
+- The reconsider endpoint accepts `scope: 'once' | 'session' | 'global'` (defaulting to the settings-page sediment scope)
+  - `once`: **writes no rule**, grants a one-shot allowance that only covers the AI's retry; the grant is consumed on use (in-memory only — after a restart the retry itself is gone, so no stale state can linger)
+  - `session`: writes a session-scoped rule with its owner (previous behaviour)
+  - `global`: writes a global rule — explicitly chosen by the user, so no session owner is required
+- The settings page's ② allow-list card gained "new approval sediment scope": **this session (default) / global**, deciding where automatic sediments (learning threshold reached, judge-unavailable approval) are written
+- Allow-list rows show a scope tag (全局 / 本会话) and session rules offer a one-click **"提升为全局"** (new API `op=promote`, idempotent — an already-global rule returns `already`)
+
+**UI**
+
+- The re-approval action became three buttons: **仅本次 / 本会话 / 全局** (in both the notice strip and the history row, each with a tooltip); the notice action area now wraps
+- History rows annotate the scope used when reconsidering: `已追认放行 · …（仅本次）` / `（已写入本会话规则）` / `（已写入全局规则）`; the events API now ships `reconsiderScope`
+- Auto-approval events gained two verdict labels: `once` (追认 · 仅本次放行) and `learned-judge-unavailable` (已确认操作，判定器不可用)
+
+### Regression tests
+
+- `test/session-scope.test.mjs` rewritten into 9 sections: scope semantics table (including "session scope without an owner never matches"), session rules allowing only their owner, **legacy learned rules applying in every session**, denyRules still global, "this once" writing no rule and expiring after one use, re-approval session/global each behaving as chosen, one-click promotion, and the sediment-scope setting deciding the layer
+- `test/reconsider.test.mjs` case 5b: now asserts the `scope` / `sessionScoped` / `sedimentScope` annotations and that an owner-less legacy learned rule reports `scope === 'global'`
+- `test/client-render-smoke.test.mjs`: case 6c now covers the scope tags, the promote button and the sediment-scope setting; case 3c additionally asserts the "（仅本次）" annotation; the re-approval button assertions follow the three scopes
+
+### Compatibility
+
+- **The 0.9.3 retirement is reverted**: owner-less sedimented / re-approval rules already in `allowlist.json` apply globally again, with no migration needed
+- Rules created **during 0.9.3** that carry a `sessionId` stay session-scoped (no `scope` field means session), so this change does not widen them into globals
+- Rules you wrote (description `用户自定义`), repository-seed rules and built-in defaults were always global and stay that way
+- No schema migration; `allowlist.json` stays at `version: 4`
+
 ## [0.9.3] — 2026-10-03
+
+> ⚠️ This release's "owner-less learned rules are **retired**" and "approval rules always apply only inside their session" were **superseded by 0.9.4**: existing rules are global again and a new approval picks its own scope (session by default). See the entry above.
 
 **Approvals only apply to the session that earned them**: learning counters and the allow rules they sediment are no longer shared across sessions; the API origin fence also gained scheme and port comparison. Addresses upstream issue #4 P0-2 and P0-3.
 
