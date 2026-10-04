@@ -1081,12 +1081,17 @@ window.__ModuleLoader__.load({
     // ================= 设置页：自动审批规则管理（settings.section） =================
     const RULE_SOURCE_TAGS = {
       default: React.createElement('span', { className: 'ag-set-tag ag-set-tag-blue' }, '预置'),
-      learned: React.createElement('span', { className: 'ag-set-tag ag-set-tag-green' }, '学习沉淀'),
+      learned: React.createElement('span', { className: 'ag-set-tag ag-set-tag-green' }, '本会话沉淀'),
       user: React.createElement('span', { className: 'ag-set-tag ag-set-tag-gray' }, '用户'),
+      inactive: React.createElement('span', { className: 'ag-set-tag ag-set-tag-gray' }, '旧沉淀 · 已停用'),
     }
     function ruleSource(rule) {
       const d = String(rule && rule.description || '')
-      if (d.indexOf('自动沉淀') === 0 || d.indexOf('人工确认后') >= 0 || d.indexOf('flash 同类') >= 0) return 'learned'
+      const learned = d.indexOf('自动沉淀：') === 0 || d.indexOf('人工确认后') >= 0 || d.indexOf('flash 同类') >= 0
+        || d.indexOf('判定器不可用，人工批准后沉淀：') === 0 || d.indexOf('用户追认：') === 0
+      // legacyInactive 由 host 计算（旧版无会话归属的沉淀规则，0.9.3 起不再参与匹配）
+      if (rule && rule.legacyInactive) return 'inactive'
+      if (learned) return 'learned'
       if (d === '用户自定义') return 'user'
       return 'default'
     }
@@ -1205,6 +1210,7 @@ window.__ModuleLoader__.load({
       const preHard = new Set(predefined.hardCategories || [])
       const learnStats = snapshot.learning && snapshot.learning.stats ? snapshot.learning.stats : {}
       const learnHistory = snapshot.learning && snapshot.learning.history ? snapshot.learning.history : {}
+      const learnLabels = snapshot.learning && snapshot.learning.labels ? snapshot.learning.labels : {}
       const statKeys = Object.keys(learnStats)
       const histKeys = Object.keys(learnHistory)
       // 当前裁判模型若指向已不在目录里的路由/模型（换过 provider、adapter 被移除），
@@ -1298,7 +1304,8 @@ window.__ModuleLoader__.load({
               React.createElement('span', { className: 'ag-set-stage' }, '② 白名单层'),
               '白名单 · 自动放行规则'),
             React.createElement('p', { className: 'ag-set-card-sub' },
-              '管道第二步：命中规则直接自动放行（不过 Flash）。示例：tool=edit + mode=danger-full-access → 所有工作区外 edit 自动放行。')),
+              '管道第二步：命中规则直接自动放行（不过 Flash）。示例：tool=edit + mode=danger-full-access → 所有工作区外 edit 自动放行。' +
+              '「本会话沉淀」是审批/学习产生的规则，只在它产生的那个会话生效；你手写的规则全局生效。')),
           React.createElement('div', { className: 'ag-set-row' },
             React.createElement('input', { className: 'ag-set-input', style: { width: 110 }, placeholder: 'tool', value: newRule.tool, onChange: function (e) { setNewRule(Object.assign({}, newRule, { tool: e.target.value })) } }),
             React.createElement('input', { className: 'ag-set-input', style: { width: 150 }, placeholder: 'mode（可选）', value: newRule.mode, onChange: function (e) { setNewRule(Object.assign({}, newRule, { mode: e.target.value })) } }),
@@ -1321,7 +1328,7 @@ window.__ModuleLoader__.load({
                   if (rule.mode) parts.push('mode=' + rule.mode)
                   if (rule.category) parts.push('category=' + rule.category)
                   if (rule.contains) parts.push('contains=' + rule.contains)
-                  const label = parts.join('  ') || '(任意)'
+                  const label = (parts.join('  ') || '(任意)') + (rule.sessionId ? '  · 会话 ' + String(rule.sessionId).slice(0, 12) : '')
                   const src = ruleSource(rule)
                   const isPre = preAllow.indexOf(JSON.stringify({ mode: rule.mode, description: rule.description })) >= 0 || (rule.mode === 'workspace-write' && !rule.tool && !rule.category && !rule.contains)
                   return React.createElement('div', { className: 'ag-set-item', key: idx },
@@ -1331,7 +1338,8 @@ window.__ModuleLoader__.load({
                     React.createElement('button', {
                       type: 'button', className: 'ag-set-item-del', title: '删除', 'aria-label': '删除规则',
                       onClick: function () {
-                        api({ op: 'remove', kind: 'allowRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains } })
+                        // sessionId 必须一起带上：两条签名相同但归属不同会话的沉淀规则是两条规则
+                        api({ op: 'remove', kind: 'allowRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains, sessionId: rule.sessionId } })
                       },
                     }, '✕'),
                   )
@@ -1376,22 +1384,24 @@ window.__ModuleLoader__.load({
               React.createElement('span', { className: 'ag-set-stage' }, '⑤ 学习沉淀'),
               '正在学习'),
             React.createElement('p', { className: 'ag-set-card-sub' },
-              '中立操作人工确认制：同一「工具|模式|类别」每确认一次计数 +1，确认满 ' + cfg.riskyThreshold + ' 次后，第 ' + (cfg.riskyThreshold + 1) + ' 次起自动放行并沉淀规则。若学习有误可终止（删除计数与样本）。')),
+              '中立操作人工确认制：同一会话内，同一「工具|模式|类别」每确认一次计数 +1，确认满 ' + cfg.riskyThreshold + ' 次后，第 ' + (cfg.riskyThreshold + 1) + ' 次起自动放行并沉淀规则（该规则只在本会话生效）。若学习有误可终止（删除计数与样本）。')),
           statKeys.length === 0
             ? React.createElement('div', { className: 'ag-set-empty' }, '暂无正在学习的内容')
             : React.createElement('div', { className: 'ag-set-learn' },
                 statKeys.map(function (k) {
                   const samples = (learnHistory[k] || []).map(function (s) { return (s && (s.fp || s.ctx)) || '' }).join(' / ').slice(0, 160)
+                  // 展示标签由 host 格式化（key 形如 sessionId|tool|mode|category）
+                  const label = (learnLabels[k]) || k
                   return React.createElement('div', { className: 'ag-set-learn-item', key: k },
                     React.createElement('div', { className: 'ag-set-learn-info' },
-                      React.createElement('span', { className: 'ag-set-learn-key' }, k),
+                      React.createElement('span', { className: 'ag-set-learn-key' }, label),
                       React.createElement('span', { className: 'ag-set-learn-sub' },
                         '已确认 ' + learnStats[k] + '/' + cfg.riskyThreshold + (samples ? ' · ' + samples : '')),
                     ),
                     React.createElement('button', {
                       type: 'button', className: 'ag-set-learn-stop', title: '终止学习（删除计数与样本）',
                       onClick: function () {
-                        if (!window.confirm('终止「' + k + '」的学习？将删除其确认计数与样本。')) return
+                        if (!window.confirm('终止「' + label + '」的学习？将删除其确认计数与样本。')) return
                         api({ op: 'remove', kind: 'learning', value: k })
                       },
                     }, '终止'),

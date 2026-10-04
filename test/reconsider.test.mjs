@@ -167,10 +167,13 @@ const ruleCount = () => JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).allowRules
   assert.strictEqual(rule.mode, 'danger-full-access', 'rule pins the mode')
   assert.strictEqual(rule.category, 'neutral', 'rule pins the category')
   assert.ok(rule.contains, 'rule carries an operation fingerprint (no blanket allow)')
+  // 追认也是「审批」：规则必须带会话归属，只对该会话生效（用户 2026-10-03 决策）
+  assert.strictEqual(rule.sessionId, 's2', 'the rule is scoped to the session it was approved in')
 
   const cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
   assert.strictEqual(cfg.allowRules.length, BASELINE_RULES + 1, 'exactly one learned rule is persisted')
   assert.strictEqual(cfg.allowRules[cfg.allowRules.length - 1].contains, rule.contains, 'persisted rule matches the response')
+  assert.strictEqual(cfg.allowRules[cfg.allowRules.length - 1].sessionId, 's2', 'the persisted rule keeps its session scope')
 
   // 重试指令已投递到会话
   assert.strictEqual(state.delivered.length, 1, 'a retry instruction is delivered once')
@@ -213,6 +216,32 @@ const ruleCount = () => JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).allowRules
   console.log('  ✓ 事件 API：原事件标注 reconsidered，追认记录被过滤，并下发生效 hardCategories + 老事件补 facts')
 }
 
+// ================= 5b. 规则快照带上作用域注解（供设置页显示） =================
+{
+  const res = await call(state, '/api/auto-approve/rules', 'GET')
+  assert.strictEqual(res.status, 200, 'rules endpoint responds')
+  const rules = res.payload.config.allowRules
+  const scoped = rules.filter((r) => r.sessionScoped)
+  assert.ok(scoped.length >= 1, 'session-scoped rules are flagged for the settings page')
+  assert.ok(scoped.every((r) => typeof r.sessionId === 'string' && r.sessionId), 'the flag agrees with sessionId')
+  const shipped = rules.find((r) => (r.description || '').indexOf('工作区写入') === 0)
+  assert.ok(shipped, 'the shipped workspace-write rule is listed')
+  assert.strictEqual(shipped.sessionScoped, false, 'shipped rules are not session-scoped')
+  assert.strictEqual(shipped.legacyInactive, false, 'shipped rules are not retired learned rules')
+
+  // 旧版无归属的沉淀规则：host 必须把它标成已停用，否则设置页会显示成生效中
+  const cfgNow = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+  cfgNow.allowRules.push({ tool: 'write', category: 'neutral', contains: 'legacy-x', description: '自动沉淀：中立 人工确认后自动放行' })
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfgNow, null, 2) + '\n', 'utf8')
+  const res2 = await call(state, '/api/auto-approve/rules', 'GET')
+  const legacy = res2.payload.config.allowRules.find((r) => r.contains === 'legacy-x')
+  assert.strictEqual(legacy.legacyInactive, true, 'an owner-less learned rule is flagged as retired')
+  assert.strictEqual(legacy.sessionScoped, false, '…and it is not mistaken for a live scoped rule')
+  cfgNow.allowRules = cfgNow.allowRules.filter((r) => r.contains !== 'legacy-x')
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfgNow, null, 2) + '\n', 'utf8')
+  console.log('  ✓ 规则快照带 sessionScoped / legacyInactive 注解')
+}
+
 // ================= 6. 重复追认幂等（不重复写规则） =================
 {
   const res = await call(state, '/api/auto-approve/reconsider', 'POST', { sessionId: 's2', eventId: 3, retry: false })
@@ -227,6 +256,25 @@ const ruleCount = () => JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).allowRules
   const res = await call(state, '/api/auto-approve/reconsider', 'POST', { eventId: 999 })
   assert.strictEqual(res.status, 404, 'unknown event id yields 404')
   console.log('  ✓ 未知事件 → 404')
+}
+
+// ================= 8. 无会话归属的记录不可追认（无法限定生效范围） =================
+// 追认产生的放行规则只对该会话生效；老事件没记 sessionId、请求体也没带时，
+// 落一条全局规则就等于把「一次批准」放大到所有会话 → 必须 400，让用户改用手写白名单。
+{
+  seedEvent({
+    id: 4, ts: '2026-09-16T13:25:00.000Z', tool: 'edit',
+    mode: 'danger-full-access', reason: 'r',
+    justification: '编辑 Merge.yaml 补充 fake-ip-filter 条目',
+    verdict: 'judge-deny', kind: 'judge-deny', path: 'classifier-deny', category: 'neutral',
+    files: ['Merge.yaml'],
+  })
+  const before = ruleCount()
+  const res = await call(state, '/api/auto-approve/reconsider', 'POST', { eventId: 4 })
+  assert.strictEqual(res.status, 400, 'a record with no session owner must not be reconsidered into a global rule')
+  assert.ok(/会话/.test(String(res.payload.error || '')), 'the error explains the missing session scope')
+  assert.strictEqual(ruleCount(), before, 'no rule is written')
+  console.log('  ✓ 无会话归属的记录不可追认（不写全局规则）')
 }
 
 console.log('All reconsider tests passed successfully!')

@@ -4,6 +4,55 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.3] — 2026-10-03
+
+**审批只在当前会话生效**：学习计数与它沉淀的放行规则不再跨会话共享；同时收紧 API 来源校验（补 scheme 与端口比对）。对应上游 issue #4 的 P0-2 与 P0-3。
+
+### 问题
+
+- **学习状态全局共享，可被「养规则」下毒**（issue #4 P0-2）：`learning.json` 的计数 key 只有 `工具|模式|类别`，不分会话；任一会话反复触发同一操作、由人工确认到阈值后，就会沉淀出一条写进 `allowlist.json` 的**全局**放行规则，之后影响所有会话。失控或恶意会话可以这样给全局下毒，而这正是「危险转人工」判定链被绕过的路径。追认（「重新审批通过」）写出的规则同样是全局的
+- **来源校验只比主机名**（issue #4 P0-3）：旧实现写的是 `u.hostname === host.split(':')[0]`——不比 scheme、不比端口，于是「名字相同」就能过：`https://` 页面、任意端口的页面、`javascript:` / `data:` 形态的来源全部放行。破坏性端点（rules / setup / revert / snapshots-clear）因此在退化路径（未加载 connection 服务时）暴露给跨源页面
+
+### 变更
+
+**作用域（src/index.mjs）**
+
+- 学习计数 key 改为 `sessionId|tool|mode|category`：确认次数只在产生它的会话里累计
+- 放行规则新增可选 `sessionId` 字段；新增 `ruleUsableInSession()` / `rulesForSession()`：带 `sessionId` 的规则只在归属会话生效
+- **旧版无归属的自动沉淀规则停用**：`自动沉淀：` / `判定器不可用，人工批准后沉淀：` / `用户追认：` 三种描述前缀的规则，因为无法证明属于哪个会话，在任何会话都不再参与匹配（它们恰好是「跨会话放行」的存量）。用户手写规则（描述「用户自定义」）、仓库种子与内置默认规则仍然全局生效——那属于「配置」，不是「审批」
+- **denyRules 有意保持全局**（不对称设计）：拒绝侧跨会话只会多弹一次人工，绝不会自动放行任何东西，保持全局是更安全的一侧
+- 追认端点写入的规则带 `sessionId`（取自事件，缺失时退回请求体）；两者都没有 → 400，让用户改用手写白名单，而不是落一条无法限定范围的全局规则
+- 规则去重/删除改为 `sameAllowRule()`（新增会话维度）：否则会话 B 的沉淀会被误判为「已存在」而复用会话 A 的规则，表现为「批准了却仍弹人工」
+- 学习 key 带上会话前缀后条数会随会话数增长，新增 400 条上限（超出按插入顺序淘汰最旧的）；所有落盘统一走 `saveLearning()`
+
+**来源校验（src/index.mjs）**
+
+- 来源必须与请求自身的 `Host` **逐字同源（scheme + host + port）**；唯一的例外是「请求 Host 本身是回环地址 且 来源也是回环别名」——覆盖 127.0.0.1 / localhost / [::1] 之间的跨端口访问
+- 非 `http(s)` 来源（`javascript:` / `data:` / `null`）一律拒绝
+- scheme 判据取自 `req.socket.encrypted`，其次是 `x-forwarded-proto`；**两者都拿不到时不做 scheme 比对**（反代未声明该头时若按 http 强判，会把用户的 https 设置页打成 403）
+- 残余风险已写明：DNS rebinding 的页面与本地服务**字面上同源**（Origin 与 Host 都是攻击域名），任何 Origin 比对都识别不出它；真正的防线是 `connection.requestRejection` 的凭据围栏（rebinding 页面拿不到 127.0.0.1 上的会话 cookie）
+
+**设置页（client.js）**
+
+- 白名单卡片：标签改为「本会话沉淀」/「旧沉淀 · 已停用」/「用户」，规则行显示归属会话（截断 12 字符），并说明「审批产生的规则只在它产生的那个会话生效」
+- 删除规则时一并带上 `sessionId`（两条签名相同、归属不同的沉淀规则是两条规则）
+- 学习卡片：key 前缀由 host 格式化（新增 `describeLearnKey()`，`sessionId|tool|mode|category` → `tool|mode|category · 会话 xxx`），并说明计数按会话隔离
+- 规则快照新增 `sessionScoped` / `legacyInactive` 注解，供界面区分「生效中」与「已停用」
+
+### 回归测试
+
+- `test/session-scope.test.mjs`（新增）：作用域语义表（本会话 / 别的会话 / 旧沉淀 / 手写 / 预置）、端到端「沉淀规则只对归属会话放行」、旧沉淀规则哪都不生效、手写全局规则不受影响、denyRules 跨会话仍生效、学习 key 落盘带会话前缀
+- `test/origin-fence.test.mjs`（新增）：8 类允许来源（同源 / 回环跨端口 / 回环别名 / LAN / 反代）+ 7 类拒绝（跨源 / 端口不符 / scheme 不符 / `javascript:` / `data:` / `null` / Referer 跨源），并显式写下 rebinding 残余风险与凭据围栏的对照
+- `test/pipeline.test.mjs` 用例 10c：学习状态改为按会话 key，并新增「换会话后不继承」断言（去掉会话前缀本断言立刻变红）
+- `test/reconsider.test.mjs`：新增 5b（快照注解）与用例 8（无会话归属 → 400 且不写规则）；用例 4 补断言「规则带 sessionId」
+- `test/client-render-smoke.test.mjs`：新增 6c（三种作用域标签 + 作用域说明）
+
+### 兼容
+
+- **存量数据的行为会变**（这是本次的目的，不是意外）：`allowlist.json` 里旧的自动沉淀 / 判定器不可用沉淀 / 追认规则**不再生效**，设置页会把它们标成「旧沉淀 · 已停用」；`learning.json` 里旧的全局计数 key（无会话前缀）不再被读取。想在所有会话生效的放行请改用「用户自定义」白名单规则（手写规则全局生效）
+- 无 schema 迁移、无需改配置文件；`allowlist.json` 的 `version` 仍是 4
+- 反向代理 / LAN 访问不受影响：同源与回环别名照旧放行；只有「同名不同端口」这类以前被误放行的来源改为 403
+
 ## [0.9.2] — 2026-10-03
 
 设置页补上「裁判模型」入口：判定模型可以直接选，不用再手改 `allowlist.json`（设置界面移植自上游 PR #11，`@sunligh91`）。

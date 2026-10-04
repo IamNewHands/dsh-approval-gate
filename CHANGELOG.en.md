@@ -4,6 +4,55 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.3] — 2026-10-03
+
+**Approvals only apply to the session that earned them**: learning counters and the allow rules they sediment are no longer shared across sessions; the API origin fence also gained scheme and port comparison. Addresses upstream issue #4 P0-2 and P0-3.
+
+### Problem
+
+- **Learning state is global, so it can be farmed into a global rule** (issue #4 P0-2): the `learning.json` counter key was just `tool|mode|category` with no session, so any session could repeat one operation, get it confirmed a few times by a human, and sediment an **allow rule written into `allowlist.json` that then applied to every session**. An out-of-control or malicious session could poison the global allowlist that way — which is exactly how the "dangerous operations go to a human" chain gets bypassed. Rules written by re-approval ("approve again") were global too
+- **The origin check compared hostnames only** (issue #4 P0-3): the old code was `u.hostname === host.split(':')[0]` — it never compared the scheme or the port, so "same name" was enough: `https://` pages, pages on any port, and `javascript:` / `data:` origins all passed. On the fallback path (no `connection` service loaded) that left the destructive endpoints (rules / setup / revert / snapshots-clear) exposed to cross-origin pages
+
+### Changes
+
+**Scope (src/index.mjs)**
+
+- The learning counter key became `sessionId|tool|mode|category`: confirmations accumulate only inside the session that produced them
+- Allow rules gained an optional `sessionId`; new `ruleUsableInSession()` / `rulesForSession()`: a rule with a `sessionId` applies only in its owning session
+- **Legacy owner-less learned rules are retired**: rules whose description starts with `自动沉淀：`, `判定器不可用，人工批准后沉淀：` or `用户追认：` cannot prove which session they belong to, so they no longer participate in matching in any session (they are exactly the existing cross-session allowances). User-authored rules (description `用户自定义`), repository-seed rules and built-in defaults stay global — those are *configuration*, not *approval*
+- **denyRules stays global on purpose** (deliberate asymmetry): on the rejection side, crossing sessions only ever adds one more human prompt and never auto-approves anything, so global is the safer side
+- Rules written by the reconsider endpoint now carry a `sessionId` (from the event, falling back to the request body); when neither has one the endpoint returns 400 so the user can hand-write a whitelist rule instead of persisting a rule with no definable scope
+- Rule de-duplication and deletion now go through `sameAllowRule()` (session dimension included): otherwise session B's sediment would be judged "already present" and silently reuse session A's rule, showing up as "I approved it but it still asks a human"
+- Because session prefixes make learning keys grow with the number of sessions, there is now a 400-key cap (oldest evicted by insertion order); every write goes through `saveLearning()`
+
+**Origin fence (src/index.mjs)**
+
+- An origin must be **literally same-origin with the request's own `Host` (scheme + host + port)**; the only exception is "the request's Host is loopback *and* the origin is a loopback alias", which covers 127.0.0.1 / localhost / [::1] across ports
+- Non-`http(s)` origins (`javascript:` / `data:` / `null`) are rejected outright
+- The scheme comes from `req.socket.encrypted`, then `x-forwarded-proto`; **when neither is available the scheme is not compared** (forcing http on a reverse proxy that does not set the header would 403 the user's own https settings page)
+- The residual risk is written down: a DNS-rebinding page is *literally* same-origin with the local service (both Origin and Host are the attacker's domain), so no Origin comparison can spot it; the real defence is `connection.requestRejection`'s credential fence (a rebinding page cannot obtain the session cookie scoped to 127.0.0.1)
+
+**Settings page (client.js)**
+
+- Allowlist card: tags are now "本会话沉淀" / "旧沉淀 · 已停用" / "用户", each learned row shows its owning session (truncated to 12 chars), and the card explains that approval-produced rules apply only to the session that produced them
+- Deleting a rule now sends its `sessionId` (two sediment rules with the same signature but different owners are two distinct rules)
+- Learning card: the key prefix is formatted by the host (new `describeLearnKey()`: `sessionId|tool|mode|category` → `tool|mode|category · 会话 xxx`), and the card states that counting is per session
+- The rules snapshot gained `sessionScoped` / `legacyInactive` annotations so the UI can tell "in effect" from "retired"
+
+### Regression tests
+
+- `test/session-scope.test.mjs` (new): scope semantics table (own session / another session / legacy learned / user-authored / shipped), an end-to-end "a sediment rule only allowlists its owning session", legacy learned rules being dead everywhere, user-authored global rules unaffected, denyRules still global, and the learning key being persisted with its session prefix
+- `test/origin-fence.test.mjs` (new): 8 allowed origins (same-origin / loopback cross-port / loopback alias / LAN / reverse proxy) and 7 rejected ones (cross-origin / port mismatch / scheme mismatch / `javascript:` / `data:` / `null` / cross-origin Referer), plus an explicit assertion of the rebinding residual and its credential-fence counterpart
+- `test/pipeline.test.mjs` case 10c: the learning fixture is now keyed per session, with a new "another session does not inherit it" assertion (removing the session prefix turns it red immediately)
+- `test/reconsider.test.mjs`: new case 5b (snapshot annotations) and case 8 (no session owner → 400 without writing a rule); case 4 now also asserts the rule carries a `sessionId`
+- `test/client-render-smoke.test.mjs`: new case 6c (the three scope tags plus the scope explanation)
+
+### Compatibility
+
+- **Existing data behaves differently on purpose**: the legacy auto-sedimented / judge-unavailable / re-approval rules already in `allowlist.json` **stop applying**, and the settings page labels them "旧沉淀 · 已停用"; legacy global learning keys in `learning.json` (without a session prefix) are no longer read. For an allowance that should apply everywhere, write a "用户自定义" allowlist rule instead (user-authored rules stay global)
+- No schema migration and no config edit needed; `allowlist.json` stays at `version: 4`
+- Reverse proxies and LAN access are unaffected: same-origin and loopback aliases still pass; only previously mis-allowed origins such as "same name, different port" now get a 403
+
 ## [0.9.2] — 2026-10-03
 
 The settings page now has a "judge model" entry: the judging model can be picked from the UI instead of hand-editing `allowlist.json` (the settings UI is ported from upstream PR #11, `@sunligh91`).

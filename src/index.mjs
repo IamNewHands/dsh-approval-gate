@@ -665,20 +665,52 @@ function readBody(req, limit = 1024 * 1024) {
 
 /**
  * 来源校验（防 DNS rebinding / 跨站表单 CSRF 攻击）
- * 允许同源请求（无 Origin/Referer 或指向 localhost/127.0.0.1/当前 Host）
+ *
+ * 与 0.9.2 及以前的差别（上游 issue #4 P0-3）：
+ *   旧实现写的是 `u.hostname === host.split(':')[0]` —— **不比 scheme、不比端口**，
+ *   于是「名字相同」就能过：`https://` 页面、任意端口的页面、`javascript:` /
+ *   `data:` 形态的来源全部放行。
+ *   现在来源必须与请求自身的 Host **逐字同源（scheme + host + port）**；唯一的例外是
+ *   「请求 Host 本身是回环地址 且 来源也是回环别名」——覆盖 127.0.0.1 / localhost / [::1]
+ *   之间的跨端口访问（DSH 的 answerer 可能在另一个端口）。
+ *
+ * scheme 判据：优先 socket.encrypted（Node 自己在 TLS 终止时置位），其次是 x-forwarded-proto
+ * （反代场景）。**两者都拿不到时不做 scheme 比对**——反代没设置该头时若强行按 http 判，
+ * 会把用户的 https 设置页打成 403。这是一处有意的「信息不足则放宽」，不是遗漏。
+ *
+ * 有意保留的残余风险（写进 GUIDE，不假装堵住了）：DNS rebinding 的页面与本地服务
+ * **字面上同源**（Origin 与 Host 都是攻击者域名，解析到 127.0.0.1），任何基于 Origin 的
+ * 比对都识别不出它。真正的防线是 requestAuthRejection 的凭据围栏——rebinding 页面拿不到
+ * 127.0.0.1 上的会话 cookie/token（cookie 按 host 字符串隔离）。本函数只是旧版部署
+ * （未加载 connection 服务）时的退化防线。
  */
 function isOriginSafe(req) {
-  const host = req.headers['host'] || ''
+  const host = String(req.headers['host'] || '')
   const origin = req.headers['origin']
   const referer = req.headers['referer']
+  const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+  // Host 去掉端口后的小写形式：`[::1]:43120` → `[::1]`
+  const hostName = host.replace(/:\d+$/, '').toLowerCase()
+  const hostIsLoopback = LOOPBACK.has(hostName)
+  // 本次请求真实的 scheme；'' 表示信息不足（不比 scheme）
+  const forwarded = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase()
+  const requestProtocol = (req.socket && req.socket.encrypted) ? 'https:'
+    : forwarded === 'https' ? 'https:'
+      : forwarded === 'http' ? 'http:'
+        : ''
 
   const check = (val) => {
     if (!val) return true
     try {
       const u = new URL(val)
-      const allowed = new Set(['localhost', '127.0.0.1', '[::1]'])
-      if (allowed.has(u.hostname)) return true
-      if (host && (u.host === host || u.hostname === host.split(':')[0])) return true
+      // 非 http(s) 的来源（javascript: / data: / file: / null）一律不认
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+      if (requestProtocol && u.protocol !== requestProtocol) return false
+      // 同源：与请求自身的 Host 完全一致（含端口）
+      if (host && u.host.toLowerCase() === host.toLowerCase()) return true
+      // 回环别名跨端口：只有在请求 Host 本身也是回环时才承认，
+      // 否则 `evil.example`（DNS 指向 127.0.0.1）会被当成回环来源放行
+      if (hostIsLoopback && LOOPBACK.has(u.hostname.toLowerCase())) return true
       return false
     } catch {
       return false
@@ -719,7 +751,13 @@ function getRulesSnapshot(permissionPresets) {
       version: config.version || CONFIG_VERSION,
       judgeModel: config.judgeModel || null,
       denyKeywords: config.denyKeywords || [],
-      allowRules: config.allowRules || [],
+      // 展示用注解（判定逻辑在 ruleUsableInSession / isLearnedRuleDescription）：
+      //   sessionScoped   —— 该规则由审批产生，只在其归属会话生效
+      //   legacyInactive —— 旧版无归属的自动沉淀规则，0.9.3 起不再参与匹配
+      allowRules: (config.allowRules || []).map((r) => Object.assign({}, r, {
+        sessionScoped: Boolean(r && typeof r.sessionId === 'string' && r.sessionId),
+        legacyInactive: Boolean(r) && !r.sessionId && isLearnedRuleDescription(r.description),
+      })),
       denyRules: config.denyRules || [],
       hardCategories: config.hardCategories || [],
       riskyThreshold: config.riskyThreshold || 3,
@@ -730,7 +768,9 @@ function getRulesSnapshot(permissionPresets) {
     },
     learning: {
       stats: learning.stats || {},
-      history: learning.history || {}
+      history: learning.history || {},
+      // key → 可读标签（去掉会话前缀）。格式化只有一个 owner，前端只负责画。
+      labels: Object.fromEntries(Object.keys(learning.stats || {}).map((k) => [k, describeLearnKey(k)]))
     },
     predefined: {
       denyKeywords: DEFAULT_DENY_KEYWORDS,
@@ -866,7 +906,7 @@ function applyRuleOp(op, kind, value) {
       if (learning.stats[key] !== undefined || learning.history[key] !== undefined) {
         delete learning.stats[key]
         delete learning.history[key]
-        saveJson(LEARNING_PATH, learning)
+        saveLearning()
         audit(`LEARN   ${key} 用户终止学习`)
         return { ok: true, removed: true }
       }
@@ -887,7 +927,7 @@ function applyRuleOp(op, kind, value) {
       if (!value || typeof value !== 'object') return { ok: false, error: '规则必须是对象' }
       const hasAny = value.tool || value.mode || value.category || value.contains
       if (!hasAny) return { ok: false, error: '规则至少需要 tool/mode/category/contains 之一' }
-      const dup = list.some((r) => r && r.tool === value.tool && r.mode === value.mode && r.category === value.category && r.contains === value.contains)
+      const dup = list.some((r) => sameAllowRule(r, value))
       if (!dup) {
         if (!value.description) value.description = '用户自定义'
         list.push(value)
@@ -906,9 +946,10 @@ function applyRuleOp(op, kind, value) {
       if (list.length !== before) audit(`CONFIG  ${kind} - ${str}`)
     } else {
       const v = value || {}
+      // 去重/删除都必须带上 sessionId：两条工具/模式/类别/指纹相同但归属不同会话的
+      // 沉淀规则是两条规则，按四元组删会误删到别的会话那条。
       for (let i = list.length - 1; i >= 0; i--) {
-        const r = list[i] || {}
-        if (r.tool === v.tool && r.mode === v.mode && r.category === v.category && r.contains === v.contains) list.splice(i, 1)
+        if (sameAllowRule(list[i], v)) list.splice(i, 1)
       }
       if (list.length !== before) audit(`CONFIG  ${kind} - ${JSON.stringify(v)}`)
     }
@@ -1218,9 +1259,92 @@ function matchRule(rules, toolName, mode, category, justification) {
   return null
 }
 
-// 计数/学习 key：tool|mode|category（category 为 flash 判定的类别，neutral 走计数）
-function learnKey(toolName, mode, category) {
-  return `${toolName}|${mode || 'none'}|${category || 'none'}`
+/**
+ * 「由审批自动产生」的放行规则：描述前缀是它们唯一的共同标记。
+ * 旧数据没有 sessionId，只能靠描述识别——**这是旧数据的兼容判据，不是业务逻辑**；
+ * 新产生的规则一律带 sessionId，不再依赖描述。
+ */
+const LEARNED_RULE_DESC_RE = /^(?:自动沉淀：|判定器不可用，人工批准后沉淀：|用户追认：)/
+function isLearnedRuleDescription(description) {
+  return LEARNED_RULE_DESC_RE.test(String(description || ''))
+}
+
+/**
+ * 规则在当前会话是否可用（用户 2026-10-03 决策：**审批只在当前会话生效**）。
+ *
+ *   - 带 sessionId 的规则 → 只在其归属会话生效
+ *   - 不带 sessionId 的规则 →
+ *       · 用户手写 / 仓库种子 / 内置默认 → 全局生效（那是「配置」，不是「审批」）
+ *       · 旧版自动沉淀的规则 → **停用**：它无法证明属于哪个会话，继续生效就等于
+ *         保留上游 issue #4 P0-2 的跨会话放行（任一会话养出的规则影响所有会话）
+ *
+ * @param {object} rule 一条 allowRule
+ * @param {string} sessionId 当前会话 id
+ * @returns {boolean} 该规则是否可参与本次判定
+ */
+export function ruleUsableInSession(rule, sessionId) {
+  if (!rule || typeof rule !== 'object') return false
+  const sid = typeof rule.sessionId === 'string' ? rule.sessionId : ''
+  if (sid) return sid === String(sessionId || '')
+  return !isLearnedRuleDescription(rule.description)
+}
+
+/** 当前会话可用的规则集合。白名单层与沉淀层共用；denyRules 有意不过滤（拒绝侧保持全局） */
+export function rulesForSession(rules, sessionId) {
+  return (Array.isArray(rules) ? rules : []).filter((r) => ruleUsableInSession(r, sessionId))
+}
+
+/**
+ * 两条 allowRule 是否「同一条」——去重必须带上 sessionId：
+ * 否则会话 B 的沉淀会被判定为「已存在」（复用会话 A 的规则），
+ * B 里那条规则其实不生效，表现为「批准了却仍然弹人工」。
+ */
+function sameAllowRule(a, b) {
+  const r = a && typeof a === 'object' ? a : {}
+  const s = b && typeof b === 'object' ? b : {}
+  return (r.tool || '') === (s.tool || '')
+    && (r.mode || '') === (s.mode || '')
+    && (r.category || '') === (s.category || '')
+    && (r.contains || '') === (s.contains || '')
+    && (r.sessionId || '') === (s.sessionId || '')
+}
+
+/**
+ * 计数/学习 key：`sessionId|tool|mode|category`。
+ *
+ * 会话前缀是安全语义的一部分（用户 2026-10-03 决策「审批只在当前会话生效」）：
+ * 全局 key 意味着任一会话都能靠反复触发把计数养到阈值，从而沉淀出一条影响之后
+ * 所有会话的放行规则（上游 issue #4 P0-2 的投毒路径）。
+ */
+function learnKey(sessionId, toolName, mode, category) {
+  return `${sessionId || ''}|${toolName}|${mode || 'none'}|${category || 'none'}`
+}
+
+// 学习状态留存上限：key 带会话前缀后条数会随会话数增长，超出后按插入顺序淘汰最旧的。
+// 计数本身有阈值语义（达到即沉淀并清 key），淘汰最旧的不会让「已确认过的操作」被误放行。
+const LEARNING_MAX_KEYS = 400
+function trimLearning() {
+  const trim = (obj) => {
+    const keys = Object.keys(obj || {})
+    if (keys.length <= LEARNING_MAX_KEYS) return
+    for (const k of keys.slice(0, keys.length - LEARNING_MAX_KEYS)) delete obj[k]
+  }
+  trim(learning.stats)
+  trim(learning.history)
+}
+
+/** 学习状态落盘：先按上限淘汰最旧 key，再写盘——所有写入点统一走这里，避免漏掉上限 */
+function saveLearning() {
+  trimLearning()
+  saveJson(LEARNING_PATH, learning)
+}
+
+/** 学习 key 的展示形式（去掉会话前缀，末尾标注会话）：`sess|edit|ws|neutral` → `edit|ws|neutral · 会话 sess` */
+export function describeLearnKey(key) {
+  const parts = String(key || '').split('|')
+  if (parts.length < 4) return String(key || '')
+  const sid = parts[0]
+  return parts.slice(1).join('|') + (sid ? ` · 会话 ${sid.slice(0, 12)}` : ' · 无会话归属')
 }
 
 // 从 justification 提取「操作指纹」：路径 / 文件名 / 项目名等有区分度的片段。
@@ -1780,7 +1904,19 @@ export default {
               if (fingerprint) rule.contains = fingerprint
               const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
               if (keywords.length > 0) rule.keywords = keywords
-              const sameRule = (r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains
+              // 追认也是「审批」：规则只对该记录所属会话生效（用户 2026-10-03 决策）。
+              // 事件没记会话（老数据）时退回请求体里的 sessionId；两者都没有则不写，
+              // 宁可让用户用手写白名单，也不落一条无法限定范围的全局放行。
+              const ruleSession = String(event.sessionId || sessionId || '')
+              if (!ruleSession) {
+                audit(`RECONSIDER event=${eventId} 无会话归属 → 不写规则（无法限定生效范围）`)
+                return send(res, 400, {
+                  ok: false,
+                  error: '该记录没有会话归属（老版本事件未记录 sessionId），无法把追认限定在会话内；请改用设置页的「白名单规则」手动放行。',
+                })
+              }
+              rule.sessionId = ruleSession
+              const sameRule = (r) => sameAllowRule(r, rule)
               const dup = config.allowRules.some(sameRule)
               if (!dup) {
                 // 围栏 3：无任何指纹时不写规则。
@@ -2224,11 +2360,11 @@ export default {
           if (out === 'allowed-once') {
             // 若因 Flash 调用失败/超时转人工，用户通过后依然记入学习样本与统计，避免因网络抖动丢失学习积累
             if (why === 'flash-failed' && learning.enabled) {
-              const k = learnKey(tName, tMode, cat || 'neutral')
+              const k = learnKey(sid, tName, tMode, cat || 'neutral')
               const prev = learning.stats[k] || 0
               learning.stats[k] = prev + 1
               recordSample(k, jst)
-              saveJson(LEARNING_PATH, learning)
+              saveLearning()
             }
             // 判定器不可用而转人工的操作，用户批准即等于「这个目标我已经确认过了」：
             // 直接沉淀一条放行规则（带本次调用的真实目标路径做候选指纹）。
@@ -2245,13 +2381,16 @@ export default {
               const keywords = candidates.filter((c) => normalizeMatchText(c) !== normalizeMatchText(fingerprint))
               if (keywords.length > 0) rule.keywords = keywords
               // 无任何指纹时**不写宽规则**：那会放行该工具在 danger-full-access 下的一切操作。
-              if (fingerprint || keywords.length > 0) {
-                const sameRule = (r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains
-                if (!config.allowRules.some(sameRule)) {
+              if (!sid) {
+                // 没有会话 id 就没有生效范围可言；写成全局规则等于把「一次批准」放大到所有会话
+                audit(`LEARN   判定器不可用转人工已批准，但会话 id 缺失 → 不沉淀（无法限定生效范围）`)
+              } else if (fingerprint || keywords.length > 0) {
+                rule.sessionId = String(sid)
+                if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                   rule.description = '判定器不可用，人工批准后沉淀：' + (fingerprint || keywords[0])
                   config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
-                  audit(`LEARN   判定器不可用转人工已批准，沉淀白名单 ${JSON.stringify(rule)}`)
+                  audit(`LEARN   判定器不可用转人工已批准，沉淀白名单（限本会话 ${String(sid).slice(0, 12)}）${JSON.stringify(rule)}`)
                 }
               } else {
                 audit(`LEARN   判定器不可用转人工已批准，但无可用指纹 → 不沉淀宽规则`)
@@ -2291,7 +2430,8 @@ export default {
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        const matchedRule = matchRule(config.allowRules, toolName, mode, null, ruleMatchContext)
+        //    规则按会话过滤：审批产生的规则只在其归属会话生效（用户 2026-10-03 决策）
+        const matchedRule = matchRule(rulesForSession(config.allowRules, sessionId), toolName, mode, null, ruleMatchContext)
         if (matchedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', displayOpts)
@@ -2340,7 +2480,8 @@ export default {
           // 判定器不可用时仍应兑现已经完成的学习。此前此分支先于学习阈值检查返回人工审批，
           // 导致 learning.json 已达到 6/3、8/3 仍反复弹窗。硬事实、危险词和确定性规则已在
           // 判定器之前处理，因此这里只对已达到阈值的 neutral 工具/模式键执行学习兜底。
-          const learnedKey = learnKey(toolName, mode, 'neutral')
+          // 学习计数按会话隔离：别的会话攒到的确认次数不能在这里替本会话放行。
+          const learnedKey = learnKey(sessionId, toolName, mode, 'neutral')
           const learnedThreshold = config.riskyThreshold || 3
           const learnedCount = learning.stats[learnedKey] || 0
           if (learning.enabled && learnedCount >= learnedThreshold) {
@@ -2406,18 +2547,20 @@ export default {
         }
 
         // 4f. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
+        //    拒绝侧**有意不过滤会话**（用户 2026-10-03 决策）：跨会话只会多弹一次人工，
+        //    绝不会自动放行任何东西，保持全局是更安全的一侧。
         if (matchRule(config.denyRules, toolName, mode, cat, ruleMatchContext)) {
           audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
         // 4g. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
-        const key = learnKey(toolName, mode, cat)
-        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, ruleMatchContext)
+        const key = learnKey(sessionId, toolName, mode, cat)
+        const learnedRule = matchRule(rulesForSession(config.allowRules, sessionId), toolName, mode, cat, ruleMatchContext)
         if (learnedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
-          saveJson(LEARNING_PATH, learning)
+          saveLearning()
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'learned', displayOpts)
           return 'allowed-once'
         }
@@ -2435,19 +2578,19 @@ export default {
           if (fpHit) {
             // ① 指纹确定性命中（用户确认过该操作）→ 自动放行 + 沉淀规则
             if (learning.enabled) {
-              const rule = { tool: toolName, category: cat, contains: fingerprint }
+              const rule = { tool: toolName, category: cat, contains: fingerprint, sessionId: String(sessionId) }
               if (mode) rule.mode = mode
-              if (!config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+              if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                 rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} 人工确认后自动放行`
                 config.allowRules.push(rule)
                 saveJson(ALLOWLIST_PATH, config)
-                audit(`LEARN   ${key} 已沉淀白名单 ${JSON.stringify(rule)}`)
+                audit(`LEARN   ${key} 已沉淀白名单（限本会话）${JSON.stringify(rule)}`)
               }
             }
             audit(`ALLOW   ${toolName} mode=${mode || 'none'} (neutral-learned=${confirmed + 1}/${threshold}) | ${reason.slice(0, 100)}`)
             delete learning.stats[key]
             delete learning.history[key]
-            saveJson(LEARNING_PATH, learning)
+            saveLearning()
             recordAutoAllow(sessionId, toolName, mode, reason, justification, 'fpHit', displayOpts)
             return 'allowed-once'
           }
@@ -2459,17 +2602,17 @@ export default {
             if (sim.verdict === 'same') {
               // 判同类 → 自动放行；有指纹则沉淀规则（无指纹不沉淀，保留样本供后续验证）
               if (learning.enabled && fingerprint) {
-                const rule = { tool: toolName, category: cat, contains: fingerprint }
+                const rule = { tool: toolName, category: cat, contains: fingerprint, sessionId: String(sessionId) }
                 if (mode) rule.mode = mode
-                if (!config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+                if (!config.allowRules.some((r) => sameAllowRule(r, rule))) {
                   rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} flash 同类验证`
                   config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
-                  audit(`LEARN   ${key} flash 判同类，已沉淀白名单 ${JSON.stringify(rule)}`)
+                  audit(`LEARN   ${key} flash 判同类，已沉淀白名单（限本会话）${JSON.stringify(rule)}`)
                 }
                 delete learning.stats[key]
                 delete learning.history[key]
-                saveJson(LEARNING_PATH, learning)
+                saveLearning()
               } else {
                 // 无指纹：不沉淀，保留样本与阈值位（下次同操作仍靠 flash 验证放行）
                 audit(`SAME    ${toolName} mode=${mode || 'none'} category=${cat} flash 判同类（无指纹，未沉淀）| ${reason.slice(0, 100)}`)
@@ -2491,7 +2634,7 @@ export default {
           if (outcome === 'allowed-once' && learning.enabled) {
             // 批准 → 记录本次操作样本（背景+指纹）；计数保持阈值位
             recordSample(key, justification)
-            saveJson(LEARNING_PATH, learning)
+            saveLearning()
             recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
           } else if (outcome === 'rejected') {
             // 拒绝 → 永久人工（带指纹；提取不到则拦全部同类，拒绝从严）
@@ -2505,7 +2648,7 @@ export default {
             }
             delete learning.stats[key]
             delete learning.history[key]
-            saveJson(LEARNING_PATH, learning)
+            saveLearning()
             recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, displayOpts))
           }
           return outcome
@@ -2522,7 +2665,7 @@ export default {
           // 批准 → 确认计数 +1，并记录本次操作样本（未达阈值，下次同类仍人工确认）
           learning.stats[key] = confirmed + 1
           recordSample(key, justification)
-          saveJson(LEARNING_PATH, learning)
+          saveLearning()
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed + 1, threshold, category: cat, path: 'neutral-confirm' }, displayOpts))
         } else if (outcome === 'rejected') {
           // 拒绝 → 升级为永久人工规则（带操作指纹；提取不到则拦全部同类，拒绝从严）
@@ -2537,7 +2680,7 @@ export default {
           }
           delete learning.stats[key]
           delete learning.history[key]
-          saveJson(LEARNING_PATH, learning)
+          saveLearning()
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat, path: 'neutral-reject' }, displayOpts))
         }
         // cancelled/unavailable：不计数（用户未表态，下次仍人工确认）

@@ -489,6 +489,30 @@ function inspect(node, out, renderer) {
   console.log('  ✓ 裁判模型卡片：目录可用走下拉框，目录不可用退化手填')
 }
 
+// ================= 6c. 白名单卡片：作用域标签与旧沉淀停用标注 =================
+{
+  // legacyInactive / sessionScoped 由 host 计算（见 test/reconsider.test.mjs 5b），
+  // 这里只验证前端把它们画对：本会话沉淀 / 旧沉淀已停用 / 用户。
+  const env = createEnv([], {
+    config: {
+      allowRules: [
+        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'a.yaml', description: '自动沉淀：中立 人工确认后自动放行', sessionId: 'sess-abc123def456', sessionScoped: true, legacyInactive: false },
+        { tool: 'write', mode: 'danger-full-access', category: 'neutral', contains: 'b.yaml', description: '自动沉淀：中立 人工确认后自动放行', sessionScoped: false, legacyInactive: true },
+        { tool: 'edit', mode: 'workspace-write', category: 'neutral', contains: 'c.yaml', description: '用户自定义', sessionScoped: false, legacyInactive: false },
+      ],
+    },
+  })
+  const booted = boot(env)
+  const tree = await renderSettled(booted, booted.component('dsh-approval-gate.settings'), {})
+  const info = inspect(tree)
+  assert.ok(/本会话沉淀/.test(info.text), 'a session-scoped learned rule is labelled as session-scoped')
+  assert.ok(/会话 sess-abc123d/.test(info.text), 'the owning session is shown (truncated to 12 chars)')
+  assert.ok(/旧沉淀 · 已停用/.test(info.text), 'an owner-less legacy learned rule is labelled retired')
+  assert.ok(/用户/.test(info.text), 'a user-authored rule keeps its own tag')
+  assert.ok(/只在它产生的那个会话生效/.test(info.text), 'the card explains the per-session scope')
+  console.log('  ✓ 白名单卡片：本会话沉淀 / 旧沉淀已停用 / 用户 三种标签与作用域说明')
+}
+
 // ================= 7. 审批说明中文化：zh 字段优先渲染 =================
 {
   // 模型写的 justification 可能是英文（子代理/其他 provider 尤其常见）；host 侧会用结构化

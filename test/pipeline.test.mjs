@@ -428,13 +428,17 @@ function boot(opts) {
 }
 
 // ================= 10c. 已满学习阈值 + 判定器不可用 → 不应继续要求人工审批 =================
+// 学习计数按会话隔离（用户 2026-10-03 决策「审批只在当前会话生效」），
+// 因此 key 是 sessionId|tool|mode|category。
 {
   const learningPath = join(dataDir, 'learning.json')
+  const SESSION = 's-threshold-judge-down'
+  const LEARN_KEY = SESSION + '|pwsh|danger-full-access|neutral'
   writeFileSync(learningPath, JSON.stringify({
     enabled: true,
-    stats: { 'pwsh|danger-full-access|neutral': 6 },
+    stats: { [LEARN_KEY]: 6 },
     history: {
-      'pwsh|danger-full-access|neutral': [
+      [LEARN_KEY]: [
         { fp: null, ctx: '查询 CI 构建运行状态', ts: new Date().toISOString() },
         { fp: null, ctx: '读取 CI 构建失败日志定位具体错误', ts: new Date().toISOString() },
         { fp: null, ctx: '等待并检查 CI 构建运行状态', ts: new Date().toISOString() },
@@ -444,7 +448,7 @@ function boot(opts) {
 
   const { state } = boot({ judgeReply: () => { throw new Error('judge down') } })
   const req = makeReq({
-    sessionId: 's-threshold-judge-down',
+    sessionId: SESSION,
     toolName: 'pwsh',
     justification: '读取 CI 失败日志定位具体错误行',
     args: { command: 'gh run view 123 --log-failed' },
@@ -454,7 +458,20 @@ function boot(opts) {
   assert.strictEqual(result.outcome, 'allowed-once', 'learned neutral operation must auto-approve when the judge is unavailable')
   assert.strictEqual(result.nextCalls, 0, 'learning threshold must prevent another human prompt')
   assert.ok(state.streamAttempts >= 2, 'the unavailable judge path is exercised before learned fallback')
-  console.log('  ✓ 学习已满阈值且判定器不可用 → 自动放行，不再重复人工审批')
+
+  // 核心断言：同一份学习状态对**别的会话**无效 —— 换会话后必须重新走人工。
+  // 去掉会话前缀隔离（回到全局 key）本断言立刻变红。
+  const other = makeReq({
+    sessionId: 's-other-session',
+    toolName: 'pwsh',
+    justification: '读取 CI 失败日志定位具体错误行',
+    args: { command: 'gh run view 456 --log-failed' },
+    callId: 'threshold-failed-2',
+  })
+  const otherResult = await decide(null, other, 'allowed-once')
+  assert.strictEqual(otherResult.nextCalls, 1,
+    'another session must NOT inherit the learned threshold — approvals only apply to the session that earned them')
+  console.log('  ✓ 学习已满阈值且判定器不可用 → 自动放行；换会话后不继承（审批只在当前会话生效）')
 }
 
 // ================= 10d. 判定器不可用转人工、用户批准 → 沉淀带指纹的放行规则 =================
