@@ -4,6 +4,28 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.13] — 2026-10-09
+
+**New "full export / import": move a machine's rules and settings to another machine in one file.** The user asked: "add a full export of the plugin's settings, so the rules and settings a machine already has can be imported on another machine and start working right away".
+
+Until now the only sync channel was the **repository seed**: the summary rules in `allowlist.json` are merged into the local config at startup, but they cannot carry what you accumulated locally — your own allow rules, the `denyRules` promoted from rejections, thresholds/timeouts/switches, the judge model, learning progress. On a new machine you had to click it all in again.
+
+- **Two new server endpoints** (same credential + origin fence as the other `/api/auto-approve/*` routes):
+  - `GET /api/auto-approve/export` → a JSON settings bundle (`kind: dsh-approval-gate-settings`, `bundleVersion: 1`, export time, plugin version, platform, config, learning progress, permission-preset state) with a `content-disposition` filename (timestamp only — no host or user name)
+  - `POST /api/auto-approve/import` → validate, sanitise, write; returns counts, warnings and the backup path
+- **Import semantics** (chosen in the settings page; the safest option is the default):
+  - **Merge** (default): rule arrays are unioned by "tool/mode/category/fingerprint + session ownership", local-only rules survive; **idempotent**, importing twice adds nothing twice
+  - **Replace**: rule arrays are replaced by the bundle's (local-only rules disappear; a backup is taken first)
+  - "Judge parameters and judge model" is imported **by default** (threshold / timeout / failure limit / output cap / scope auto-allow / outside-needs-human / sediment scope / judge model); uncheck it to touch rules only
+  - "Promote session rules to global" is **off** by default: session ids never match across machines, so such rules would never fire (when checked, each rule is rewritten to `scope: global` without `sessionId`, and the count is reported)
+  - "Learning progress" is **off** by default: learning keys look like `session|tool|mode|category` and rarely match on another machine
+- **Always backs up before importing**: `$DSH_HOME/auto-approve/import-backup-<timestamp>.json` keeps the pre-import `allowlist` and `learning` so the whole thing can be rolled back. A rejected import (wrong kind / too-new version / missing `config`) **writes nothing and leaves no backup**
+- **Allow-listed fields only**: the bundle's `config` accepts 14 known keys and rule objects accept 8 fields; invalid values (threshold 0, a 1e8 timeout, non-boolean switches, illegal enums) are dropped, and a rule with `scope: session` but no `sessionId` is dropped outright (under `ruleScope` semantics it can never fire — importing it would only make you believe it allows something). Caps: 5000 entries, 500 chars per field
+- **The bundle carries no machine paths** (only `platform` and the profile name) — a file meant to travel between machines should not drag local directory structure along
+- **It never writes the profile's `cordis.patch.yml`**: the permission preset stays with the existing "one-click configure preset" card (editing the profile while a session runs triggers an HMR reload that can interrupt an in-flight turn). If the bundle says the source machine had the preset configured and this machine does not, the UI points you at that card
+- If the imported judge-model provider is not registered on this machine, the response warns that "the judge will fail and fall back to human approval" — the judge model is machine-local, and copying another machine's value is the easiest trap
+- New `test/export-import.test.mjs` (22 assertions across three isolated temporary `DSH_HOME`s that stand in for "another machine": export content, sanitising, merge/replace, idempotency, session promotion, the learning switch, backups, rejected input writing nothing), plus 4 card-render assertions in `client-render-smoke`; all 15 test files green
+
 ## [0.9.12] — 2026-10-05
 
 **Fixes the "pending" badge: non-re-approvable rejections no longer pin it at 1.** The user asked live: "why is there a pending 1?"

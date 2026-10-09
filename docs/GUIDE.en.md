@@ -201,6 +201,38 @@ The following are **machine-local** and are never synchronised (set them per mac
 - `judgeTimeoutMs`: single flash judgment timeout (default 20000ms; auto-retries once, then goes to human)
 - `judgeFailureLimit`: consecutive judge failures per session before one manual human approval is offered (default 3, **machine-local**, never synchronised between machines)
 
+### Full export / import (v0.9.13+)
+
+"Sharing rules across machines" only synchronises the aggregated ruleset in the repository seed; it cannot carry what you accumulated on this machine. The **"Backup & migration · full export / import"** card in the settings page adds that channel: export this machine's rules and judge settings as a single JSON file, import it on another machine, and start using it right away.
+
+What the export (`GET /api/auto-approve/export`) contains:
+
+| Section | Contents |
+|---|---|
+| `config` | `allowRules` / `denyRules` / `denyKeywords` / `hardCategories`; `riskyThreshold` / `judgeTimeoutMs` / `judgeFailureLimit` / `judgeMaxTokens`; `sedimentScope` / `scopeAutoAllow` / `outsideNeedsHuman` / `learning.enabled`; `judgeModel` |
+| `learning` | Learning counters and samples (`stats` / `history`) |
+| `preset` | Whether the source machine had the permission preset configured (informational; the import never writes the profile because of it) |
+| Metadata | `kind` / `bundleVersion` / `exportedAt` / `pluginVersion` / `source.platform` / `source.profile` |
+
+The bundle carries **no machine paths, no credentials and no approval history** (`events.jsonl` / `audit.log` / `snapshots/` are all excluded).
+
+Import (`POST /api/auto-approve/import`; pick the bundle in the settings page, choose the options, then press "Confirm import"):
+
+| Option | Default | Meaning |
+|---|---|---|
+| Mode | **Merge** | Merge = union of rule arrays (deduplicated by "tool/mode/category/fingerprint + session ownership", local-only rules survive, idempotent); Replace = rule arrays come from the bundle |
+| Judge parameters and judge model | on | Turn it off to import rules only; thresholds/timeouts/switches/sediment scope/judge model keep their local values |
+| Promote session rules to global | off | Session ids never match across machines, so such rules would **never fire**; when checked each rule is rewritten to `scope: global` without `sessionId` |
+| Learning progress | off | Learning keys look like `session\|tool\|mode\|category` and rarely match on another machine — useful only when cloning one machine's data |
+
+Safety boundaries:
+
+- **A backup is always written first** to `$DSH_HOME/auto-approve/import-backup-<timestamp>.json` (pre-import `allowlist` and `learning`), so the whole thing can be rolled back
+- A rejected import (wrong `kind` / `bundleVersion` newer than this plugin / missing `config`) **writes nothing and leaves no backup**
+- Allow-listed fields only: 14 known `config` keys and 8 rule-object fields; invalid values (threshold 0, a 1e8 timeout, non-boolean switches, illegal enums) are dropped, and a rule with `scope: session` but no `sessionId` is dropped outright (under `ruleScope` semantics it can never fire — keeping it would only make you believe it allows something). Caps: 5000 entries / 500 chars per field
+- **It never writes the profile's `cordis.patch.yml`**: the permission preset stays with the "one-click configure preset" card (editing the profile while a session runs triggers an HMR reload that can interrupt an in-flight turn). When the bundle says the source machine had the preset configured and this machine does not, the UI points you at that card
+- If the imported judge-model provider is not among this machine's registered routes, the response warns that "the judge will fail and fall back to human approval" — `judgeModel` is **machine-local**, so do not copy another machine's value
+
 ## Usage
 
 Select **"Auto Approval (Flash)"** in the session's permission dropdown (`/permission` dialog or settings). Other sessions are unaffected (gated per session preset).
@@ -210,6 +242,7 @@ Select **"Auto Approval (Flash)"** in the session's permission dropdown (`/permi
 A new "Auto Approval" section in the DSH settings panel (`settings.section`, styled like native DSH settings) provides visual rule management, cards ordered by pipeline stage:
 
 - **Setup card**: detects whether the `auto-approve` permission preset exists in `cordis.patch.yml`; if missing, click "Configure" to write it automatically (text-level edit, comments preserved), effective after restart
+- **Backup & migration** (v0.9.13): "full export / import" — export rules and judge settings as one JSON file and import it on another machine (see "Full export / import")
 - **Pipeline overview**: judgment pipeline + active hard-risk category badges
 - **① DENY · deny list** (`denyKeywords`): view/add/remove dangerous keywords (removing a predefined keyword asks for confirmation)
 - **② Allow list** (`allowRules`): view (source tags 预置/沉淀/用户 plus scope tags **全局** / **本会话**; session rules show their owner) / add (tool/mode/category/contains form) / remove / **promote to global** (one click for a session rule). The card top holds the **"new approval sediment scope"** setting: this session (default) / global
@@ -217,7 +250,7 @@ A new "Auto Approval" section in the DSH settings panel (`settings.section`, sty
 - **④ Flash · thresholds & timeout**: edit `riskyThreshold` (within one session, auto-approve starts at the N+1th occurrence after N confirmations) / `judgeTimeoutMs` / `judgeFailureLimit` directly
 - **⑤ Learning · in progress**: confirmation counts (n/N) + samples; counting is **per session** (the key is `session|tool|mode|category`, the UI shows the last three plus the session), with a **"Stop" button** to intervene (removes count and samples, restarts learning)
 
-All changes go through `POST /api/auto-approve/rules` into `allowlist.json` — **hot-reloaded immediately** (no restart); `POST /api/auto-approve/setup` handles one-click setup.
+All changes go through `POST /api/auto-approve/rules` into `allowlist.json` — **hot-reloaded immediately** (no restart); `POST /api/auto-approve/setup` handles one-click setup; `GET /api/auto-approve/export` and `POST /api/auto-approve/import` handle the full export / import.
 
 ## Human Review UI (v0.4.0+)
 

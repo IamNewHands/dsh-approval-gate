@@ -1273,6 +1273,348 @@ function applyRuleOp(op, kind, value) {
   return { ok: false, error: `未知操作: ${op}` }
 }
 
+// ---- 全量设置导出 / 导入（跨机器迁移：规则 + 判定参数 + 学习进度）----
+//
+// 为什么需要它：用户自己的规则与判定参数只存在 $DSH_HOME/auto-approve/ 下
+// （allowlist.json / learning.json），换一台机器就得从头点一遍。仓库种子
+// （仓库根 allowlist.json）只能带「汇总版」规则，带不走用户新增的规则、
+// 拒绝升级规则、阈值与裁判模型。
+//
+// 导出包是**纯数据**：不含机器绝对路径、不含凭据；导入端只认 kind 与白名单字段，
+// 未识别的键一律丢弃。两条刻意不做的写入：
+//   1. 不覆盖版本号 —— 仓库种子（bundledSeed）是权威，本机不自行降级
+//   2. 不写 profile 的 cordis.patch.yml —— 那是设置页「初始化权限预设」卡片的职责，
+//      且会话运行期改 profile 会触发 HMR 重载（可能打断在途 turn）
+
+/** 导出包标识：导入端只认它，避免把任意 JSON 当成设置包写进本地配置 */
+const SETTINGS_BUNDLE_KIND = 'dsh-approval-gate-settings'
+const SETTINGS_BUNDLE_VERSION = 1
+
+/** 导出包携带的配置键（白名单）；导入端同样只认这些键 */
+const BUNDLE_CONFIG_KEYS = [
+  'version', 'denyKeywords', 'allowRules', 'denyRules', 'hardCategories',
+  'riskyThreshold', 'judgeTimeoutMs', 'judgeFailureLimit', 'judgeMaxTokens',
+  'judgeModel', 'sedimentScope', 'scopeAutoAllow', 'outsideNeedsHuman', 'learning',
+]
+
+/** 规则对象允许携带的字段（白名单）：未来版本新增的内部字段不会被旧版导入 */
+const BUNDLE_RULE_FIELDS = ['tool', 'mode', 'category', 'contains', 'description', 'keywords', 'scope', 'sessionId']
+
+/** 导入体量上限：超出部分截断（5000 条规则的包约 1MB，正常使用远低于此） */
+const BUNDLE_MAX_RULES = 5000
+const BUNDLE_MAX_KEYWORDS = 32
+const BUNDLE_MAX_STRING = 500
+
+/** 插件自身版本（导出包的溯源信息；读不到就留空，不影响导入） */
+function pluginVersion() {
+  const pkg = loadJson(join(__dirname, '..', 'package.json'), null)
+  return pkg && typeof pkg.version === 'string' ? pkg.version : ''
+}
+
+/** 字符串列表消毒：去空、去重、截断长度与条数 */
+function sanitizeStringList(value, options = {}) {
+  const max = options.max || BUNDLE_MAX_RULES
+  const itemMax = options.itemMax || BUNDLE_MAX_STRING
+  if (!Array.isArray(value)) return []
+  const out = []
+  const seen = new Set()
+  for (const item of value) {
+    if (out.length >= max) break
+    const s = String(item == null ? '' : item).trim().slice(0, itemMax)
+    if (!s || seen.has(s)) continue
+    seen.add(s)
+    out.push(s)
+  }
+  return out
+}
+
+/**
+ * 规则列表消毒：只保留白名单字段，丢弃空规则。
+ *
+ * 作用域字段按 ruleScope 的语义收紧：
+ *   - `scope: 'global'` 丢掉 sessionId（全局规则带会话归属是自相矛盾的数据）
+ *   - `scope: 'session'` 却没有 sessionId → 按 ruleScope 语义这条规则永不生效（'none'），
+ *     直接丢弃，免得导入一份「看着在、其实不生效」的规则
+ *   - 无 scope 但有 sessionId → 原样保留（0.9.3 的会话作用域写法，ruleScope 认得）
+ */
+function sanitizeRuleList(value, options = {}) {
+  const max = options.max || BUNDLE_MAX_RULES
+  if (!Array.isArray(value)) return []
+  const out = []
+  for (const item of value) {
+    if (out.length >= max) break
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const rule = {}
+    for (const field of BUNDLE_RULE_FIELDS) {
+      if (!(field in item)) continue
+      if (field === 'keywords') {
+        const keywords = sanitizeStringList(item.keywords, { max: BUNDLE_MAX_KEYWORDS, itemMax: 200 })
+        if (keywords.length > 0) rule.keywords = keywords
+        continue
+      }
+      const s = String(item[field] == null ? '' : item[field]).trim().slice(0, BUNDLE_MAX_STRING)
+      if (s) rule[field] = s
+    }
+    if (rule.scope !== undefined && rule.scope !== 'global' && rule.scope !== 'session') delete rule.scope
+    if (rule.scope === 'global') delete rule.sessionId
+    if (rule.scope === 'session' && !rule.sessionId) continue
+    if (!rule.tool && !rule.mode && !rule.category && !rule.contains && !(rule.keywords && rule.keywords.length)) continue
+    out.push(rule)
+  }
+  return out
+}
+
+/** 导出用配置快照：显式挑键 + 深拷贝，绝不把内存里的配置对象本身交出去 */
+function exportableConfig() {
+  const picked = {}
+  for (const key of BUNDLE_CONFIG_KEYS) if (config[key] !== undefined) picked[key] = config[key]
+  return JSON.parse(JSON.stringify(picked))
+}
+
+/** 构造导出包（全量：规则 + 判定参数 + 学习进度 + 权限预设状态） */
+function buildSettingsBundle(permissionPresets) {
+  reloadConfig()
+  return {
+    kind: SETTINGS_BUNDLE_KIND,
+    bundleVersion: SETTINGS_BUNDLE_VERSION,
+    exportedAt: new Date().toISOString(),
+    pluginVersion: pluginVersion(),
+    configVersion: config.version || CONFIG_VERSION,
+    source: { platform: process.platform, profile: process.env.DSH_PROFILE || '' },
+    config: exportableConfig(),
+    learning: {
+      enabled: learning.enabled !== false,
+      stats: JSON.parse(JSON.stringify(learning.stats || {})),
+      history: JSON.parse(JSON.stringify(learning.history || {})),
+    },
+    preset: { configured: getSetupState(permissionPresets).configured === true },
+  }
+}
+
+/** 导入包消毒：把外部 JSON 收敛成一份「只含白名单键与合法取值」的配置片段 */
+function sanitizeBundleConfig(raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const out = {}
+  if (Array.isArray(src.denyKeywords)) out.denyKeywords = sanitizeStringList(src.denyKeywords)
+  if (Array.isArray(src.allowRules)) out.allowRules = sanitizeRuleList(src.allowRules)
+  if (Array.isArray(src.denyRules)) out.denyRules = sanitizeRuleList(src.denyRules)
+  if (Array.isArray(src.hardCategories)) out.hardCategories = sanitizeStringList(src.hardCategories, { itemMax: 64 })
+  const num = (value, min, max) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n >= min && n <= max ? n : undefined
+  }
+  const threshold = num(src.riskyThreshold, 1, 1000)
+  if (threshold !== undefined) out.riskyThreshold = threshold
+  const timeout = num(src.judgeTimeoutMs, 1000, 600000)
+  if (timeout !== undefined) out.judgeTimeoutMs = timeout
+  const failureLimit = num(src.judgeFailureLimit, 1, 100)
+  if (failureLimit !== undefined) out.judgeFailureLimit = failureLimit
+  const maxTokens = num(src.judgeMaxTokens, 128, 200000)
+  if (maxTokens !== undefined) out.judgeMaxTokens = maxTokens
+  if (src.judgeModel && typeof src.judgeModel === 'object' && !Array.isArray(src.judgeModel)) {
+    out.judgeModel = {
+      provider: String(src.judgeModel.provider || '').trim().slice(0, 200),
+      model: String(src.judgeModel.model || '').trim().slice(0, 200),
+    }
+  }
+  if (src.sedimentScope === 'global' || src.sedimentScope === 'session') out.sedimentScope = src.sedimentScope
+  if (typeof src.scopeAutoAllow === 'boolean') out.scopeAutoAllow = src.scopeAutoAllow
+  if (typeof src.outsideNeedsHuman === 'boolean') out.outsideNeedsHuman = src.outsideNeedsHuman
+  if (src.learning && typeof src.learning === 'object' && !Array.isArray(src.learning)) {
+    out.learning = { enabled: src.learning.enabled !== false }
+  }
+  return out
+}
+
+/** 学习进度消毒：stats 是 key→计数，history 是 key→样本数组 */
+function sanitizeLearningMap(value, withHistory) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const out = {}
+  for (const key of Object.keys(src).slice(0, LEARNING_MAX_KEYS)) {
+    const k = String(key || '').slice(0, 200)
+    if (!k) continue
+    if (!withHistory) {
+      const n = Number(src[key])
+      if (Number.isFinite(n) && n >= 0) out[k] = Math.floor(n)
+      continue
+    }
+    const list = Array.isArray(src[key]) ? src[key] : []
+    const samples = []
+    for (const sample of list.slice(-10)) {
+      const s = sample && typeof sample === 'object' ? sample : {}
+      const fp = String(s.fp == null ? '' : s.fp).slice(0, 200)
+      const ctx = String(s.ctx == null ? '' : s.ctx).slice(0, 400)
+      if (!fp && !ctx) continue
+      samples.push({ fp, ctx })
+    }
+    if (samples.length > 0) out[k] = samples
+  }
+  return out
+}
+
+/**
+ * 导入全量设置。
+ *
+ * @param {object} bundle 导出包（buildSettingsBundle 的产物或同构 JSON）
+ * @param {{mode?: string, importSettings?: boolean, importLearning?: boolean, globalizeSession?: boolean}} options
+ * @returns {{ok: boolean, error?: string, mode?: string, backupPath?: string, applied?: object, warnings?: string[]}}
+ *
+ * 语义：
+ *   - mode='replace' 规则数组按导入包覆盖；mode='merge'（默认）按「工具/模式/类别/指纹 +
+ *     会话归属」并集，本机独有规则保留
+ *   - importSettings（默认开）导入阈值/超时/开关/沉淀作用域/裁判模型；关掉只动规则
+ *   - globalizeSession（默认关）把导入的会话作用域规则提升为全局 —— 跨机器会话 id 对不上，
+ *     这类规则不提升则永不生效
+ *   - importLearning（默认关）导入学习进度；key 带会话前缀，跨机器通常不会命中
+ *   - 写入前必定留一份回滚备份（$DSH_HOME/auto-approve/import-backup-<时间戳>.json）
+ */
+function importSettingsBundle(bundle, options = {}) {
+  const warnings = []
+  if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) {
+    return { ok: false, error: '导入内容不是 JSON 对象' }
+  }
+  if (bundle.kind !== SETTINGS_BUNDLE_KIND) {
+    return { ok: false, error: `不是 dsh-approval-gate 的设置包（kind=${JSON.stringify(bundle.kind)}）` }
+  }
+  const bundleVersion = Number(bundle.bundleVersion)
+  if (Number.isFinite(bundleVersion) && bundleVersion > SETTINGS_BUNDLE_VERSION) {
+    return { ok: false, error: `设置包版本 ${bundleVersion} 高于本插件支持的 ${SETTINGS_BUNDLE_VERSION}，请先升级插件` }
+  }
+  if (!bundle.config || typeof bundle.config !== 'object' || Array.isArray(bundle.config)) {
+    return { ok: false, error: '设置包缺少 config 段' }
+  }
+
+  // 以磁盘上的最新配置为基准（与审批热更新同源），避免拿内存里的旧快照做并集
+  reloadConfig()
+
+  const mode = options.mode === 'replace' ? 'replace' : 'merge'
+  const incoming = sanitizeBundleConfig(bundle.config)
+  const importSettings = options.importSettings !== false
+  const globalizeSession = options.globalizeSession === true
+  const importLearning = options.importLearning === true
+
+  // 回滚备份：写任何东西之前先落盘一份当前状态（含 learning），导入不满意可整份取回
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const backupPath = join(DATA_DIR, `import-backup-${stamp}.json`)
+  saveJson(backupPath, {
+    kind: 'dsh-approval-gate-import-backup',
+    createdAt: new Date().toISOString(),
+    allowlist: exportableConfig(),
+    learning: { enabled: learning.enabled !== false, stats: learning.stats || {}, history: learning.history || {} },
+  })
+
+  /** 会话作用域规则跨机器不会命中（sessionId 对不上），按需提升为全局 */
+  const globalize = (list) => {
+    let promoted = 0
+    const mapped = list.map((rule) => {
+      if (ruleScope(rule) === 'global') return rule
+      promoted += 1
+      const copy = Object.assign({}, rule, { scope: 'global' })
+      delete copy.sessionId
+      return copy
+    })
+    return { mapped, promoted }
+  }
+
+  const applied = { mode, globalized: 0, rules: {}, settings: [] }
+
+  // ---- 规则数组（字符串型：危险词 / 硬类别）----
+  for (const kind of ['denyKeywords', 'hardCategories']) {
+    const next = incoming[kind]
+    if (!Array.isArray(next)) continue
+    if (mode === 'replace') {
+      const before = (config[kind] || []).length
+      config[kind] = next.slice()
+      applied.rules[kind] = { replaced: next.length, droppedLocal: Math.max(0, before - next.length) }
+      continue
+    }
+    const current = Array.isArray(config[kind]) ? config[kind] : []
+    const seen = new Set(current.map((r) => ruleKey(kind, r)))
+    let added = 0
+    for (const rule of next) {
+      const k = ruleKey(kind, rule)
+      if (seen.has(k)) continue
+      seen.add(k)
+      current.push(rule)
+      added += 1
+    }
+    config[kind] = current
+    applied.rules[kind] = { added, skipped: next.length - added }
+  }
+
+  // ---- 规则数组（对象型：白名单 / 永久人工）----
+  for (const kind of ['allowRules', 'denyRules']) {
+    const next = incoming[kind]
+    if (!Array.isArray(next)) continue
+    const base = kind === 'allowRules' && globalizeSession ? globalize(next) : { mapped: next, promoted: 0 }
+    applied.globalized += base.promoted
+    if (mode === 'replace') {
+      const before = (config[kind] || []).length
+      config[kind] = base.mapped.map((r) => Object.assign({}, r))
+      applied.rules[kind] = { replaced: base.mapped.length, droppedLocal: Math.max(0, before - base.mapped.length) }
+      continue
+    }
+    const current = Array.isArray(config[kind]) ? config[kind] : []
+    let added = 0
+    for (const rule of base.mapped) {
+      if (current.some((r) => sameAllowRule(r, rule))) continue
+      current.push(Object.assign({}, rule))
+      added += 1
+    }
+    config[kind] = current
+    applied.rules[kind] = { added, skipped: base.mapped.length - added }
+  }
+
+  // ---- 判定参数与裁判模型 ----
+  if (importSettings) {
+    for (const key of ['riskyThreshold', 'judgeTimeoutMs', 'judgeFailureLimit', 'judgeMaxTokens']) {
+      if (incoming[key] === undefined) continue
+      config[key] = incoming[key]
+      applied.settings.push(key)
+    }
+    for (const key of ['scopeAutoAllow', 'outsideNeedsHuman']) {
+      if (incoming[key] === undefined) continue
+      config[key] = incoming[key]
+      applied.settings.push(key)
+    }
+    if (incoming.sedimentScope !== undefined) {
+      config.sedimentScope = incoming.sedimentScope
+      applied.settings.push('sedimentScope')
+    }
+    if (incoming.judgeModel !== undefined) {
+      config.judgeModel = incoming.judgeModel
+      applied.settings.push('judgeModel')
+    }
+    if (incoming.learning !== undefined) {
+      config.learning = Object.assign({}, config.learning, { enabled: incoming.learning.enabled })
+      learning.enabled = config.learning.enabled !== false
+      applied.settings.push('learning.enabled')
+    }
+  } else {
+    warnings.push('按你的选择跳过了判定参数与裁判模型（只导入规则）')
+  }
+
+  // ---- 学习进度 ----
+  if (importLearning) {
+    if (bundle.learning && typeof bundle.learning === 'object') {
+      learning.stats = sanitizeLearningMap(bundle.learning.stats, false)
+      learning.history = sanitizeLearningMap(bundle.learning.history, true)
+      saveLearning()
+      applied.learning = { stats: Object.keys(learning.stats).length, history: Object.keys(learning.history).length }
+    } else {
+      warnings.push('设置包里没有学习进度，已跳过')
+    }
+  }
+
+  // 版本号不随导入包走：仓库种子（bundledSeed）是权威，本机不自行降级
+  saveJson(ALLOWLIST_PATH, config)
+  audit(`IMPORT 全量设置 mode=${mode} settings=${applied.settings.length} learning=${importLearning} globalized=${applied.globalized} backup=${backupPath}`)
+  if (applied.globalized > 0) {
+    warnings.push(`已把 ${applied.globalized} 条会话作用域规则提升为全局（跨机器会话 id 对不上，不提升则永不生效）`)
+  }
+  return { ok: true, mode, backupPath, applied, warnings }
+}
+
 const CATEGORY_LABELS = {
   deletion: '删除操作',
   credential: '凭据修改',
@@ -1930,6 +2272,8 @@ export function judgeModelCandidates(judgeModel, selection) {
 }
 
 export { normalizeConfig, mergeSharedRules, migrateJudgeModel, ruleKey, looksDeny, matchRule, ruleAnchorText, SHARED_RULE_KEYS, normalizeMatchText, extractFingerprintCandidates }
+// 全量设置导出/导入：供设置页 API 与 test/export-import.test.mjs 使用
+export { buildSettingsBundle, importSettingsBundle, sanitizeBundleConfig, sanitizeRuleList, SETTINGS_BUNDLE_KIND, SETTINGS_BUNDLE_VERSION, BUNDLE_CONFIG_KEYS }
 
 export default {
   name: NAME,
@@ -2117,6 +2461,89 @@ export default {
       }
     } catch (error) {
       console.error(`[${NAME}] 注册规则/初始化 API 失败`, error)
+    }
+
+    // ---- 全量设置导出 / 导入 API（设置页「备份与迁移」卡片；跨机器同步规则与判定参数）----
+    let offExportRoute = null
+    let offImportRoute = null
+    try {
+      if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+        offExportRoute = ctx.webServer.register({
+          kind: 'exact',
+          path: '/api/auto-approve/export',
+          handler: async (req, res) => {
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
+              return
+            }
+            if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+            try {
+              const bundle = buildSettingsBundle(permissionPresets)
+              const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')
+              res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-cache',
+                // 文件名只带时间戳，不带主机名/用户名（导出包会被拷到别的机器）
+                'content-disposition': `attachment; filename="dsh-approval-gate-settings-${stamp}.json"`,
+              })
+              res.end(JSON.stringify(bundle, null, 2))
+            } catch (e) {
+              res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) }))
+            }
+          },
+        })
+        offImportRoute = ctx.webServer.register({
+          kind: 'exact',
+          path: '/api/auto-approve/import',
+          handler: async (req, res) => {
+            const authRej = requestAuthRejection(ctx, req)
+            if (authRej !== undefined) {
+              res.writeHead(authRej, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ ok: false, error: authRej === 401 ? 'Unauthorized: DSH credential required' : 'Forbidden: untrusted origin' }))
+              return
+            }
+            const send = (code, obj) => {
+              res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
+              res.end(JSON.stringify(obj))
+            }
+            if (req.method !== 'POST') return send(405, { ok: false, error: 'method not allowed' })
+            try {
+              // 上限放宽到 8MB：一份 5000 条规则的设置包约 1MB
+              const body = await readBody(req, 8 * 1024 * 1024)
+              const result = importSettingsBundle(body && body.bundle, {
+                mode: body && body.mode,
+                importSettings: !(body && body.importSettings === false),
+                importLearning: !!(body && body.importLearning),
+                globalizeSession: !!(body && body.globalizeSession),
+              })
+              // 裁判模型是**机器本地**配置：导入的 provider 若本机没注册，判定会失败转人工。
+              // 只提示不阻断（用户可能稍后才装那个 provider）；目录拿不到时静默跳过。
+              if (result.ok && config.judgeModel && config.judgeModel.provider && llm && typeof llm.listProviders === 'function') {
+                try {
+                  const raw = await llm.listProviders()
+                  const ids = (Array.isArray(raw) ? raw : [])
+                    .map((p) => String((p && p.id) || ''))
+                    .filter(Boolean)
+                  if (ids.length > 0 && ids.indexOf(config.judgeModel.provider) < 0) {
+                    result.warnings.push(`导入的裁判模型 provider「${config.judgeModel.provider}」未在本机注册：判定会失败并转人工，请在「裁判模型」卡片改选本机可用路由`)
+                  }
+                } catch { /* 模型目录不可用：不阻断导入 */ }
+              }
+              return send(result.ok ? 200 : 400, result)
+            } catch (e) {
+              send(400, { ok: false, error: String((e && e.message) || e) })
+            }
+          },
+        })
+        console.log(`[${NAME}] 导出/导入 API 已注册：/api/auto-approve/export, /import`)
+      } else {
+        console.warn(`[${NAME}] webServer 不可用，导出/导入 API 未注册`)
+      }
+    } catch (error) {
+      console.error(`[${NAME}] 注册导出/导入 API 失败`, error)
     }
 
     // ---- 模型目录 API（设置页：裁判模型下拉框） ----
@@ -2536,6 +2963,8 @@ export default {
       if (offRulesRoute) { try { offRulesRoute() } catch (e) {} }
       if (offSetupRoute) { try { offSetupRoute() } catch (e) {} }
       if (offModelsRoute) { try { offModelsRoute() } catch (e) {} }
+      if (offExportRoute) { try { offExportRoute() } catch (e) {} }
+      if (offImportRoute) { try { offImportRoute() } catch (e) {} }
       if (offDiffRoute) { try { offDiffRoute() } catch (e) {} }
       if (offRevertRoute) { try { offRevertRoute() } catch (e) {} }
       if (offReconsiderRoute) { try { offReconsiderRoute() } catch (e) {} }

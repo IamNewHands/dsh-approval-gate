@@ -1235,6 +1235,14 @@ window.__ModuleLoader__.load({
       const [sedimentScope, setSedimentScope] = React.useState('session')
       const [scopeAutoAllow, setScopeAutoAllow] = React.useState(true)
       const [outsideNeedsHuman, setOutsideNeedsHuman] = React.useState(true)
+      // ---- 备份与迁移（全量导出 / 导入）----
+      // importFile = { name, bundle } | null：选中的设置包（已在前端校验 kind），
+      // 有值时渲染导入选项面板，点「确认导入」才真正写盘。
+      const [importFile, setImportFile] = React.useState(null)
+      const [importMode, setImportMode] = React.useState('merge')
+      const [importSettings, setImportSettings] = React.useState(true)
+      const [importLearning, setImportLearning] = React.useState(false)
+      const [globalizeSession, setGlobalizeSession] = React.useState(false)
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -1321,6 +1329,102 @@ window.__ModuleLoader__.load({
           .finally(function () { setBusy(false) })
       }
 
+      // ---- 备份与迁移：导出（服务端带 content-disposition，前端只负责触发下载）----
+      // 下载用「临时 anchor」而不是 window.open：失败时能拿到 JSON 错误并给出提示，
+      // 也不会把设置页导航走。anchor 用完即移除，不留任何常驻 DOM。
+      const exportSettings = function () {
+        setBusy(true)
+        fetch('/api/auto-approve/export', { headers: { 'cache-control': 'no-cache' } })
+          .then(function (r) { return r.json() })
+          .then(function (bundle) {
+            if (!bundle || bundle.kind !== 'dsh-approval-gate-settings') {
+              showFeedback('导出失败：' + JSON.stringify(bundle).slice(0, 160), false)
+              return
+            }
+            const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')
+            const name = 'dsh-approval-gate-settings-' + stamp + '.json'
+            const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }))
+            const a = document.createElement('a')
+            a.href = url
+            a.download = name
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            setTimeout(function () { URL.revokeObjectURL(url) }, 10000)
+            const c = bundle.config || {}
+            showFeedback('已导出 ' + name + '（白名单 ' + ((c.allowRules || []).length)
+              + ' · 永久人工 ' + ((c.denyRules || []).length)
+              + ' · 危险词 ' + ((c.denyKeywords || []).length) + '）')
+          })
+          .catch(function (e) { showFeedback('导出失败：' + String((e && e.message) || e), false) })
+          .finally(function () { setBusy(false) })
+      }
+
+      const pickImportFile = function (e) {
+        const file = e.target.files && e.target.files[0]
+        e.target.value = '' // 清空，同一个文件可以再次选择
+        if (!file) return
+        const reader = new FileReader()
+        reader.onload = function () {
+          let bundle = null
+          try { bundle = JSON.parse(String(reader.result || '')) } catch (err) { bundle = null }
+          if (!bundle || bundle.kind !== 'dsh-approval-gate-settings') {
+            setImportFile(null)
+            showFeedback('不是 dsh-approval-gate 的设置包（需要 kind=dsh-approval-gate-settings）', false)
+            return
+          }
+          setImportFile({ name: file.name, bundle: bundle })
+          showFeedback('已读取 ' + file.name + '，选好导入方式后点「确认导入」')
+        }
+        reader.onerror = function () { showFeedback('读取文件失败', false) }
+        reader.readAsText(file)
+      }
+
+      const runImport = function () {
+        if (!importFile) return
+        const sure = importMode === 'replace'
+          ? '覆盖导入：本机现有的白名单 / 永久人工 / 危险词 / 硬类别将被设置包替换。导入前会自动备份，可整份回滚。确定继续？'
+          : '合并导入：本机规则保留，只补齐设置包里本机没有的规则。确定继续？'
+        if (!window.confirm(sure)) return
+        setBusy(true)
+        fetch('/api/auto-approve/import', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            bundle: importFile.bundle,
+            mode: importMode,
+            importSettings: importSettings,
+            importLearning: importLearning,
+            globalizeSession: globalizeSession,
+          }),
+        })
+          .then(function (r) { return r.json() })
+          .then(function (res) {
+            if (!res || !res.ok) {
+              showFeedback('导入失败：' + String((res && res.error) || '未知错误'), false)
+              return
+            }
+            const rules = (res.applied && res.applied.rules) || {}
+            const bits = []
+            ;['allowRules', 'denyRules', 'denyKeywords', 'hardCategories'].forEach(function (k) {
+              const item = rules[k]
+              if (!item) return
+              bits.push(item.added !== undefined ? k + ' +' + item.added : k + ' ' + item.replaced + ' 条')
+            })
+            const backupName = String(res.backupPath || '').split(/[\\/]/).pop()
+            let msg = '导入完成（' + res.mode + '：' + (bits.join(' · ') || '无变化') + '）'
+            if (res.applied && res.applied.globalized) msg += '，会话规则提升 ' + res.applied.globalized + ' 条'
+            if (backupName) msg += '；备份 ' + backupName
+            const warnings = res.warnings || []
+            if (warnings.length) msg += '；注意：' + warnings.join('；')
+            showFeedback(msg, warnings.length === 0)
+            setImportFile(null)
+            load()
+          })
+          .catch(function (e) { showFeedback('导入请求失败：' + String((e && e.message) || e), false) })
+          .finally(function () { setBusy(false) })
+      }
+
       if (!snapshot) {
         return React.createElement('div', { className: 'ag-set' },
           React.createElement('div', { className: error ? 'ag-set-err' : 'ag-set-ok' }, error || '加载中…'))
@@ -1366,6 +1470,89 @@ window.__ModuleLoader__.load({
             }, setup.configured ? '重新检查' : '一键配置权限预设'),
             !setup.configured ? React.createElement('span', { className: 'ag-set-note' }, '写入后需重启 dsh web 生效') : null,
           ),
+        ),
+
+        // ---- 备份与迁移（全量导出 / 导入）----
+        // 一台机器上攒出来的规则与判定参数只存在 $DSH_HOME/auto-approve/ 下，
+        // 这张卡片把它们整份导出成一个 JSON，在另一台机器导入即可同步使用。
+        // 刻意不碰 profile 的 cordis.patch.yml（权限预设仍由上面的「一键配置」负责）：
+        // 会话运行期改 profile 会触发 HMR 重载，可能打断在途 turn。
+        React.createElement('div', { className: 'ag-set-card' },
+          React.createElement('div', { className: 'ag-set-card-head' },
+            React.createElement('div', { className: 'ag-set-card-title' }, '备份与迁移 · 全量导出 / 导入'),
+            React.createElement('p', { className: 'ag-set-card-sub' },
+              '把本机的规则与判定参数导出成一个 JSON 文件，在另一台机器的这张卡片里导入即可同步使用。' +
+              '导入前会自动备份当前配置（$DSH_HOME/auto-approve/import-backup-*.json），可整份回滚。' +
+              '导出内容：白名单 / 永久人工 / 危险词 / 硬类别 / 阈值与超时 / 定域与区外开关 / 裁判模型 / 学习进度。')),
+          React.createElement('div', { className: 'ag-set-row' },
+            React.createElement('button', {
+              type: 'button', className: 'ag-set-btn ag-set-btn-primary', disabled: busy,
+              onClick: exportSettings,
+            }, '导出全部设置（.json）'),
+            React.createElement('label', { className: 'ag-set-btn', style: { cursor: 'pointer', margin: 0 } },
+              '选择设置包…',
+              React.createElement('input', {
+                type: 'file', accept: '.json,application/json', style: { display: 'none' },
+                onChange: pickImportFile,
+              }),
+            ),
+            React.createElement('span', { className: 'ag-set-note' },
+              '不含权限预设：导入后若本机未配置，仍用上面的「一键配置权限预设」'),
+          ),
+          importFile
+            ? React.createElement('div', { className: 'ag-set-card' },
+                React.createElement('p', { className: 'ag-set-card-sub' },
+                  '待导入：' + importFile.name
+                  + '（插件 ' + String(importFile.bundle.pluginVersion || '未知')
+                  + ' · 导出于 ' + String(importFile.bundle.exportedAt || '').slice(0, 16).replace('T', ' ')
+                  + ' · 白名单 ' + (((importFile.bundle.config || {}).allowRules || []).length)
+                  + ' / 永久人工 ' + (((importFile.bundle.config || {}).denyRules || []).length) + '）'),
+                React.createElement('div', { className: 'ag-set-row' },
+                  React.createElement('span', { className: 'ag-set-item-meta' }, '导入方式：'),
+                  React.createElement('select', {
+                    className: 'ag-set-input', value: importMode,
+                    onChange: function (e) { setImportMode(e.target.value) },
+                  },
+                    React.createElement('option', { value: 'merge' }, '合并（并集，保留本机规则）'),
+                    React.createElement('option', { value: 'replace' }, '覆盖（用设置包替换本机规则）'),
+                  ),
+                  React.createElement('label', { className: 'ag-set-item-meta', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+                    React.createElement('input', {
+                      type: 'checkbox', checked: importSettings,
+                      onChange: function (e) { setImportSettings(e.target.checked) },
+                    }),
+                    '判定参数与裁判模型',
+                  ),
+                  React.createElement('label', { className: 'ag-set-item-meta', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+                    React.createElement('input', {
+                      type: 'checkbox', checked: globalizeSession,
+                      onChange: function (e) { setGlobalizeSession(e.target.checked) },
+                    }),
+                    '会话规则提升为全局',
+                  ),
+                  React.createElement('label', { className: 'ag-set-item-meta', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+                    React.createElement('input', {
+                      type: 'checkbox', checked: importLearning,
+                      onChange: function (e) { setImportLearning(e.target.checked) },
+                    }),
+                    '学习进度',
+                  ),
+                ),
+                React.createElement('div', { className: 'ag-set-row' },
+                  React.createElement('button', {
+                    type: 'button', className: 'ag-set-btn ag-set-btn-primary', disabled: busy,
+                    onClick: runImport,
+                  }, '确认导入'),
+                  React.createElement('button', {
+                    type: 'button', className: 'ag-set-btn', disabled: busy,
+                    onClick: function () { setImportFile(null) },
+                  }, '取消'),
+                ),
+                React.createElement('p', { className: 'ag-set-card-sub' },
+                  '「会话规则提升为全局」用于跨机器：会话 id 对不上，不提升则这类规则永不生效；' +
+                  '「学习进度」的 key 带会话归属，跨机器通常不会命中，只在克隆同一台机器的数据时有用。'),
+              )
+            : null,
         ),
 
         // ---- 管道总览 ----

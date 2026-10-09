@@ -175,6 +175,40 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 - `judgeTimeoutMs`：单次判定超时（默认 20000ms，超时自动重试 1 次）
 - `judgeFailureLimit`：判定器**连续失败**多少次后转一次人工（默认 3）。前 2 次失败静默拒绝让 agent 改方案，第 3 次转人工，避免判定器长期不可用时卡死任务；判定成功一次即清零
 
+### 全量导出 / 导入（v0.9.13+）
+
+「多机共享规则」只同步仓库种子里的汇总规则，带不走你在本机攒出来的东西。设置页的
+**「备份与迁移 · 全量导出 / 导入」** 卡片补上这条通道：把本机的规则与判定参数整份导出成
+一个 JSON，在另一台机器导入即可同步开始使用。
+
+导出（`GET /api/auto-approve/export`）的内容：
+
+| 段 | 内容 |
+|---|---|
+| `config` | `allowRules` / `denyRules` / `denyKeywords` / `hardCategories`；`riskyThreshold` / `judgeTimeoutMs` / `judgeFailureLimit` / `judgeMaxTokens`；`sedimentScope` / `scopeAutoAllow` / `outsideNeedsHuman` / `learning.enabled`；`judgeModel` |
+| `learning` | 学习计数与样本（`stats` / `history`） |
+| `preset` | 来源机器的权限预设是否已配置（仅供参考，导入端不据此写 profile） |
+| 元信息 | `kind` / `bundleVersion` / `exportedAt` / `pluginVersion` / `source.platform` / `source.profile` |
+
+导出包**不含机器绝对路径、不含凭据、不含审批历史**（`events.jsonl` / `audit.log` / `snapshots/` 都不在包里）。
+
+导入（`POST /api/auto-approve/import`；设置页选中设置包后勾选选项再点「确认导入」）：
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| 导入方式 | **合并** | 合并 = 规则并集（按「工具/模式/类别/指纹 + 会话归属」去重，本机独有规则保留，幂等）；覆盖 = 规则数组按设置包替换 |
+| 判定参数与裁判模型 | 开 | 关掉则只导入规则，阈值/超时/开关/沉淀作用域/裁判模型保持本机值 |
+| 会话规则提升为全局 | 关 | 会话 id 跨机器对不上，不提升则这类规则**永不生效**；勾选后逐条改写 `scope: global` 并去掉 `sessionId` |
+| 学习进度 | 关 | 学习 key 形如 `会话\|工具\|模式\|类别`，跨机器基本不会命中，只在克隆同一台机器的数据时有用 |
+
+安全边界：
+
+- **导入前必定备份**到 `$DSH_HOME/auto-approve/import-backup-<时间戳>.json`（含导入前的 `allowlist` 与 `learning`），可整份回滚
+- 被拒绝的导入（`kind` 不符 / `bundleVersion` 高于本插件 / 缺 `config`）**不写盘、不留备份**
+- 只认白名单：`config` 的 14 个已知键 + 规则对象的 8 个字段；非法取值（阈值 0、超时 1e8、非布尔开关、非法枚举）一律丢弃；`scope: session` 却没有 `sessionId` 的规则直接丢弃（`ruleScope` 语义下它永不生效，留着只会让人误以为已放行）；上限 5000 条 / 单字段 500 字符
+- **不写 profile 的 `cordis.patch.yml`**：权限预设仍由「一键配置权限预设」卡片负责（会话运行期改 profile 会触发 HMR 重载，可能打断在途 turn）。设置包标记来源机器已配置而本机未配置时，界面会提示去点那张卡片
+- 导入的裁判模型 provider 若不在本机已注册路由里，返回警告「判定会失败并转人工」——`judgeModel` 是**机器本地**配置，不要照搬另一台机器的值
+
 ## 使用
 
 在会话的权限下拉（`/permission` 弹窗或设置页）选中**「自动审批（Flash）」**，该会话即启用自动审批；其他会话不受影响（按会话预设门控）。
@@ -184,6 +218,7 @@ dsh plugin --profile web add "github:IamNewHands/dsh-approval-gate#main"
 DSH 设置面板新增「自动审批」分区（settings.section，样式与 DSH 原生设置一致），按管道顺序提供可视化规则管理，每张卡片标注管道阶段：
 
 - **初始化卡片**：检测 `cordis.patch.yml` 是否已含 auto-approve 权限预设；未配置时点「一键配置」自动写入（文本级修改，保留注释格式），重启后生效
+- **备份与迁移**（v0.9.13）：「全量导出 / 导入」——把规则与判定参数整份导出成一个 JSON，在另一台机器导入即可同步使用（详见「全量导出 / 导入」）
 - **管道总览**：判定链路 + 生效的硬风险类别徽标
 - **① DENY 层 · 黑名单**（denyKeywords）：查看/添加/删除危险词（删除预置词有确认提示）
 - **② 白名单层 · 白名单**（allowRules）：查看（来源标签 预置 / 沉淀 / 用户 + 作用域标签 **全局** / **本会话**，会话规则显示归属会话）/添加（tool/mode/category/contains 表单）/删除 / **提升为全局**（会话规则一键改全局）。卡片顶部可设置**「新审批沉淀的作用域」**：仅本会话（默认）/ 全局
@@ -191,7 +226,7 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 - **④ Flash 判定 · 阈值与超时**：`riskyThreshold`（同一会话内学习满 N 次后第 N+1 次自动放行）/ `judgeTimeoutMs` 直接修改
 - **⑤ 学习沉淀 · 正在学习**：展示确认计数（n/N）与样本，计数**按会话隔离**（key 为 `会话|工具|模式|类别`，界面只显示后三段+会话号）；**「终止」按钮可介入删除**（删除计数与样本，重新学习）
 
-所有修改通过 `POST /api/auto-approve/rules` 写入 `allowlist.json`，**热更新即时生效**（无需重启）；`POST /api/auto-approve/setup` 负责一键初始化。
+所有修改通过 `POST /api/auto-approve/rules` 写入 `allowlist.json`，**热更新即时生效**（无需重启）；`POST /api/auto-approve/setup` 负责一键初始化；`GET /api/auto-approve/export` 与 `POST /api/auto-approve/import` 负责全量设置导出 / 导入。
 
 ## 人工审查 UI（v0.4.0+）
 
