@@ -18,7 +18,7 @@
     "allowlist.json"
   ],
   "scripts": {
-    "test": "node --check src/index.mjs && node --check client.js && node --check src/paths.mjs && node --check src/sanitize.mjs && node --check src/classifier.mjs && node --check src/zh.mjs && node test/zh.test.mjs && node test/unit.test.mjs && node test/seed-sync.test.mjs && node test/absorbed.test.mjs && node test/pipeline.test.mjs && node test/reconsider.test.mjs && node test/reconsider-match.test.mjs && node test/client-render-smoke.test.mjs && node test/models-endpoint.test.mjs && node test/session-scope.test.mjs && node test/origin-fence.test.mjs && node test/path-targets.test.mjs && node test/fence-scope.test.mjs && node test/step4-anchor.test.mjs && node test/export-import.test.mjs"
+    "test": "node --check src/index.mjs && node --check client.js && node --check src/paths.mjs && node --check src/sanitize.mjs && node --check src/classifier.mjs && node --check src/zh.mjs && node test/zh.test.mjs && node test/unit.test.mjs && node test/seed-sync.test.mjs && node test/absorbed.test.mjs && node test/pipeline.test.mjs && node test/reconsider.test.mjs && node test/reconsider-match.test.mjs && node test/client-render-smoke.test.mjs && node test/models-endpoint.test.mjs && node test/session-scope.test.mjs && node test/origin-fence.test.mjs && node test/path-targets.test.mjs && node test/fence-scope.test.mjs && node test/step4-anchor.test.mjs && node test/export-import.test.mjs && node test/export-import-route.test.mjs"
   },
   "keywords": [
     "deepseek-harness",
