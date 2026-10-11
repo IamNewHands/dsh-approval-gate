@@ -4,6 +4,36 @@ This file records notable changes to dsh-approval-gate. Version numbers follow [
 
 > Chinese version: see [CHANGELOG.md](CHANGELOG.md).
 
+## [0.9.14] — 2026-10-11
+
+**Deny keywords can no longer be split by a pair of quotes; command record cap raised from 300/400 to 4000.** Both issues came out of auditing the approval log of a REA installation session.
+
+### Quotes splitting a dangerous keyword
+
+Deny keywords matched as bare substrings, while PowerShell paths are usually quoted — and the quote lands exactly between the two halves of the keyword:
+
+```powershell
+Set-ItemProperty -Path 'HKCU:\Environment' -Name 'GHIDRA_INSTALL_DIR' -Value '...'
+#                     ^ quote sits between `-path ` and `hkcu:`
+```
+
+The keyword is `set-itemproperty -path hkcu:`, so the match failed. In the local `events.jsonl`, four elevation commands that wrote to the registry (ids 1504 / 1505 / 1510 / 1511) had **zero deny hits**; `Remove-Item 'HKCU:\Software\Foo' -Recurse` evaded `remove-item hkcu` the same way. Those four were only stopped by the separate "anything outside the workspace goes to a human" rule — the keyword rule itself had structurally stopped working, and any quoted variant could slip through.
+
+Fix: `looksDeny` now also tests a dequoted variant alongside the original text. The keywords themselves contain no quotes, and `matchDenyKeyword`'s boundary check still applies, so `Get-Date -Format "c:"` dequotes to `-format c:` whose left neighbour is `-` — `format c:` still does not match, and there is no false positive.
+
+### Command records truncated too short
+
+Reviewing commands after the fact showed the records were cut off, with no way to recover the full text:
+
+| Field | Consumer | Old cap | At cap |
+|---|---|---|---|
+| `ev.command` | fingerprint for reconsider/sediment rules | 400 | 341 / 926 (36.8%) |
+| `ev.facts.command` | **review UI facts table** | 300 | 447 / 914 (48.9%) |
+
+In this audit, event id 1503 (extracting a 195 MB JDK) could not be explained for that reason. Both caps are now **4000**. The cost is negligible: the command field is 0.24 MB of a 2.34 MB `events.jsonl` (10.4%), and p99 is 400 — there are no oversized commands, so raising the cap only stops losing the tail.
+
+- 8 new `unit.test.mjs` assertions: quoted HKCU/HKLM writes, `Remove-Item 'HKCU:\...' -Recurse`, and `reg delete 'HKCU\...'` must match; `Get-Date -Format "c:"` and `npm run format` must not; `--force-with-lease` stays a safe flag after dequoting. All 16 test files green.
+
 ## [0.9.13] — 2026-10-09
 
 **New "full export / import": move a machine's rules and settings to another machine in one file.** The user asked: "add a full export of the plugin's settings, so the rules and settings a machine already has can be imported on another machine and start working right away".

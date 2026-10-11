@@ -4,6 +4,36 @@
 
 > 英文版见 [CHANGELOG.en.md](CHANGELOG.en.md)。
 
+## [0.9.14] — 2026-10-11
+
+**修 deny 关键词被一对引号绕过；命令记录上限 300/400 → 4000。** 两处都是审查 REA 安装会话的审批记录时实测出来的。
+
+### 引号拆开危险词
+
+危险词用裸子串匹配，而 PowerShell 里路径常带引号，引号正好夹在关键词中间：
+
+```powershell
+Set-ItemProperty -Path 'HKCU:\Environment' -Name 'GHIDRA_INSTALL_DIR' -Value '...'
+#                     ↑ 引号夹在 `-path ` 与 `hkcu:` 之间
+```
+
+关键词是 `set-itemproperty -path hkcu:`，于是匹配失败。本机 `events.jsonl` 里 1504 / 1505 / 1510 / 1511 四条写注册表的提权命令，**deny 命中全部为空**；`Remove-Item 'HKCU:\Software\Foo' -Recurse` 同理绕过 `remove-item hkcu`。这四条当时只靠「工作区外一律人工」兜住 —— 规则本身已结构性失效，任何带引号的同类写法都能穿过。
+
+修复：`looksDeny` 在原文本之外再判一次「去掉引号」的变体。危险词本身不含引号，且 `matchDenyKeyword` 的边界检查仍在，所以 `Get-Date -Format "c:"` 去引号后左侧有 `-`，照旧挡住 `format c:`，不误报。
+
+### 命令记录截断过短
+
+事后复核命令时发现记录被截断，无法还原全貌：
+
+| 字段 | 读者 | 旧上限 | 顶格比例 |
+|---|---|---|---|
+| `ev.command` | 追认/沉淀规则取指纹 | 400 | 341 / 926（36.8%） |
+| `ev.facts.command` | **审查界面字段表格** | 300 | 447 / 914（48.9%） |
+
+本次审查中，id 1503（解压 195 MB JDK）就因此无法解释为何被规则放行。两处上限统一提到 **4000**。代价可忽略：`events.jsonl` 2.34 MB 里 command 字段合计仅 0.24 MB（10.4%），且 p99 = 400，没有超长命令 —— 放宽只是不再丢尾部。
+
+- 新增 8 条 `unit.test.mjs` 断言：引号包裹的 HKCU/HKLM 写入、`Remove-Item 'HKCU:\...' -Recurse`、`reg delete 'HKCU\...'` 必须命中；`Get-Date -Format "c:"`、`npm run format` 不得误报；`--force-with-lease` 去引号后仍是安全标志。16 个测试文件全绿。
+
 ## [0.9.13] — 2026-10-09
 
 **新增「全量导出 / 导入」：把一台机器的规则与设置整份搬到另一台机器。** 用户要求：「做个全量导出插件的设置功能，这样把一台机器上已有的规则和插件的设置能直接导入到其他机器上直接就能同步开始使用」。
