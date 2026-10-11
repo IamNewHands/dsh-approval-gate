@@ -159,6 +159,32 @@ assert.strictEqual(looksDeny('git push --force origin main'), true, 'bare --forc
 assert.strictEqual(looksDeny('git push --force;'), true, 'punctuation after --force still blocks')
 assert.strictEqual(looksDeny('docker rm -f container'), true, 'docker rm at a boundary still blocks')
 
+// 引号不得拆开危险词（2026-10-11 实测漏洞：本机 4 条写注册表的提权命令全部绕过 deny）
+// 真实样本：`Set-ItemProperty -Path 'HKCU:\Environment' -Name 'GHIDRA_INSTALL_DIR' ...`
+// 引号夹在 `-path ` 与 `hkcu:` 之间，裸子串 `set-itemproperty -path hkcu:` 不命中。
+assert.strictEqual(looksDeny("Set-ItemProperty -Path 'HKCU:\\Environment' -Name 'X' -Value 'y'"), true,
+  'quoted HKCU path must not evade set-itemproperty -path hkcu:')
+assert.strictEqual(looksDeny('Set-ItemProperty -Path "HKCU:\\Environment" -Name X'), true,
+  'double-quoted HKCU path must also be blocked')
+assert.strictEqual(looksDeny('Set-ItemProperty -Path HKCU:\\Environment -Name X'), true,
+  'unquoted HKCU path keeps working (no regression)')
+assert.strictEqual(looksDeny("Set-ItemProperty -Path 'HKLM:\\Software\\Foo' -Name X"), true,
+  'quoted HKLM path must not evade set-itemproperty -path hklm:')
+assert.strictEqual(looksDeny("Remove-Item 'HKCU:\\Software\\Foo' -Recurse"), true,
+  'quoted HKCU path must not evade remove-item hkcu')
+assert.strictEqual(looksDeny("reg delete 'HKCU\\Software\\Foo' /f"), true,
+  'quoted HKCU path must not evade reg delete')
+// 去引号后不得制造误报：格式串里的 `c:` 左侧有 `-`，边界检查照旧挡住 `format c:`
+assert.strictEqual(looksDeny('Get-Date -Format "c:"'), false,
+  'quoted format string must NOT be read as format c:')
+assert.strictEqual(looksDeny('npm run format'), false, 'formatter still not blocked after dequoting')
+// 去引号只影响「引号夹在词中间」的情形；词本身相邻的危险短语照旧命中（原有行为，非本次引入）
+assert.strictEqual(looksDeny("git commit -m 'force push docs'"), true,
+  'a literally adjacent dangerous phrase still blocks (pre-existing, unchanged by dequoting)')
+// 去引号不得把安全标志变成危险词：--force-with-lease 去引号后仍是安全标志
+assert.strictEqual(looksDeny("git push '--force-with-lease' origin main"), false,
+  'dequoting must not turn --force-with-lease into --force')
+
 // 3. extractOperationFingerprint test
 const GENERIC_EN_WORDS = new Set([
   'update', 'updates', 'updating', 'updated', 'install', 'installs', 'installing',

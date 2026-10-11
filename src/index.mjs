@@ -566,7 +566,11 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   if (o.failureReason) ev.failureReason = String(o.failureReason).slice(0, 300)
   // command：本次调用的真实命令文本（pwsh 等命令类工具没有 file_path，追认规则需要它做指纹，
   // 否则只能退化成 justification 里的偶然词，如 2026-09-18 的 contains:"job"）
-  if (o.command) ev.command = String(o.command).slice(0, 400)
+  // 上限 4000（2026-10-11 由 400 提高）：实测 926 条含 command 的事件里 341 条（36.8%）
+  // 顶在 400 上被截断，事后无法复核命令全貌，也无法解释规则为何命中。
+  // 提高上限的代价可忽略：events.jsonl 2.34 MB 里 command 字段合计仅 0.24 MB（10.4%），
+  // 且 400→4000 后总字节不变（p99 = 400，没有超长命令），只是不再丢尾部。
+  if (o.command) ev.command = String(o.command).slice(0, 4000)
   // targets：本次调用指向的**绝对路径**（与 files 不同，含只读目标；用于回答「动的是哪里」）。
   // files 只装写目标（供改动前快照），两者刻意分开：把只读目标当写目标会给敏感文件拍快照。
   if (Array.isArray(o.targets) && o.targets.length > 0) {
@@ -1868,13 +1872,37 @@ function matchDenyKeyword(lower, kw) {
   }
 }
 
+/**
+ * 引号归一化：命令里的引号会把连续的危险词切成两半，从而绕过 deny 关键词。
+ *
+ * 实测（2026-10-11，本机 events.jsonl 1504/1505/1510/1511）：
+ *   `Set-ItemProperty -Path 'HKCU:\Environment' -Name X`
+ * 不含 `set-itemproperty -path hkcu:` —— `-path ` 与 `hkcu:` 之间夹了一个引号；
+ * `Remove-Item 'HKCU:\Software\Foo' -Recurse` 同样绕过 `remove-item hkcu`。
+ * 四条写注册表的提权命令，deny 命中全部为空，只靠「工作区外一律人工」兜住。
+ *
+ * 危险词本身不含引号，所以「去掉引号后再判一次」是安全的：`matchDenyKeyword` 的
+ * 边界检查仍在，`Get-Date -Format "c:"` 去引号后是 `-format c:`，左侧的 `-` 照样
+ * 挡住 `format c:`，不会把格式串误判成格式化磁盘。
+ *
+ * @param {string} text 待归一化文本
+ * @returns {string} 去掉 `"` `'` 与反引号后的文本
+ */
+function stripDenyQuotes(text) {
+  return String(text || '').replace(/["'`]/g, '')
+}
+
 function looksDeny(text) {
   const lower = String(text || '').toLowerCase()
   const keywords = config.denyKeywords || DEFAULT_DENY_KEYWORDS
+  // 原文与去引号变体都判一次：原文保住既有行为，变体堵住引号拆词绕过。
+  const variants = [lower]
+  const dequoted = stripDenyQuotes(lower)
+  if (dequoted !== lower) variants.push(dequoted)
   return keywords.some((keyword) => {
     const kw = String(keyword || '').trim().toLowerCase()
     if (!kw) return false
-    return matchDenyKeyword(lower, kw)
+    return variants.some((v) => matchDenyKeyword(v, kw))
   })
 }
 

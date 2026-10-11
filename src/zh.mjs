@@ -156,7 +156,10 @@ function clip(text, max) {
 export function describeFacts(input) {
   const o = input || {}
   const toolName = String(o.toolName || 'unknown').trim() || 'unknown'
-  const command = clip(String(o.command == null ? '' : o.command).trim(), 300)
+  // 命令上限 4000（2026-10-11 由 300 提高）：审查界面读的就是 facts.command
+  // （client.js factsRows），实测 914 条里 447 条（48.9%）顶在 300 上被截断，
+  // 事后复核看不到命令全貌。事件日志里 command 字段占比很低，放宽代价可忽略。
+  const command = clip(String(o.command == null ? '' : o.command).trim(), 4000)
   const commandTool = isCommandTool(toolName)
   const actionKey = actionKeyFor(toolName, command, commandTool)
   const mode = String(o.mode || '').trim()
@@ -238,7 +241,9 @@ export function compactFacts(facts) {
   const fenceText = str(facts.fenceText, 120)
   if (fenceText) out.fenceText = fenceText
   if (facts.targetTraversal === true) out.targetTraversal = true
-  const command = str(facts.command, 300)
+  // 上限与 describeFacts 的 command 保持一致（4000）：审查界面读的就是这个字段，
+  // 两处不一致会让「界面看到完整的、落盘却截断」（或反之），事后审计失真。
+  const command = str(facts.command, 4000)
   if (command) out.command = command
   const commandLabel = str(facts.commandLabel, 40)
   if (commandLabel) out.commandLabel = commandLabel
