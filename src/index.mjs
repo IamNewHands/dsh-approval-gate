@@ -999,16 +999,33 @@ function isOriginSafe(req) {
  * 核心服务不可用（旧版部署未加载 connection）时退化为来源校验。
  * 返回 undefined 表示放行；否则返回应写入的 HTTP 状态码（401/403）。
  */
-function requestAuthRejection(ctx, req) {
+let connectionFallbackWarned = false
+
+/**
+ * 取核心 connection 服务。cordis 禁止直接读取未 inject 的服务：
+ * `ctx.connection` 会抛 `cannot get property "connection" without inject`，
+ * 每次请求都刷一条错误日志。ctx.get() 是免声明的官方入口，服务缺失时返回 undefined。
+ */
+function resolveConnection(ctx) {
   try {
-    const conn = ctx && ctx.connection
-    if (conn && typeof conn.requestRejection === 'function') {
+    if (ctx && typeof ctx.get === 'function') return ctx.get('connection')
+  } catch { /* 落到 requestAuthRejection 的一次性告警 */ }
+  return undefined
+}
+
+function requestAuthRejection(ctx, req) {
+  const conn = resolveConnection(ctx)
+  if (conn && typeof conn.requestRejection === 'function') {
+    try {
       const rejection = conn.requestRejection(req)
       if (rejection !== undefined) return rejection
       return undefined
+    } catch (error) {
+      console.error(`[${NAME}] requestRejection 异常，退化为来源校验`, error)
     }
-  } catch (error) {
-    console.error(`[${NAME}] requestRejection 异常，退化为来源校验`, error)
+  } else if (!connectionFallbackWarned) {
+    connectionFallbackWarned = true
+    console.warn(`[${NAME}] connection 服务不可用，API 鉴权退化为来源校验（只提示一次）`)
   }
   return isOriginSafe(req) ? undefined : 403
 }
